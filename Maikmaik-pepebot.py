@@ -12,3 +12,4 @@
  if signal == "buy":
  "skip"})
  
+ 
