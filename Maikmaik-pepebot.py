@@ -9,7 +9,9 @@ BYBIT_KEY = os.environ.get("BYBIT_API_KEY", "")
 BYBIT_SECRET = os.environ.get("BYBIT_API_SECRET", "")
 TG_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TG_CHAT = os.environ.get("TELEGRAM_CHAT_ID", "")
-TRADE_USDT = float(os.environ.get("TRADE_USDT", "50"))  # hoeveel USDT per trade
+# RENTE-OP-RENTE: start met 100, daarna steeds 100 + winst weer inzetten
+# We gebruiken dus AL je USDT, niet een vast bedrag
+START_USDT = 100  # alleen ter info, bot gebruikt gewoon je hele balance
 SYMBOL = "PEPEUSDT"
 INTERVAL = "15"  # 15m zoals in TradingView
 KEY_VALUE = 1.0  # UT Bot sensitivity - 1.0 = standaard, hoger = rustiger
@@ -54,7 +56,7 @@ def do_buy(reason="UT Bot Buy"):
     if usdt < 10:
         send_telegram(f"❌ BUY genegeerd: te weinig USDT ({usdt})")
         return
-    use = min(TRADE_USDT, usdt * 0.98)
+    use = usdt * 0.98  # RENTE-OP-RENTE: alles inzetten (100 + winst), 2% over voor fees
     # Prijs ophalen voor qty berekening
     try:
         tick = session.get_tickers(category="spot", symbol=SYMBOL)
@@ -138,7 +140,7 @@ def calc_ut_signal(candles):
 
 def bot_loop():
     global last_signal, last_candle_time, bot_state
-    send_telegram("🤖 Bot gestart - 100% gratis modus\nGeen TradingView nodig, ik reken UT Bot zelf uit.\nStuur /status voor je positie.")
+    send_telegram("🤖 Bot gestart - 100% gratis modus\nRente-op-rente AAN: start 100 USDT, daarna 100 + winst steeds weer inzetten.\nGeen TradingView nodig, ik reken UT Bot zelf uit.\nStuur /status voor je positie.")
     while True:
         try:
             candles = get_candles()
