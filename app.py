@@ -1,261 +1,237 @@
-import os
-import math
-import time
-import json
-import threading
-import requests
+import os, time, math, threading, json, requests
 from flask import Flask, request, jsonify
 from pybit.unified_trading import HTTP
 
 app = Flask(__name__)
 
-# ===== CONFIG - alles uit Render Environment =====
-SYMBOOL = "PEPEUSDT"
-BYBIT_API_KEY = os.environ.get("BYBIT_API_KEY", "")
-BYBIT_API_SECRET = os.environ.get("BYBIT_API_SECRET", "")
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
+# --- ENV VARS (Render > Environment) ---
+BYBIT_KEY = os.environ.get("BYBIT_API_KEY", "")
+BYBIT_SECRET = os.environ.get("BYBIT_API_SECRET", "")
+TG_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+TG_CHAT = os.environ.get("TELEGRAM_CHAT_ID", "")
+TRADE_USDT = float(os.environ.get("TRADE_USDT", "50"))
+SYMBOL = "PEPEUSDT"
+INTERVAL = "15"
+KEY_VALUE = 1.0
+ATR_PERIOD = 14
+STOP_LOSS_PCT = float(os.environ.get("STOP_LOSS_PCT", "0.03"))
+COOLDOWN_SEC = 900
+STATE_FILE = "state.json"
 
-TRADE_PCT = float(os.environ.get("TRADE_PCT", "0.98"))
-TAKE_PROFIT_PCT = float(os.environ.get("TAKE_PROFIT_PCT", "0.015"))
-STOP_LOSS_PCT = float(os.environ.get("STOP_LOSS_PCT", "0.03"))  # NIEUW: verkoop bij -3%
-CHECK_INTERVAL = int(os.environ.get("CHECK_INTERVAL", "60"))
-COOLDOWN_SEC = int(os.environ.get("COOLDOWN_SEC", "300"))  # NIEUW: 5 min wachten na verkoop
-STATE_FILE = "bot_state.json"
+session = HTTP(testnet=False, api_key=BYBIT_KEY, api_secret=BYBIT_SECRET)
+trade_lock = threading.Lock()
+bot_state = "Wachten op eerste candle..."
 
-session = HTTP(testnet=False, api_key=BYBIT_API_KEY, api_secret=BYBIT_API_SECRET)
-
-# ===== STATE - blijft bewaard bij herstart =====
-def laad_state():
-    default = {
-        "in_positie": False,
-        "koop_prijs": 0.0,
-        "aantal": 0.0,
-        "laatste_actie": "gestart",
-        "laatste_ping": time.time(),
-        "actief": True,  # NIEUW: voor /stop en /start
-        "laatste_verkoop": 0
-    }
+# --- STATE ---
+def load_state():
+    default = {"enabled": True, "in_position": False, "entry_price": 0.0,
+               "last_signal": None, "last_candle_time": None, "last_sell_time": 0}
     try:
-        if os.path.exists(STATE_FILE):
-            with open(STATE_FILE, "r") as f:
-                data = json.load(f)
-                default.update(data)
-                print(f"State hersteld: {default}")
-    except Exception as e:
-        print(f"State laden fout: {e}")
+        with open(STATE_FILE) as f:
+            default.update(json.load(f))
+    except Exception:
+        pass
     return default
 
-def sla_state_op():
+def save_state(s):
     try:
         with open(STATE_FILE, "w") as f:
-            json.dump(bot_state, f)
+            json.dump(s, f)
     except Exception as e:
-        print(f"State opslaan fout: {e}")
+        print(f"State save error: {e}")
 
-bot_state = laad_state()
-trade_lock = threading.Lock()
+state = load_state()
 
-# ===== TELEGRAM =====
+# --- TELEGRAM ---
 def send_telegram(msg):
+    if not TG_TOKEN or not TG_CHAT:
+        print(f"Telegram niet ingesteld: {msg}")
+        return
     try:
-        if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-            print("Telegram niet ingesteld, msg:", msg)
-            return
-        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-        requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": msg}, timeout=10)
+        requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
+                      json={"chat_id": TG_CHAT, "text": msg}, timeout=10)
     except Exception as e:
-        print("Telegram fout:", e)
-
-# ===== 【entity-BYBIT¦canonical_name=BYBIT】 HELPERS =====
-def get_prijs():
-    r = session.get_tickers(category="spot", symbol=SYMBOOL)
-    return float(r["result"]["list"][0]["lastPrice"])
+        print(f"Telegram error: {e}")
 
 def get_balances():
-    # 1x ophalen i.p.v. 2x, scheelt API calls
-    r = session.get_wallet_balance(accountType="UNIFIED")
-    coins = {c["coin"]: float(c["walletBalance"]) for c in r["result"]["list"][0]["coin"]}
-    return coins.get("USDT", 0.0), coins.get("PEPE", 0.0)
+    try:
+        r = session.get_wallet_balance(accountType="UNIFIED")
+        usdt = pepe = 0
+        for c in r["result"]["list"][0]["coin"]:
+            if c["coin"] == "USDT":
+                usdt = float(c.get("walletBalance") or 0)
+            if c["coin"] == "PEPE":
+                pepe = float(c.get("walletBalance") or 0)
+        return usdt, pepe
+    except Exception as e:
+        print(f"Balance error: {e}")
+        return 0, 0
 
-def koop():
+def get_price():
+    try:
+        tick = session.get_tickers(category="spot", symbol=SYMBOL)
+        return float(tick["result"]["list"][0]["lastPrice"])
+    except Exception:
+        return 0
+
+def do_buy(reason="UT Bot Buy"):
+    global state
     with trade_lock:
-        if bot_state["in_positie"]:
+        if state["in_position"]:
             return
         usdt, _ = get_balances()
-        bedrag = usdt * TRADE_PCT
-        if bedrag < 5:
-            send_telegram(f"⚠️ Te weinig USDT om te kopen: {usdt:.2f}")
+        if usdt < 10:
+            send_telegram(f"❌ BUY genegeerd: te weinig USDT ({usdt:.2f})")
             return
-        prijs = get_prijs()
-        aantal = math.floor(bedrag / prijs)
-        if aantal <= 0:
+        use = min(TRADE_USDT, usdt * 0.98)
+        price = get_price()
+        if price <= 0:
+            send_telegram("❌ BUY mislukt: geen prijs")
+            return
+        qty = int(math.floor((use / price) / 1000) * 1000)
+        if qty <= 0:
+            send_telegram("❌ BUY genegeerd: qty te klein")
             return
         try:
-            session.place_order(category="spot", symbol=SYMBOOL, side="Buy", orderType="Market", qty=str(aantal))
+            session.place_order(category="spot", symbol=SYMBOL, side="Buy",
+                                orderType="Market", qty=str(qty))
+            state["in_position"] = True
+            state["entry_price"] = price
+            save_state(state)
+            send_telegram(f"✅ BUY ({reason})\n{qty} PEPE voor ~{use:.1f} USDT\nPrijs: {price}")
         except Exception as e:
-            send_telegram(f"❌ Koop mislukt: {e}")
-            return
-        # Prijs na order ophalen = dichter bij echte fill-prijs
-        time.sleep(2)
-        echte_prijs = get_prijs()
-        bot_state.update({
-            "in_positie": True,
-            "koop_prijs": echte_prijs,
-            "aantal": float(aantal),
-            "laatste_actie": f"GEKOCHT {aantal} @ {echte_prijs}"
-        })
-        sla_state_op()
-        send_telegram(f"🟢 GEKOCHT\n{aantal} PEPE @ {echte_prijs}\nUSDT gebruikt: {bedrag:.2f}")
+            send_telegram(f"❌ Error bij buy: {e}")
 
-def verkoop(reden="TP"):
+def do_sell(reason="UT Bot Sell"):
+    global state
     with trade_lock:
-        if not bot_state["in_positie"]:
-            return
         _, pepe = get_balances()
         if pepe <= 0:
-            bot_state["in_positie"] = False
-            sla_state_op()
+            state["in_position"] = False
+            save_state(state)
+            send_telegram(f"SELL genegeerd: geen PEPE ({pepe})")
+            return
+        qty = int(math.floor(pepe / 1000) * 1000)
+        if qty <= 0:
+            send_telegram("SELL genegeerd: qty te klein na afronding")
             return
         try:
-            session.place_order(category="spot", symbol=SYMBOOL, side="Sell", orderType="Market", qty=str(int(pepe)))
+            session.place_order(category="spot", symbol=SYMBOL, side="Sell",
+                                orderType="Market", qty=str(qty))
+            state["in_position"] = False
+            state["entry_price"] = 0
+            state["last_sell_time"] = time.time()
+            save_state(state)
+            send_telegram(f"✅ SELL ({reason})\n{qty} PEPE verkocht")
         except Exception as e:
-            send_telegram(f"❌ Verkoop mislukt: {e}")
-            return
-        time.sleep(2)
-        prijs = get_prijs()
-        koop_prijs = bot_state["koop_prijs"]
-        winst_pct = (prijs - koop_prijs) / koop_prijs * 100 if koop_prijs else 0
-        emoji = "🔴" if reden == "TP" else "🛑"
-        label = "VERKOCHT (Take Profit)" if reden == "TP" else "VERKOCHT (Stop-Loss)"
-        bot_state.update({
-            "in_positie": False,
-            "koop_prijs": 0.0,
-            "aantal": 0.0,
-            "laatste_actie": f"{label} @ {prijs} winst {winst_pct:.2f}%",
-            "laatste_verkoop": time.time()
-        })
-        sla_state_op()
-        send_telegram(f"{emoji} {label}\n{int(pepe)} PEPE @ {prijs}\nWinst: {winst_pct:.2f}%")
+            send_telegram(f"❌ Error bij sell: {e}")
 
-# ===== HERSTEL BIJ OPSTART =====
-def herstel_positie_bij_opstart():
-    """Als Render herstart is en we hebben nog PEPE, dan zaten we in een positie."""
-    try:
-        _, pepe = get_balances()
-        if pepe > 0 and not bot_state["in_positie"]:
-            # We weten de oude koopprijs niet meer, gebruik huidige prijs als schatting
-            # en laat de gebruiker het corrigeren via /setkoop
-            prijs = get_prijs()
-            bot_state.update({
-                "in_positie": True,
-                "koop_prijs": prijs,
-                "aantal": float(pepe),
-                "laatste_actie": f"HERSTELD na herstart: {int(pepe)} PEPE @ ~{prijs} (check koopprijs!)"
-            })
-            sla_state_op()
-            send_telegram(f"♻️ Herstart gedetecteerd\nJe hebt nog {int(pepe)} PEPE.\nIk heb de koopprijs op huidige prijs gezet ({prijs}).\nStuur /setkoop <prijs> als je de echte koopprijs weet.")
-        elif pepe == 0 and bot_state["in_positie"]:
-            bot_state.update({"in_positie": False, "koop_prijs": 0.0, "aantal": 0.0, "laatste_actie": "Hersteld: geen PEPE meer, positie gereset"})
-            sla_state_op()
-    except Exception as e:
-        print(f"Herstel fout: {e}")
+# --- UT BOT ---
+def get_candles():
+    r = session.get_kline(category="spot", symbol=SYMBOL, interval=INTERVAL, limit=100)
+    out = []
+    for k in reversed(r["result"]["list"]):
+        out.append({"time": int(k[0]), "open": float(k[1]), "high": float(k[2]),
+                    "low": float(k[3]), "close": float(k[4])})
+    return out
 
-# ===== TRADING LOOP =====
-def trading_loop():
-    time.sleep(5)
-    herstel_positie_bij_opstart()
-    send_telegram("🤖 Bot gestart - NIEUWE VERSIE\n✅ Stop-loss AAN\n✅ Herstel na herstart AAN\n✅ /stop en /start werken echt\nStuur /ping om te testen")
+def calc_ut_signal(candles):
+    trs = []
+    for i in range(1, len(candles)):
+        h, l, pc = candles[i]["high"], candles[i]["low"], candles[i-1]["close"]
+        trs.append(max(h-l, abs(h-pc), abs(l-pc)))
+    def atr_at(idx):
+        if idx <= 0: return trs[0] if trs else 0
+        if idx < ATR_PERIOD: return sum(trs[:idx]) / idx
+        return sum(trs[idx-ATR_PERIOD:idx]) / ATR_PERIOD
+    trailing = None; prev_close = None; signal = None
+    for i in range(1, len(candles)):
+        c = candles[i]
+        xatr = atr_at(i) * KEY_VALUE
+        if trailing is None:
+            trailing = c["close"] - xatr; signal = "buy"
+        else:
+            if prev_close is not None and prev_close > trailing and c["close"] < trailing:
+                signal = "sell"
+            elif prev_close is not None and prev_close < trailing and c["close"] > trailing:
+                signal = "buy"
+            if signal == "buy":
+                trailing = max(trailing, c["close"] - xatr)
+            else:
+                trailing = min(trailing, c["close"] + xatr)
+        prev_close = c["close"]
+    return signal
+
+def check_stop_loss():
+    if not state["in_position"] or not state["entry_price"]:
+        return
+    price = get_price()
+    if price <= 0: return
+    if price <= state["entry_price"] * (1 - STOP_LOSS_PCT):
+        send_telegram(f"🛑 STOP-LOSS -{STOP_LOSS_PCT*100:.0f}% geraakt\nEntry: {state['entry_price']} | Nu: {price}")
+        do_sell("Stop-loss")
+
+def bot_loop():
+    global bot_state
+    send_telegram("🤖 Bot gestart - NIEUWE VERSIE\n✅ Stop-loss AAN (-3%)\n✅ Herstel na herstart AAN\n✅ /stop en /start werken echt\nStuur /ping om te testen")
     while True:
         try:
-            if not bot_state.get("actief", True):
-                print("Bot is gepauzeerd via /stop, wachten...")
-                time.sleep(CHECK_INTERVAL)
-                continue
-
-            prijs = get_prijs()
-
-            if not bot_state["in_positie"]:
-                # Cooldown na verkoop
-                if time.time() - bot_state.get("laatste_verkoop", 0) < COOLDOWN_SEC:
-                    print(f"Cooldown... nog {int(COOLDOWN_SEC - (time.time() - bot_state['laatste_verkoop']))}s")
-                else:
-                    koop()
+            if state["enabled"]:
+                candles = get_candles()
+                closed = candles[:-1]
+                sig = calc_ut_signal(closed)
+                ctime = closed[-1]["time"]
+                bot_state = f"Laatste gesloten candle: {ctime} | Signaal: {sig} | In positie: {state['in_position']}"
+                check_stop_loss()
+                if ctime != state["last_candle_time"]:
+                    if sig == "buy" and state["last_signal"] != "buy":
+                        if time.time() - state["last_sell_time"] < COOLDOWN_SEC:
+                            print("BUY geblokkeerd: cooldown")
+                        else:
+                            do_buy()
+                    elif sig == "sell" and state["last_signal"] != "sell":
+                        do_sell()
+                    state["last_signal"] = sig
+                    state["last_candle_time"] = ctime
+                    save_state(state)
             else:
-                koop_prijs = bot_state["koop_prijs"]
-                if koop_prijs > 0:
-                    # Take Profit
-                    if prijs >= koop_prijs * (1 + TAKE_PROFIT_PCT):
-                        verkoop(reden="TP")
-                    # Stop-Loss - NIEUW
-                    elif prijs <= koop_prijs * (1 - STOP_LOSS_PCT):
-                        verkoop(reden="SL")
-                    else:
-                        print(f"Wachten... prijs {prijs} koop {koop_prijs} | TP: {koop_prijs * (1 + TAKE_PROFIT_PCT):.8f} | SL: {koop_prijs * (1 - STOP_LOSS_PCT):.8f}")
-            time.sleep(CHECK_INTERVAL)
+                bot_state = "Bot is GESTOPT via /stop"
+            time.sleep(60)
         except Exception as e:
-            print("Loop fout:", e)
-            time.sleep(30)
+            print(f"Loop fout: {e}")
+            time.sleep(60)
 
-# ===== FLASK ROUTES =====
-@app.route("/")
-def home():
-    return "Pepebot is LIVE ✅ (v2)", 200
-
-@app.route("/ping")
-def ping():
-    bot_state["laatste_ping"] = time.time()
-    sla_state_op()
-    return jsonify({"status": "ok", "bot": "live", "symbool": SYMBOOL, "in_positie": bot_state["in_positie"], "actief": bot_state.get("actief", True), "laatste_actie": bot_state["laatste_actie"]}), 200
-
-@app.route("/health")
-def health():
-    return jsonify({"ok": True, "in_positie": bot_state["in_positie"], "actief": bot_state.get("actief", True)}), 200
-
+# --- TELEGRAM WEBHOOK ---
 @app.route("/telegram", methods=["POST"])
 def telegram_webhook():
+    global state
     data = request.get_json(force=True, silent=True) or {}
     msg = data.get("message", {})
-    text = msg.get("text", "").strip().lower()
     chat_id = str(msg.get("chat", {}).get("id", ""))
-
-    # BEVEILIGING: alleen jouw chat mag commando's sturen
-    if chat_id != str(TELEGRAM_CHAT_ID):
+    text = (msg.get("text") or "").strip().lower()
+    if TG_CHAT and chat_id != str(TG_CHAT):
         print(f"Geblokkeerde Telegram poging van chat_id: {chat_id}")
-        return jsonify({"ok": True}), 200
-
-    if text == "/ping":
-        send_telegram(f"🏓 PONG - Ik ben LIVE ✅\nSymbool: {SYMBOOL}\nActief: {bot_state.get('actief', True)}\nIn positie: {bot_state['in_positie']}\nLaatste actie: {bot_state['laatste_actie']}")
-    elif text == "/status":
-        try:
-            prijs = get_prijs()
-            usdt, pepe = get_balances()
-            send_telegram(f"📊 STATUS\nPrijs: {prijs}\nUSDT: {usdt:.2f}\nPEPE: {int(pepe)}\nActief: {bot_state.get('actief', True)}\nIn positie: {bot_state['in_positie']}\nKoopprijs: {bot_state['koop_prijs']}\nLaatste actie: {bot_state['laatste_actie']}")
-        except Exception as e:
-            send_telegram(f"Status fout: {e}")
+        return jsonify({"ok": True})
+    if text == "/start":
+        state["enabled"] = True; save_state(state)
+        send_telegram("▶️ Bot GESTART - ik koop weer")
     elif text == "/stop":
-        bot_state["actief"] = False
-        sla_state_op()
-        send_telegram("⏸️ Bot GEPAUZEERD.\nIk koop/verkoop niks meer tot je /start stuurt.\nOpen posities blijven gewoon open.")
-    elif text == "/start":
-        bot_state["actief"] = True
-        sla_state_op()
-        send_telegram("▶️ Bot weer ACTIEF.\nIk ga weer handelen.")
-    elif text.startswith("/setkoop"):
-        # Voorbeeld: /setkoop 0.00001234
-        try:
-            nieuwe_prijs = float(text.split()[1])
-            bot_state["koop_prijs"] = nieuwe_prijs
-            sla_state_op()
-            send_telegram(f"✅ Koopprijs aangepast naar {nieuwe_prijs}")
-        except:
-            send_telegram("Gebruik: /setkoop 0.00001234")
-    return jsonify({"ok": True}), 200
+        state["enabled"] = False; save_state(state)
+        send_telegram("⏸️ Bot GESTOPT - ik koop niks meer (posities blijven open)")
+    elif text == "/ping":
+        send_telegram(f"🏓 Pong! Bot leeft.\n{bot_state}")
+    elif text == "/status":
+        usdt, pepe = get_balances()
+        send_telegram(f"📊 Status\nAan: {state['enabled']}\nIn positie: {state['in_position']}\nEntry: {state['entry_price']}\nUSDT: {usdt:.2f}\nPEPE: {pepe}\n{bot_state}")
+    return jsonify({"ok": True})
 
-# Start trading in background, niet 2x in debug
-if os.environ.get("WERKZEUG_RUN_MAIN") != "true":
-    threading.Thread(target=trading_loop, daemon=True).start()
+@app.route("/")
+@app.route("/health")
+def health():
+    return jsonify({"ok": True, "bot": bot_state})
+
+# Start loop 1x
+threading.Thread(target=bot_loop, daemon=True).start()
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", "10000"))
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
