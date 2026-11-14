@@ -11,7 +11,6 @@ app = Flask(__name__)
 # --- Instellingen ---
 SYMBOOL = "PEPEUSDT"
 INTERVAL = "15"
-STOP_LOSS_PCT = 3.0
 
 BYBIT_API_KEY = os.environ.get("BYBIT_API_KEY")
 BYBIT_API_SECRET = os.environ.get("BYBIT_API_SECRET")
@@ -63,17 +62,14 @@ def get_prijs():
 
 def get_klines():
     resp = session.get_kline(category="spot", symbol=SYMBOOL, interval=INTERVAL, limit=100)
-    # Bybit geeft nieuwste eerst, draai om: oud -> nieuw
     klines = list(reversed(resp["result"]["list"]))
     return klines
 
 def supertrend_richting(klines, atr_period=10, multiplier=3.0):
-    # Simpele, correcte Supertrend-berekening
     highs = [float(k[2]) for k in klines]
     lows = [float(k[3]) for k in klines]
     closes = [float(k[4]) for k in klines]
 
-    # True Range + ATR
     tr_list = []
     for i in range(1, len(klines)):
         tr = max(
@@ -85,8 +81,6 @@ def supertrend_richting(klines, atr_period=10, multiplier=3.0):
 
     atr = sum(tr_list[-atr_period:]) / atr_period
 
-    # Laatste 2 candles bepalen de richting
-    # Supertrend up als close > (hl2 - multiplier * atr)
     resultaten = []
     for i in range(len(klines) - 2, len(klines)):
         hl2 = (highs[i] + lows[i]) / 2
@@ -172,7 +166,6 @@ def do_sell(reden="signaal"):
 
 def bot_loop():
     time.sleep(5)
-    # Herstel positie na herstart
     try:
         if get_free_balance("PEPE") > 1000:
             bot_state["in_positie"] = True
@@ -180,7 +173,7 @@ def bot_loop():
     except Exception as e:
         print(f"Herstel fout: {e}")
 
-    send_telegram("🤖 Bot gestart - Rente-op-rente AAN - Stop-loss -3% AAN")
+    send_telegram("🤖 Bot gestart - Rente-op-rente AAN - GEEN stop-loss")
 
     while True:
         try:
@@ -196,22 +189,12 @@ def bot_loop():
             bot_state["laatste_candle"] = int(klines[-1][0])
             richting = supertrend_richting(klines)
 
-            # Stop-loss check
-            if bot_state["in_positie"] and bot_state["entry_prijs"] > 0:
-                prijs = get_prijs()
-                verlies = (bot_state["entry_prijs"] - prijs) / bot_state["entry_prijs"] * 100
-                if verlies >= STOP_LOSS_PCT:
-                    bot_state["signaal"] = "sell (stop-loss)"
-                    do_sell(f"stop-loss -{verlies:.2f}%")
-                    time.sleep(30)
-                    continue
-
             # Buy: flip van down -> up
             if len(richting) >= 2 and richting[-2] == "down" and richting[-1] == "up":
                 bot_state["signaal"] = "buy"
                 if not bot_state["in_positie"]:
                     do_buy()
-            # Sell: flip van up -> down
+            # Sell: flip van up -> down - GEEN stop-loss meer
             elif len(richting) >= 2 and richting[-2] == "up" and richting[-1] == "down":
                 bot_state["signaal"] = "sell"
                 if bot_state["in_positie"]:
