@@ -11,6 +11,10 @@ app = Flask(__name__)
 # --- Instellingen ---
 SYMBOOL = "PEPEUSDT"
 INTERVAL = "15"
+ATR_PERIOD_UT = 14
+UT_MULT = 4.0
+ST_ATR = 10
+ST_MULT = 3.0
 
 BYBIT_API_KEY = os.environ.get("BYBIT_API_KEY")
 BYBIT_API_SECRET = os.environ.get("BYBIT_API_SECRET")
@@ -28,7 +32,9 @@ bot_state = {
     "signaal": "geen",
     "laatste_candle": 0,
     "entry_prijs": 0.0,
-    "actief": True
+    "actief": True,
+    "laatste_ut": None,
+    "laatste_st": None,
 }
 
 def send_telegram(msg):
@@ -42,14 +48,13 @@ def send_telegram(msg):
         print(f"Telegram error: {e}")
 
 def get_free_balance(coin):
-    for acc in ["SPOT", "UNIFIED", "FUND", "CONTRACT"]:
+    for acc in ["UNIFIED", "SPOT", "FUND", "CONTRACT"]:
         try:
             resp = session.get_wallet_balance(accountType=acc, coin=coin)
             coins = resp["result"]["list"][0]["coin"]
             for c in coins:
                 if c["coin"] == coin:
                     val = float(c.get("walletBalance") or 0)
-                    print(f"Balance {coin} in {acc}: {val}")
                     if val > 0:
                         return val
         except Exception as e:
@@ -62,37 +67,88 @@ def get_prijs():
 
 def get_klines():
     resp = session.get_kline(category="spot", symbol=SYMBOOL, interval=INTERVAL, limit=100)
-    klines = list(reversed(resp["result"]["list"]))
-    return klines
+    # Bybit geeft nieuwste eerst, wij willen oudste eerst
+    return list(reversed(resp["result"]["list"]))
 
-def supertrend_richting(klines, atr_period=10, multiplier=3.0):
-    highs = [float(k[2]) for k in klines]
-    lows = [float(k[3]) for k in klines]
-    closes = [float(k[4]) for k in klines]
-
+def calc_atr(highs, lows, closes, period):
     tr_list = []
-    for i in range(1, len(klines)):
+    for i in range(1, len(highs)):
         tr = max(
             highs[i] - lows[i],
             abs(highs[i] - closes[i - 1]),
             abs(lows[i] - closes[i - 1])
         )
         tr_list.append(tr)
+    # Simpele ATR: gemiddelde van laatste 'period' TR's
+    return sum(tr_list[-period:]) / period, tr_list
 
-    atr = sum(tr_list[-atr_period:]) / atr_period
+# --- 1. SUPERTREND 10, 3 - GECORRIGEERD ---
+def supertrend_richting(klines):
+    highs = [float(k[2]) for k in klines]
+    lows = [float(k[3]) for k in klines]
+    closes = [float(k[4]) for k in klines]
+    atr, _ = calc_atr(highs, lows, closes, ST_ATR)
 
-    resultaten = []
-    for i in range(len(klines) - 2, len(klines)):
-        hl2 = (highs[i] + lows[i]) / 2
-        upper = hl2 + multiplier * atr
-        lower = hl2 - multiplier * atr
-        if closes[i] > upper:
-            resultaten.append("down")
-        elif closes[i] < lower:
-            resultaten.append("up")
+    # We berekenen alleen laatste candle, met juiste logica
+    i = len(klines) - 1
+    hl2 = (highs[i] + lows[i]) / 2
+    upper = hl2 + ST_MULT * atr
+    lower = hl2 - ST_MULT * atr
+
+    # CORRECT: prijs boven upper = UP, onder lower = DOWN
+    if closes[i] > upper:
+        return "up", upper, lower
+    if closes[i] < lower:
+        return "down", upper, lower
+    # Tussenin: hou vorige richting
+    return bot_state["laatste_st"] or "down", upper, lower
+
+# --- 2. UT BOT ALERTS 4, 14 ---
+def utbot_richting(klines):
+    highs = [float(k[2]) for k in klines]
+    lows = [float(k[3]) for k in klines]
+    closes = [float(k[4]) for k in klines]
+    atr, _ = calc_atr(highs, lows, closes, ATR_PERIOD_UT)
+
+    # UT Bot trailing stop logica
+    trailing = None
+    richting = "down"
+    for i in range(1, len(klines)):
+        src = closes[i]
+        if src > (trailing if trailing is not None else src - UT_MULT * atr):
+            # Boven trailing -> up
+            new_trailing = max(trailing if trailing is not None else src - UT_MULT * atr, src - UT_MULT * atr)
+            if richting == "down":
+                richting = "up"
+            trailing = new_trailing
         else:
-            resultaten.append(resultaten[-1] if resultaten else "down")
-    return resultaten
+            new_trailing = min(trailing if trailing is not None else src + UT_MULT * atr, src + UT_MULT * atr)
+            if richting == "up":
+                richting = "down"
+            trailing = new_trailing
+
+    return richting
+
+# --- 3. TRENDLINE ---
+def trendline_richting(klines):
+    closes = [float(k[4]) for k in klines]
+    # Simpele trendline: linear regression over laatste 30 candles
+    data = closes[-30:]
+    n = len(data)
+    x_mean = sum(range(n)) / n
+    y_mean = sum(data) / n
+    num = sum((i - x_mean) * (data[i] - y_mean) for i in range(n))
+    den = sum((i - x_mean) ** 2 for i in range(n))
+    slope = num / den if den != 0 else 0
+    # Trendline waarde op laatste candle
+    trend_value = y_mean + slope * (n - 1 - x_mean)
+    prijs = closes[-1]
+    # Prijs boven trendline + stijgende lijn = up
+    if prijs > trend_value and slope > 0:
+        return "up"
+    if prijs < trend_value and slope < 0:
+        return "down"
+    return "up" if prijs > trend_value else "down"
 
 def do_buy():
     try:
@@ -118,33 +174,29 @@ def do_buy():
             orderType="Market",
             qty=str(qty)
         )
-        print(f"BUY resp: {resp}")
+        print(f"BUY order: {resp}")
         bot_state["in_positie"] = True
         bot_state["entry_prijs"] = prijs
-        msg = f"BUY uitgevoerd: {qty} PEPE voor ~{bedrag:.2f} USDT @ {prijs}"
-        send_telegram(msg)
-        return msg
+        send_telegram(f"✅ BUY {SYMBOOL} | qty {qty} | prijs {prijs}")
+        return "BUY uitgevoerd"
     except Exception as e:
-        msg = f"Error bij buy: {e}"
-        print(msg)
-        send_telegram(msg)
-        return msg
+        print(f"BUY error: {e}")
+        send_telegram(f"❌ BUY error: {e}")
+        return f"BUY error: {e}"
 
 def do_sell(reden="signaal"):
     try:
         pepe_free = get_free_balance("PEPE")
-        print(f"SELL signaal - PEPE free: {pepe_free} reden: {reden}")
+        print(f"SELL signaal ({reden}) - PEPE free: {pepe_free}")
         if pepe_free <= 0:
-            msg = f"SELL genegeerd: geen PEPE ({pepe_free})"
-            send_telegram(msg)
-            return msg
+            bot_state["in_positie"] = False
+            return "SELL genegeerd: geen PEPE"
 
-        qty = math.floor(float(pepe_free) / 1000) * 1000
+        qty = math.floor(pepe_free / 1000) * 1000
         if qty <= 0:
-            msg = "SELL genegeerd: Qty te klein na afronding"
-            send_telegram(msg)
-            return msg
+            return "SELL genegeerd: Qty te klein"
 
+        prijs = get_prijs()
         resp = session.place_order(
             category="spot",
             symbol=SYMBOOL,
@@ -152,101 +204,75 @@ def do_sell(reden="signaal"):
             orderType="Market",
             qty=str(qty)
         )
-        print(f"SELL resp: {resp}")
+        print(f"SELL order: {resp}")
+        pnl_pct = ((prijs - bot_state["entry_prijs"]) / bot_state["entry_prijs"] * 100) if bot_state["entry_prijs"] else 0
         bot_state["in_positie"] = False
         bot_state["entry_prijs"] = 0.0
-        msg = f"SELL uitgevoerd: {qty} PEPE verkocht ({reden})"
-        send_telegram(msg)
-        return msg
+        send_telegram(f"🔴 SELL {SYMBOOL} | qty {qty} | prijs {prijs} | PnL {pnl_pct:.2f}% | reden: {reden}")
+        return "SELL uitgevoerd"
     except Exception as e:
-        msg = f"Error bij sell: {e}"
-        print(msg)
-        send_telegram(msg)
-        return msg
+        print(f"SELL error: {e}")
+        send_telegram(f"❌ SELL error: {e}")
+        return f"SELL error: {e}"
+
+def check_signalen():
+    try:
+        klines = get_klines()
+        if not klines:
+            return
+
+        candle_time = int(klines[-1][0])
+        # Alleen 1x per nieuwe candle handelen
+        if candle_time == bot_state["laatste_candle"]:
+            return
+        bot_state["laatste_candle"] = candle_time
+
+        st, _, _ = supertrend_richting(klines)
+        ut = utbot_richting(klines)
+        trend = trendline_richting(klines)
+
+        print(f"Candle {candle_time} | ST: {st} | UT: {ut} | Trendline: {trend} | In positie: {bot_state['in_positie']}")
+        bot_state["laatste_st"] = st
+        bot_state["laatste_ut"] = ut
+
+        # KOOP: alles moet UP zijn
+        if not bot_state["in_positie"] and st == "up" and ut == "up" and trend == "up":
+            bot_state["signaal"] = "buy"
+            do_buy()
+        # VERKOOP: UT of Supertrend draait naar DOWN
+        elif bot_state["in_positie"] and (ut == "down" or st == "down"):
+            bot_state["signaal"] = "sell"
+            do_sell(reden=f"UT={ut} ST={st}")
+        else:
+            bot_state["signaal"] = "geen"
+    except Exception as e:
+        print(f"check_signalen error: {e}")
 
 def bot_loop():
-    time.sleep(5)
-    try:
-        if get_free_balance("PEPE") > 1000:
-            bot_state["in_positie"] = True
-            bot_state["entry_prijs"] = get_prijs()
-    except Exception as e:
-        print(f"Herstel fout: {e}")
-
-    send_telegram("🤖 Bot gestart - Rente-op-rente AAN - GEEN stop-loss")
-
     while True:
-        try:
-            if not bot_state["actief"]:
-                time.sleep(10)
-                continue
+        if bot_state["actief"]:
+            check_signalen()
+        time.sleep(60)
 
-            klines = get_klines()
-            if len(klines) < 20:
-                time.sleep(30)
-                continue
-
-            bot_state["laatste_candle"] = int(klines[-1][0])
-            richting = supertrend_richting(klines)
-
-            # Buy: flip van down -> up
-            if len(richting) >= 2 and richting[-2] == "down" and richting[-1] == "up":
-                bot_state["signaal"] = "buy"
-                if not bot_state["in_positie"]:
-                    do_buy()
-            # Sell: flip van up -> down - GEEN stop-loss meer
-            elif len(richting) >= 2 and richting[-2] == "up" and richting[-1] == "down":
-                bot_state["signaal"] = "sell"
-                if bot_state["in_positie"]:
-                    do_sell("supertrend flip")
-            else:
-                bot_state["signaal"] = richting[-1]
-
-            time.sleep(60)
-        except Exception as e:
-            print(f"Loop fout: {e}")
-            time.sleep(30)
+# --- Flask routes ---
+@app.route("/", methods=["GET"])
+def home():
+    return jsonify({"status": "live", "state": bot_state})
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    data = request.get_json(force=True, silent=True) or {}
-    action = str(data.get("action", "")).lower()
-    print(f"Webhook ontvangen: {data}")
-    if action == "buy":
-        msg = do_buy()
-    elif action == "sell":
-        msg = do_sell("webhook")
-    else:
-        msg = f"Onbekende action: {action}"
-    return jsonify({"status": msg}), 200
+    # Voor als je later TradingView alerts wil gebruiken
+    data = request.json or {}
+    print(f"Webhook: {data}")
+    return jsonify({"ok": True})
 
-@app.route("/ping", methods=["GET"])
-def ping():
-    return jsonify({
-        "status": "ok",
-        "signaal": bot_state["signaal"],
-        "in_positie": bot_state["in_positie"],
-        "laatste_candle": bot_state["laatste_candle"],
-        "entry_prijs": bot_state["entry_prijs"]
-    }), 200
+@app.route("/status", methods=["GET"])
+def status():
+    return jsonify(bot_state)
 
-@app.route("/start", methods=["GET", "POST"])
-def start():
-    bot_state["actief"] = True
-    send_telegram("▶️ Bot gestart")
-    return "Bot gestart", 200
-
-@app.route("/stop", methods=["GET", "POST"])
-def stop():
-    bot_state["actief"] = False
-    send_telegram("⏸️ Bot gestopt")
-    return "Bot gestopt", 200
-
-@app.route("/", methods=["GET"])
-def home():
-    return "Bot draait", 200
+# Start loop bij opstarten
+threading.Thread(target=bot_loop, daemon=True).start()
 
 if __name__ == "__main__":
-    threading.Thread(target=bot_loop, daemon=True).start()
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
