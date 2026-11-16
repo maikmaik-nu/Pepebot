@@ -12,6 +12,7 @@ CATEGORY = "spot"
 INTERVAL = "15"
 KEY_VALUE = 4
 ATR_PERIOD = 14
+BASE_URL = "https://api.bybit.eu"
 
 def log(msg):
     print(msg, flush=True)
@@ -41,7 +42,7 @@ def _headers(ts, recv, sign):
 
 def get_price():
     try:
-        r = requests.get("https://api.bybit.com/v5/market/tickers",
+        r = requests.get(f"{BASE_URL}/v5/market/tickers",
                          params={"category": CATEGORY, "symbol": SYMBOL}, timeout=10).json()
         return float(r["result"]["list"][0]["lastPrice"])
     except Exception as e:
@@ -49,14 +50,15 @@ def get_price():
         return 0
 
 def get_balance(coin):
+    # ALLES VIA SPOT - dit is de fix voor jouw 100.24 USDT
     try:
         if not BYBIT_API_KEY or not BYBIT_API_SECRET:
             return 0.0
         ts = str(int(time.time() * 1000))
         recv = "5000"
-        query = f"accountType=UNIFIED&coin={coin}"
+        query = f"accountType=SPOT&coin={coin}"
         sign = _sign(ts, recv, query)
-        url = f"https://api.bybit.com/v5/account/wallet-balance?{query}"
+        url = f"{BASE_URL}/v5/account/wallet-balance?{query}"
         r = requests.get(url, headers=_headers(ts, recv, sign), timeout=10).json()
         if r.get("retCode") != 0:
             log(f"Saldo error {coin}: {r}")
@@ -89,7 +91,7 @@ def place_order(side, qty):
     body = {"category": "spot", "symbol": SYMBOL, "side": side, "orderType": "Market", "qty": str(qty)}
     body_str = json.dumps(body)
     sign = _sign(ts, recv, body_str)
-    r = requests.post("https://api.bybit.com/v5/order/create",
+    r = requests.post(f"{BASE_URL}/v5/order/create",
                       headers=_headers(ts, recv, sign), data=body_str, timeout=10)
     log(f"ORDER {side} qty {qty}: {r.text}")
     try:
@@ -99,9 +101,9 @@ def place_order(side, qty):
 
 def do_buy():
     usdt = get_free_usdt()
-    log(f"UT BOT BUY - USDT: {usdt}")
+    log(f"UT BOT BUY - USDT SPOT: {usdt}")
     if usdt < 10:
-        send_telegram(f"BUY: te weinig USDT ({usdt:.2f})")
+        send_telegram(f"BUY: te weinig USDT SPOT ({usdt:.2f})")
         return
     bedrag = usdt * 0.998
     prijs = get_price()
@@ -113,26 +115,26 @@ def do_buy():
         return
     res = place_order("Buy", qty)
     if res.get("retCode") == 0:
-        send_telegram(f"ECHT GEKOCHT {SYMBOL} Bedrag: {bedrag:.2f} USDT Qty: {qty} Prijs: {prijs}")
+        send_telegram(f"ECHT GEKOCHT {SYMBOL} SPOT Bedrag: {bedrag:.2f} USDT Qty: {qty} Prijs: {prijs}")
     else:
         send_telegram(f"BUY mislukt: {res}")
 
 def do_sell():
     pepe = get_pepe_balance()
-    log(f"UT BOT SELL - PEPE: {pepe}")
+    log(f"UT BOT SELL - PEPE SPOT: {pepe}")
     if pepe < 1000:
-        send_telegram(f"SELL: te weinig PEPE ({pepe})")
+        send_telegram(f"SELL: te weinig PEPE SPOT ({pepe})")
         return
     qty = int(pepe // 1000 * 1000)
     res = place_order("Sell", qty)
     if res.get("retCode") == 0:
-        send_telegram(f"ECHT VERKOCHT {SYMBOL} Qty: {qty}")
+        send_telegram(f"ECHT VERKOCHT {SYMBOL} SPOT Qty: {qty}")
     else:
         send_telegram(f"SELL mislukt: {res}")
 
 def get_klines():
     try:
-        r = requests.get("https://api.bybit.com/v5/market/kline",
+        r = requests.get(f"{BASE_URL}/v5/market/kline",
                          params={"category": CATEGORY, "symbol": SYMBOL, "interval": INTERVAL, "limit": 200},
                          timeout=10).json()
         if r.get("retCode") != 0:
@@ -152,23 +154,18 @@ def utbot_signal():
     if len(closes) < 30:
         return "NONE"
 
-    # TR berekenen
     trs = []
     for i in range(1, len(closes)):
         tr = max(highs[i] - lows[i], abs(highs[i] - closes[i-1]), abs(lows[i] - closes[i-1]))
         trs.append(tr)
 
-    # ATR met Wilder's RMA - exact zoals TradingView
-    # trs[0] hoort bij candle 1, trs[13] bij candle 14
     atr_at = [None] * len(closes)
     atr = sum(trs[:ATR_PERIOD]) / ATR_PERIOD
     atr_at[ATR_PERIOD] = atr
     for i in range(ATR_PERIOD + 1, len(closes)):
-        # tr voor candle i is trs[i-1]
         atr = (atr * (ATR_PERIOD - 1) + trs[i-1]) / ATR_PERIOD
         atr_at[i] = atr
 
-    # UT Bot trailing stop - exact TradingView logica
     trailing = None
     last_signal = "NONE"
 
@@ -201,7 +198,7 @@ last_handled_signal = None
 
 def bot_loop():
     global last_handled_signal
-    log("Bot loop gestart - UT Bot zelf berekenen")
+    log("Bot loop gestart - UT Bot zelf berekenen - SPOT via bybit.eu")
     while True:
         try:
             signaal = utbot_signal()
@@ -224,7 +221,7 @@ def bot_loop():
 
 @app.route("/")
 def home():
-    return "Pepebot FINAL - UT Bot zelf - GEEN stop-loss - Rente-op-rente AAN - GEEN Supertrend - GEEN TradingView"
+    return "Pepebot FINAL - UT Bot zelf - SPOT - bybit.eu - Rente-op-rente AAN"
 
 @app.route("/ping")
 def ping():
@@ -232,7 +229,7 @@ def ping():
 
 @app.route("/status")
 def status():
-    return jsonify({"usdt": get_free_usdt(), "pepe": get_pepe_balance(), "prijs": get_price(), "in_positie": is_in_positie(), "utbot_signaal": utbot_signal()})
+    return jsonify({"usdt_spot": get_free_usdt(), "pepe_spot": get_pepe_balance(), "prijs": get_price(), "in_positie": is_in_positie(), "utbot_signaal": utbot_signal()})
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
@@ -243,12 +240,11 @@ def telegram():
     data = request.get_json(force=True, silent=True) or {}
     text = data.get("message", {}).get("text", "")
     if text == "/ping":
-        send_telegram("PONG - Ik ben LIVE - UT Bot zelf - GEEN stop-loss - GEEN Supertrend - GEEN TradingView")
+        send_telegram("PONG - Ik ben LIVE - UT Bot zelf - SPOT - bybit.eu")
     elif text == "/status":
-        send_telegram(f"Status: USDT {get_free_usdt():.2f} - PEPE {get_pepe_balance():.0f} - In positie: {is_in_positie()} - UT Bot: {utbot_signal()}")
+        send_telegram(f"Status SPOT: USDT {get_free_usdt():.2f} - PEPE {get_pepe_balance():.0f} - In positie: {is_in_positie()} - UT Bot: {utbot_signal()}")
     return jsonify({"ok": True})
 
-# Start loop bij import - DIT is de fix voor Render / gunicorn
 _loop_started = False
 _lock = threading.Lock()
 
@@ -257,7 +253,7 @@ def start_loop_once():
     with _lock:
         if not _loop_started:
             _loop_started = True
-            send_telegram("Bot gestart - UT Bot zelf berekenen - Rente-op-rente AAN - GEEN stop-loss - GEEN Supertrend - GEEN TradingView - Start met 100")
+            send_telegram("Bot gestart - UT Bot zelf - SPOT via bybit.eu - Rente-op-rente AAN - Start met 100")
             threading.Thread(target=bot_loop, daemon=True).start()
 
 start_loop_once()
