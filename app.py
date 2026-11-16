@@ -13,6 +13,9 @@ INTERVAL = "15"
 KEY_VALUE = 4
 ATR_PERIOD = 14
 
+def log(msg):
+    print(msg, flush=True)
+
 def send_telegram(msg):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return
@@ -21,7 +24,7 @@ def send_telegram(msg):
             f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
             json={"chat_id": TELEGRAM_CHAT_ID, "text": msg}, timeout=10)
     except Exception as e:
-        print(f"Telegram error: {e}")
+        log(f"Telegram error: {e}")
 
 def _sign(ts, recv, payload=""):
     msg = ts + BYBIT_API_KEY + recv + payload
@@ -39,27 +42,32 @@ def _headers(ts, recv, sign):
 def get_price():
     try:
         r = requests.get("https://api.bybit.com/v5/market/tickers",
-                          params={"category": CATEGORY, "symbol": SYMBOL}, timeout=10).json()
+                         params={"category": CATEGORY, "symbol": SYMBOL}, timeout=10).json()
         return float(r["result"]["list"][0]["lastPrice"])
     except Exception as e:
-        print(f"Prijs error: {e}")
+        log(f"Prijs error: {e}")
         return 0
 
 def get_balance(coin):
     try:
-        ts = str(int(time.time()*1000))
+        if not BYBIT_API_KEY or not BYBIT_API_SECRET:
+            return 0.0
+        ts = str(int(time.time() * 1000))
         recv = "5000"
         query = f"accountType=UNIFIED&coin={coin}"
         sign = _sign(ts, recv, query)
         url = f"https://api.bybit.com/v5/account/wallet-balance?{query}"
         r = requests.get(url, headers=_headers(ts, recv, sign), timeout=10).json()
+        if r.get("retCode") != 0:
+            log(f"Saldo error {coin}: {r}")
+            return 0.0
         coins = r["result"]["list"][0]["coin"]
         for c in coins:
             if c["coin"] == coin:
                 return float(c.get("walletBalance") or 0)
         return 0.0
     except Exception as e:
-        print(f"Saldo error {coin}: {e}")
+        log(f"Saldo error {coin}: {e}")
         return 0.0
 
 def get_free_usdt():
@@ -69,29 +77,33 @@ def get_pepe_balance():
     return get_balance("PEPE")
 
 def is_in_positie():
-    return get_pepe_balance() >= 1000
+    prijs = get_price()
+    if prijs <= 0:
+        return False
+    waarde = get_pepe_balance() * prijs
+    return waarde >= 10
 
 def place_order(side, qty):
-    ts = str(int(time.time()*1000))
+    ts = str(int(time.time() * 1000))
     recv = "5000"
     body = {"category": "spot", "symbol": SYMBOL, "side": side, "orderType": "Market", "qty": str(qty)}
     body_str = json.dumps(body)
     sign = _sign(ts, recv, body_str)
     r = requests.post("https://api.bybit.com/v5/order/create",
                       headers=_headers(ts, recv, sign), data=body_str, timeout=10)
-    print(f"ORDER {side} qty {qty}: {r.text}")
+    log(f"ORDER {side} qty {qty}: {r.text}")
     try:
         return r.json()
-    except:
+    except Exception:
         return {"retCode": -1, "retMsg": r.text}
 
 def do_buy():
     usdt = get_free_usdt()
-    print(f"UT BOT BUY - USDT: {usdt}")
+    log(f"UT BOT BUY - USDT: {usdt}")
     if usdt < 10:
         send_telegram(f"BUY: te weinig USDT ({usdt:.2f})")
         return
-    bedrag = usdt * 0.98
+    bedrag = usdt * 0.998
     prijs = get_price()
     if prijs <= 0:
         return
@@ -107,7 +119,7 @@ def do_buy():
 
 def do_sell():
     pepe = get_pepe_balance()
-    print(f"UT BOT SELL - PEPE: {pepe}")
+    log(f"UT BOT SELL - PEPE: {pepe}")
     if pepe < 1000:
         send_telegram(f"SELL: te weinig PEPE ({pepe})")
         return
@@ -123,60 +135,91 @@ def get_klines():
         r = requests.get("https://api.bybit.com/v5/market/kline",
                          params={"category": CATEGORY, "symbol": SYMBOL, "interval": INTERVAL, "limit": 200},
                          timeout=10).json()
+        if r.get("retCode") != 0:
+            log(f"Kline error: {r}")
+            return [], [], []
         klines = r["result"]["list"][::-1]
         closes = [float(k[4]) for k in klines]
         highs = [float(k[2]) for k in klines]
         lows = [float(k[3]) for k in klines]
         return closes, highs, lows
     except Exception as e:
-        print(f"Kline error: {e}")
+        log(f"Kline error: {e}")
         return [], [], []
 
 def utbot_signal():
     closes, highs, lows = get_klines()
     if len(closes) < 30:
         return "NONE"
+
+    # TR berekenen
     trs = []
     for i in range(1, len(closes)):
-        tr = max(highs[i]-lows[i], abs(highs[i]-closes[i-1]), abs(lows[i]-closes[i-1]))
+        tr = max(highs[i] - lows[i], abs(highs[i] - closes[i-1]), abs(lows[i] - closes[i-1]))
         trs.append(tr)
-    atr = sum(trs[-ATR_PERIOD:]) / ATR_PERIOD
-    nloss = KEY_VALUE * atr
-    trailing = 0
+
+    # ATR met Wilder's RMA - exact zoals TradingView
+    # trs[0] hoort bij candle 1, trs[13] bij candle 14
+    atr_at = [None] * len(closes)
+    atr = sum(trs[:ATR_PERIOD]) / ATR_PERIOD
+    atr_at[ATR_PERIOD] = atr
+    for i in range(ATR_PERIOD + 1, len(closes)):
+        # tr voor candle i is trs[i-1]
+        atr = (atr * (ATR_PERIOD - 1) + trs[i-1]) / ATR_PERIOD
+        atr_at[i] = atr
+
+    # UT Bot trailing stop - exact TradingView logica
+    trailing = None
     last_signal = "NONE"
-    for i in range(1, len(closes)):
+
+    for i in range(ATR_PERIOD, len(closes)):
+        nloss = KEY_VALUE * atr_at[i]
         close = closes[i]
         prev_close = closes[i-1]
-        if close > trailing and prev_close > trailing:
-            trailing = max(trailing, close - nloss)
-        elif close < trailing and prev_close < trailing:
-            trailing = min(trailing, close + nloss)
+
+        if trailing is None:
+            trailing = close - nloss if close > prev_close else close + nloss
         else:
-            trailing = close - nloss if close > trailing else close + nloss
+            prev_trailing = trailing
+            if close > prev_trailing and prev_close > prev_trailing:
+                trailing = max(prev_trailing, close - nloss)
+            elif close < prev_trailing and prev_close < prev_trailing:
+                trailing = min(prev_trailing, close + nloss)
+            elif close > prev_trailing:
+                trailing = close - nloss
+            else:
+                trailing = close + nloss
+
         if close > trailing:
             last_signal = "BUY"
         elif close < trailing:
             last_signal = "SELL"
+
     return last_signal
 
 last_handled_signal = None
 
 def bot_loop():
     global last_handled_signal
-    print("Bot loop gestart - UT Bot zelf berekenen")
+    log("Bot loop gestart - UT Bot zelf berekenen")
     while True:
         try:
             signaal = utbot_signal()
             in_pos = is_in_positie()
-            print(f"Check - UT Bot: {signaal} - In positie: {in_pos} - Prijs: {get_price()}")
+            prijs = get_price()
+            log(f"Check - UT Bot: {signaal} - In positie: {in_pos} - Prijs: {prijs}")
             if signaal == "BUY" and not in_pos and last_handled_signal != "BUY":
                 do_buy()
                 last_handled_signal = "BUY"
             elif signaal == "SELL" and in_pos and last_handled_signal != "SELL":
                 do_sell()
                 last_handled_signal = "SELL"
+            elif signaal == "BUY" and in_pos:
+                last_handled_signal = "BUY"
+            elif signaal == "SELL" and not in_pos:
+                last_handled_signal = "SELL"
         except Exception as e:
-            print(f"Loop error: {e}")
+            log(f"Loop error: {e}")
         time.sleep(60)
 
 @app.route("/")
@@ -205,9 +248,20 @@ def telegram():
         send_telegram(f"Status: USDT {get_free_usdt():.2f} - PEPE {get_pepe_balance():.0f} - In positie: {is_in_positie()} - UT Bot: {utbot_signal()}")
     return jsonify({"ok": True})
 
+# Start loop bij import - DIT is de fix voor Render / gunicorn
+_loop_started = False
+_lock = threading.Lock()
+
+def start_loop_once():
+    global _loop_started
+    with _lock:
+        if not _loop_started:
+            _loop_started = True
+            send_telegram("Bot gestart - UT Bot zelf berekenen - Rente-op-rente AAN - GEEN stop-loss - GEEN Supertrend - GEEN TradingView - Start met 100")
+            threading.Thread(target=bot_loop, daemon=True).start()
+
+start_loop_once()
+
 if __name__ == "__main__":
-    send_telegram("Bot gestart - UT Bot zelf berekenen - Rente-op-rente AAN - GEEN stop-loss - GEEN Supertrend - GEEN TradingView - Start met 100")
-    t = threading.Thread(target=bot_loop, daemon=True)
-    t.start()
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
