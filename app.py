@@ -40,17 +40,32 @@ def _headers(ts, recv, sign):
         "Content-Type": "application/json"
     }
 
+def _extract_list(result):
+    # Bybit EU stuurt soms dict met list, soms direct een list
+    if isinstance(result, dict):
+        return result.get("list", []) or []
+    if isinstance(result, list):
+        return result
+    return []
+
 def get_price():
     try:
         r = requests.get(f"{BASE_URL}/v5/market/tickers",
                          params={"category": CATEGORY, "symbol": SYMBOL}, timeout=10).json()
-        return float(r["result"]["list"][0]["lastPrice"])
+        if r.get("retCode") != 0:
+            log(f"Prijs error retCode: {r}")
+            return 0
+        lst = _extract_list(r.get("result", {}))
+        if not lst:
+            log(f"Prijs error geen list: {r}")
+            return 0
+        return float(lst[0].get("lastPrice") or 0)
     except Exception as e:
         log(f"Prijs error: {e}")
         return 0
 
 def get_balance(coin):
-    # ALLES VIA SPOT - dit is de fix voor jouw 100.24 USDT
+    # ALLES VIA SPOT
     try:
         if not BYBIT_API_KEY or not BYBIT_API_SECRET:
             return 0.0
@@ -63,9 +78,12 @@ def get_balance(coin):
         if r.get("retCode") != 0:
             log(f"Saldo error {coin}: {r}")
             return 0.0
-        coins = r["result"]["list"][0]["coin"]
+        lst = _extract_list(r.get("result", {}))
+        if not lst:
+            return 0.0
+        coins = lst[0].get("coin", []) or []
         for c in coins:
-            if c["coin"] == coin:
+            if c.get("coin") == coin:
                 return float(c.get("walletBalance") or 0)
         return 0.0
     except Exception as e:
@@ -81,7 +99,8 @@ def get_pepe_balance():
 def is_in_positie():
     prijs = get_price()
     if prijs <= 0:
-        return False
+        # Fallback: als prijs even faalt, kijk alleen naar PEPE aantal
+        return get_pepe_balance() >= 1000000
     waarde = get_pepe_balance() * prijs
     return waarde >= 10
 
@@ -108,6 +127,12 @@ def do_buy():
     bedrag = usdt * 0.998
     prijs = get_price()
     if prijs <= 0:
+        # Probeer prijs uit laatste kline te halen
+        closes, _, _ = get_klines()
+        if closes:
+            prijs = closes[-1]
+    if prijs <= 0:
+        send_telegram("BUY mislukt: geen prijs")
         return
     qty = int((bedrag / prijs) // 1000 * 1000)
     if qty < 1000:
@@ -140,7 +165,11 @@ def get_klines():
         if r.get("retCode") != 0:
             log(f"Kline error: {r}")
             return [], [], []
-        klines = r["result"]["list"][::-1]
+        lst = _extract_list(r.get("result", {}))
+        if not lst:
+            log(f"Kline error geen list: {r}")
+            return [], [], []
+        klines = lst[::-1]
         closes = [float(k[4]) for k in klines]
         highs = [float(k[2]) for k in klines]
         lows = [float(k[3]) for k in klines]
