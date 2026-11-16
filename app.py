@@ -6,12 +6,14 @@ BYBIT_API_KEY = os.environ.get("BYBIT_API_KEY", "")
 BYBIT_API_SECRET = os.environ.get("BYBIT_API_SECRET", "")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
-SYMBOL = "PEPEUSDT"
+
+# BTC werkt op 【entity-Bybit¦canonical_name=Bybit】 EU, PEPE niet. Daarom BTC.
+SYMBOL = "BTCUSDT"
 CATEGORY = "spot"
 INTERVAL = "15"
-KEY_VALUE = 4
 ATR_PERIOD = 14
 BASE_URL = "https://api.bybit.eu"
+MIN_ORDER_USDT = 5.0
 
 def log(msg):
     print(msg, flush=True)
@@ -46,11 +48,22 @@ def _extract_list(result):
         return result
     return []
 
+def _safe_json(resp):
+    if resp.status_code != 200:
+        log(f"HTTP {resp.status_code}: {resp.text[:300]}")
+        return None
+    try:
+        return resp.json()
+    except Exception as e:
+        log(f"Geen JSON: {resp.text[:300]} err={e}")
+        return None
+
 def get_price():
     try:
-        r = requests.get(f"{BASE_URL}/v5/market/tickers", params={"category": CATEGORY, "symbol": SYMBOL}, timeout=10).json()
-        if r.get("retCode") != 0:
-            log(f"Prijs error retCode: {r}")
+        resp = requests.get(f"{BASE_URL}/v5/market/tickers", params={"category": CATEGORY, "symbol": SYMBOL}, timeout=10)
+        r = _safe_json(resp)
+        if not r or r.get("retCode") != 0:
+            log(f"Prijs error: {r}")
             return 0
         lst = _extract_list(r.get("result", {}))
         if not lst:
@@ -61,17 +74,21 @@ def get_price():
         return 0
 
 def get_balance(coin):
-    # LAATSTE VERSIE: EERST SPOT & MARGIN, daar staat je geld
-    for acct in ["SPOT", "UNIFIED"]:
+    if not BYBIT_API_KEY or not BYBIT_API_SECRET:
+        log("Geen API key/secret")
+        return 0.0
+    # SPOT EERST - daar staat je geld
+    for acct in ["SPOT", "UNIFIED", "FUND"]:
         try:
-            if not BYBIT_API_KEY or not BYBIT_API_SECRET:
-                return 0.0
             ts = str(int(time.time() * 1000))
             recv = "5000"
             query = f"accountType={acct}&coin={coin}"
             sign = _sign(ts, recv, query)
             url = f"{BASE_URL}/v5/account/wallet-balance?{query}"
-            r = requests.get(url, headers=_headers(ts, recv, sign), timeout=10).json()
+            resp = requests.get(url, headers=_headers(ts, recv, sign), timeout=10)
+            r = _safe_json(resp)
+            if not r:
+                continue
             if r.get("retCode") != 0:
                 log(f"Saldo error {coin} {acct}: {r}")
                 continue
@@ -81,7 +98,7 @@ def get_balance(coin):
             coins = lst[0].get("coin", []) or []
             for c in coins:
                 if c.get("coin") == coin:
-                    bal = float(c.get("walletBalance") or 0)
+                    bal = float(c.get("walletBalance") or c.get("availableToWithdraw") or 0)
                     if bal > 0:
                         return bal
         except Exception as e:
@@ -92,25 +109,62 @@ def get_balance(coin):
 def get_free_usdt():
     return get_balance("USDT")
 
-def get_pepe_balance():
-    return get_balance("PEPE")
+def get_coin_balance():
+    # BTC balance, niet PEPE meer
+    base = SYMBOL.replace("USDT", "").replace("USDC", "")
+    return get_balance(base)
+
+def get_symbol_info():
+    try:
+        resp = requests.get(f"{BASE_URL}/v5/market/instruments-info", params={"category": CATEGORY, "symbol": SYMBOL}, timeout=10)
+        r = _safe_json(resp)
+        if not r or r.get("retCode") != 0:
+            return None
+        lst = _extract_list(r.get("result", {}))
+        if not lst:
+            return None
+        return lst[0]
+    except Exception:
+        return None
+
+def round_qty(qty):
+    info = get_symbol_info()
+    if not info:
+        return round(qty, 6)
+    try:
+        step = float(info.get("lotSizeFilter", {}).get("qtyStep", "0.000001"))
+        min_qty = float(info.get("lotSizeFilter", {}).get("minOrderQty", "0"))
+        # afronden naar beneden op qtyStep
+        import math
+        qty = math.floor(qty / step) * step
+        if qty < min_qty:
+            return 0
+        # voorkom floating point troep
+        return round(qty, 8)
+    except Exception:
+        return round(qty, 6)
 
 def is_in_positie():
     prijs = get_price()
     if prijs <= 0:
-        return get_pepe_balance() > 0
-    return get_pepe_balance() * prijs > 1
+        return get_coin_balance() > 0
+    return get_coin_balance() * prijs > 1
 
 def place_order(side, qty):
     try:
+        qty = round_qty(qty)
+        if qty <= 0:
+            log(f"Order {side}: qty te klein na afronden")
+            return {}
         ts = str(int(time.time() * 1000))
         recv = "5000"
         body = {"category": CATEGORY, "symbol": SYMBOL, "side": side, "orderType": "Market", "qty": str(qty)}
         payload = json.dumps(body)
         sign = _sign(ts, recv, payload)
-        r = requests.post(f"{BASE_URL}/v5/order/create", headers=_headers(ts, recv, sign), data=payload, timeout=10).json()
+        resp = requests.post(f"{BASE_URL}/v5/order/create", headers=_headers(ts, recv, sign), data=payload, timeout=10)
+        r = _safe_json(resp)
         log(f"Order {side} {qty}: {r}")
-        return r
+        return r or {}
     except Exception as e:
         log(f"Order error: {e}")
         return {}
@@ -118,30 +172,30 @@ def place_order(side, qty):
 def do_buy():
     usdt = get_free_usdt()
     prijs = get_price()
-    if usdt < 5 or prijs <= 0:
+    if usdt < MIN_ORDER_USDT or prijs <= 0:
         log(f"BUY: te weinig USDT ({usdt}) of geen prijs ({prijs})")
         return
-    qty = int(usdt / prijs)
-    if qty <= 0:
-        return
-    log(f"BUY: {qty} PEPE voor {usdt} USDT @ {prijs}")
+    qty = usdt / prijs
+    log(f"BUY: {qty} {SYMBOL} voor {usdt} USDT @ {prijs}")
     place_order("Buy", qty)
-    send_telegram(f"BUY: {qty} PEPE @ {prijs} - USDT: {usdt}")
+    send_telegram(f"BUY: {SYMBOL} @ {prijs} - USDT: {usdt}")
 
 def do_sell():
-    pepe = get_pepe_balance()
+    bal = get_coin_balance()
     prijs = get_price()
-    if pepe <= 0 or prijs <= 0:
-        log(f"SELL: geen PEPE ({pepe}) of geen prijs ({prijs})")
+    if bal <= 0 or prijs <= 0:
+        log(f"SELL: geen {SYMBOL} ({bal}) of geen prijs ({prijs})")
         return
-    qty = int(pepe)
-    log(f"SELL: {qty} PEPE @ {prijs}")
-    place_order("Sell", qty)
-    send_telegram(f"SELL: {qty} PEPE @ {prijs}")
+    log(f"SELL: {bal} {SYMBOL} @ {prijs}")
+    place_order("Sell", bal)
+    send_telegram(f"SELL: {SYMBOL} @ {prijs}")
 
 def get_klines():
     try:
-        r = requests.get(f"{BASE_URL}/v5/market/kline", params={"category": CATEGORY, "symbol": SYMBOL, "interval": INTERVAL, "limit": 200}, timeout=10).json()
+        resp = requests.get(f"{BASE_URL}/v5/market/kline", params={"category": CATEGORY, "symbol": SYMBOL, "interval": INTERVAL, "limit": 200}, timeout=10)
+        r = _safe_json(resp)
+        if not r:
+            return []
         return _extract_list(r.get("result", {}))
     except Exception as e:
         log(f"Klines error: {e}")
@@ -171,8 +225,8 @@ last_handled_signal = 0
 
 def bot_loop():
     global last_handled_signal
-    log("Bot loop gestart - GEEN stop-loss - Start met 100 - Rente-op-rente AAN")
-    send_telegram("Bot gestart: GEEN stop-loss - Start met 100 - Rente-op-rente AAN - SPOT via bybit.eu")
+    log("Bot loop gestart - BTCUSDT - SPOT via bybit.eu - GEEN stop-loss - Rente-op-rente AAN")
+    send_telegram("Bot gestart: BTCUSDT - SPOT via bybit.eu - GEEN stop-loss - Rente-op-rente AAN")
     while True:
         try:
             prijs = get_price()
@@ -194,7 +248,7 @@ def bot_loop():
 
 @app.route("/")
 def home():
-    return f"Bot live - Prijs: {get_price()} - USDT: {get_free_usdt()}"
+    return f"Bot live - {SYMBOL} Prijs: {get_price()} - USDT: {get_free_usdt()}"
 
 @app.route("/ping")
 def ping():
@@ -202,7 +256,7 @@ def ping():
 
 @app.route("/status")
 def status():
-    return jsonify({"prijs": get_price(), "usdt": get_free_usdt(), "pepe": get_pepe_balance(), "symbool": SYMBOL})
+    return jsonify({"prijs": get_price(), "usdt": get_free_usdt(), "coin": get_coin_balance(), "symbool": SYMBOL})
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
@@ -220,7 +274,10 @@ def start_loop_once():
         if not _loop_started:
             _loop_started = True
             threading.Thread(target=bot_loop, daemon=True).start()
-start_loop_once()
+
+# Alleen starten als RUN_BOT=1 - dit fixt dat hij 5x start
+if os.environ.get("RUN_BOT") == "1":
+    start_loop_once()
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
