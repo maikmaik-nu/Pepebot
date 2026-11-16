@@ -61,7 +61,8 @@ def get_price():
         return 0
 
 def get_balance(coin):
-    for acct in ["UNIFIED", "SPOT", "FUND"]:
+    # LAATSTE VERSIE: EERST SPOT & MARGIN, daar staat je geld
+    for acct in ["SPOT", "UNIFIED"]:
         try:
             if not BYBIT_API_KEY or not BYBIT_API_SECRET:
                 return 0.0
