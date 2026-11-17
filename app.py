@@ -3,7 +3,7 @@ from flask import Flask, request, jsonify
 
 app = Flask(__name__)
 
-【entity-BYBIT_API_KEY¦canonical_name=Bybit】 = os.environ.get("【entity-BYBIT_API_KEY¦canonical_name=Bybit】", "").strip()
+BYBIT_API_KEY = os.environ.get("BYBIT_API_KEY", "").strip()
 BYBIT_API_SECRET = os.environ.get("BYBIT_API_SECRET", "").strip()
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
@@ -52,12 +52,12 @@ def save_state():
 
 def _sign(params_str, timestamp):
     recv_window = "5000"
-    payload = timestamp + 【entity-BYBIT_API_KEY¦canonical_name=Bybit】 + recv_window + params_str
+    payload = timestamp + BYBIT_API_KEY + recv_window + params_str
     sign = hmac.new(BYBIT_API_SECRET.encode("utf-8"), payload.encode("utf-8"), hashlib.sha256).hexdigest()
     return sign, recv_window
 
 def _headers(sign, recv_window, timestamp):
-    return {"X-BAPI-API-KEY": 【entity-BYBIT_API_KEY¦canonical_name=Bybit】, "X-BAPI-SIGN": sign, "X-BAPI-SIGN-TYPE": "2", "X-BAPI-TIMESTAMP": timestamp, "X-BAPI-RECV-WINDOW": recv_window, "Content-Type": "application/json"}
+    return {"X-BAPI-API-KEY": BYBIT_API_KEY, "X-BAPI-SIGN": sign, "X-BAPI-SIGN-TYPE": "2", "X-BAPI-TIMESTAMP": timestamp, "X-BAPI-RECV-WINDOW": recv_window, "Content-Type": "application/json"}
 
 def bybit_get(path, params):
     timestamp = str(int(time.time() * 1000))
@@ -78,27 +78,38 @@ def bybit_post(path, body):
     return r.json()
 
 def get_balances():
+    total_usdt = 0.0
+    total_pepe = 0.0
+    seen_ok = False
+    last_error = "ERROR"
     for account_type in ["UNIFIED", "SPOT"]:
         try:
             data = bybit_get("/v5/account/wallet-balance", {"accountType": account_type, "coin": "USDT,PEPE"})
             log("Saldo check " + account_type + ": retCode=" + str(data.get("retCode")))
             if data.get("retCode") == 10003:
-                log("FOUT 10003: Key geen toestemming. bybit.eu API Read + Spot Trade + Wallet AAN, IP UIT")
-                return None, None, "10003"
+                log("FOUT 10003 in " + account_type + ": Key geen toestemming. bybit.eu API Read + Spot Trade + Wallet AAN, IP UIT")
+                last_error = "10003"
+                continue
             if data.get("retCode") != 0:
                 log("Saldo error " + account_type + ": " + str(data))
+                last_error = "ERROR"
                 continue
             lst = data.get("result", {}).get("list", [])
             if not lst:
                 continue
-            coins = {}
+            seen_ok = True
             for c in lst[0].get("coin", []):
-                coins[c.get("coin")] = float(c.get("walletBalance", 0) or 0)
-            return coins.get("USDT", 0.0), coins.get("PEPE", 0.0), account_type
+                if c.get("coin") == "USDT":
+                    total_usdt += float(c.get("walletBalance", 0) or 0)
+                if c.get("coin") == "PEPE":
+                    total_pepe += float(c.get("walletBalance", 0) or 0)
         except Exception as e:
             log("Saldo exception " + account_type + ": " + str(e))
+            last_error = "ERROR"
             continue
-    return None, None, "ERROR"
+    if not seen_ok:
+        return None, None, last_error
+    return total_usdt, total_pepe, "UNIFIED+SPOT"
 
 def get_klines():
     try:
