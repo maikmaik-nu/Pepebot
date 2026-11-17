@@ -1,11 +1,10 @@
-import os, json, time, threading
-import hmac, hashlib, urllib.parse
+import os, json, time, threading, hmac, hashlib, urllib.parse
 import requests
 from flask import Flask, request, jsonify
 
 app = Flask(__name__)
 
-BYBIT_API_KEY = os.environ.get("【entity-BYBIT¦canonical_name=Bybit】_API_KEY", "").strip()
+BYBIT_API_KEY = os.environ.get("BYBIT_API_KEY", "").strip()
 BYBIT_API_SECRET = os.environ.get("BYBIT_API_SECRET", "").strip()
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
@@ -14,6 +13,7 @@ SYMBOL = "PEPEUSDT"
 CATEGORY = "spot"
 INTERVAL = "15"
 ATR_PERIOD = 14
+START_CAPITAL = 100.0
 BASE_URLS = ["https://api.bytick.com", "https://api.bybit.eu", "https://api.bybit.com"]
 BASE_URL = BASE_URLS[0]
 STATE_FILE = "state.json"
@@ -25,11 +25,16 @@ _LOOP_STARTED = False
 def log(msg):
     print(msg, flush=True)
 
+log(f"KEY LOADED: {len(BYBIT_API_KEY)} chars, start={BYBIT_API_KEY[:4] + '****' if BYBIT_API_KEY else 'LEEG'}")
+log(f"SECRET LOADED: {len(BYBIT_API_SECRET)} chars")
+if not BYBIT_API_KEY or not BYBIT_API_SECRET:
+    log("FOUT: BYBIT_API_KEY of SECRET ontbreekt in Environment!")
+
 def send_telegram(msg):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return
     try:
-        requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", json={"chat_id": TELEGRAM_CHAT_ID, "text": msg}, timeout=10)
+        requests.post("https://api.telegram.org/bot" + TELEGRAM_BOT_TOKEN + "/sendMessage", json={"chat_id": TELEGRAM_CHAT_ID, "text": msg}, timeout=10)
     except Exception as e:
         log("Telegram error: " + str(e))
 
@@ -68,14 +73,14 @@ def bybit_get(path, params, base):
     url = base + path + "?" + query
     try:
         r = requests.get(url, headers=headers, timeout=15)
-        log(f"bybit_get {base} {path} status={r.status_code}")
+        log(f"bybit_get {base} status={r.status_code}")
         try:
             data = r.json()
             log(f"retCode={data.get('retCode')} retMsg={data.get('retMsg')}")
             return data
         except Exception:
-            log(f"GEEN JSON, raw: {r.text[:300]}")
-            return {"retCode": -1, "retMsg": f"HTTP {r.status_code}: {r.text[:200]}"}
+            log(f"GEEN JSON raw: {r.text[:300]}")
+            return {"retCode": -1, "retMsg": f"HTTP {r.status_code}"}
     except Exception as e:
         log("bybit_get error: " + str(e))
         return {"retCode": -1, "retMsg": str(e)}
@@ -88,25 +93,23 @@ def bybit_post(path, body, base):
     url = base + path
     try:
         r = requests.post(url, headers=headers, data=body_str, timeout=15)
-        log(f"bybit_post {path} status={r.status_code}")
         try:
             return r.json()
         except Exception:
-            return {"retCode": -1, "retMsg": f"HTTP {r.status_code}: {r.text[:200]}"}
+            return {"retCode": -1, "retMsg": f"HTTP {r.status_code}"}
     except Exception as e:
-        log("bybit_post error: " + str(e))
         return {"retCode": -1, "retMsg": str(e)}
 
 def get_balances():
+    global BASE_URL
     total_usdt = 0.0
     total_pepe = 0.0
-    seen_ok = False
     last_error = "ERROR"
     last_raw = {}
     for base in BASE_URLS:
-        for account_type in ["UNIFIED", "SPOT"]:
+        for account_type in ["SPOT", "UNIFIED"]:
             try:
-                data = bybit_get("/v5/account/wallet-balance", {"accountType": account_type}, base)
+                data = bybit_get("/v5/account/wallet-balance", {"accountType": account_type, "coin": "USDT,PEPE"}, base)
                 last_raw = data
                 if data.get("retCode") == 10003:
                     last_error = "10003"
@@ -117,22 +120,17 @@ def get_balances():
                 lst = data.get("result", {}).get("list", [])
                 if not lst:
                     continue
-                seen_ok = True
-                global BASE_URL
                 BASE_URL = base
                 for c in lst[0].get("coin", []):
                     if c.get("coin") == "USDT":
                         total_usdt += float(c.get("walletBalance", 0) or 0)
                     if c.get("coin") == "PEPE":
                         total_pepe += float(c.get("walletBalance", 0) or 0)
-                # 1 werkende combo is genoeg
                 return total_usdt, total_pepe, "OK", last_raw
             except Exception as e:
                 log("Saldo exception: " + str(e))
                 continue
-    if not seen_ok:
-        return None, None, last_error, last_raw
-    return total_usdt, total_pepe, "OK", last_raw
+    return None, None, last_error, last_raw
 
 def get_klines():
     try:
@@ -178,7 +176,7 @@ def place_market_order(side, qty):
         qty_step, min_qty = get_qty_step()
         qty = int(qty / qty_step) * qty_step
         if qty < min_qty:
-            log("Order te klein")
+            log("Order te klein: " + str(qty))
             return None
         body = {"category": CATEGORY, "symbol": SYMBOL, "side": side, "orderType": "Market", "qty": str(qty)}
         log("Plaats order: " + str(body))
@@ -203,7 +201,7 @@ def check_bot():
             with STATE_LOCK:
                 if time.time() - STATE["last_error_msg"] > 600:
                     STATE["last_error_msg"] = time.time()
-                    send_telegram("Pepebot: saldo 10003. Fix: bybit.eu Read + Spot Trade + Wallet AAN, IP UIT.")
+                    send_telegram("Pepebot: Kan saldo niet lezen (10003). Fix: bybit.eu API Read + Spot Trade + Wallet AAN, IP UIT.")
         log("Bot stopt: geen saldo")
         return
     log(f"Saldo USDT: {usdt} PEPE: {pepe_qty}")
@@ -235,7 +233,7 @@ def check_bot():
                 with STATE_LOCK:
                     STATE["in_position"] = True; STATE["entry_price"] = price; STATE["qty"] = qty
                 save_state()
-                send_telegram("GEKOCHT PEPEUSDT Prijs: " + str(price))
+                send_telegram("GEKOCHT PEPEUSDT Prijs: " + str(price) + " Inleg: " + str(usdt) + " USDT GEEN stop-loss Rente-op-rente AAN")
                 log("KOOP uitgevoerd")
             return
     if in_pos:
@@ -248,17 +246,18 @@ def check_bot():
                 with STATE_LOCK:
                     STATE["in_position"] = False; STATE["qty"] = 0; STATE["entry_price"] = 0
                 save_state()
-                send_telegram("VERKOCHT PEPEUSDT Prijs: " + str(price))
+                send_telegram("VERKOCHT PEPEUSDT Prijs: " + str(price) + " Saldo: " + str(usdt) + " USDT")
                 log("VERKOOP uitgevoerd")
             return
     log("Geen signaal")
     with STATE_LOCK:
         if time.time() - STATE["last_start_msg"] > 3600:
-            STATE["last_start_msg"] = time.time(); need_start = True
+            STATE["last_start_msg"] = time.time()
+            need_start = True
         else:
             need_start = False
     if need_start:
-        send_telegram(f"Bot gestart: GEEN stop-loss Start 100 - Rente-op-rente AAN SPOT via 【entity-bybit¦canonical_name=Bybit】.eu Saldo: {usdt} USDT")
+        send_telegram("Bot gestart: GEEN stop-loss - Start met 100 - Rente-op-rente AAN - SPOT via bybit.eu Saldo: " + str(usdt) + " USDT")
     save_state()
     log("=== Bot check klaar ===")
 
@@ -284,7 +283,7 @@ def home():
     with STATE_LOCK:
         st = dict(STATE)
     key = BYBIT_API_KEY[:4] + "****" if BYBIT_API_KEY else "LEEG"
-    return jsonify({"status": "running", "symbol": SYMBOL, "in_position": st["in_position"], "key_start": key})
+    return jsonify({"status": "running", "symbol": SYMBOL, "in_position": st["in_position"], "key_start": key, "start_capital": START_CAPITAL})
 
 @app.route("/saldo")
 @app.route("/balance")
