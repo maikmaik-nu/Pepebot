@@ -3,8 +3,7 @@ from flask import Flask, request, jsonify
 
 app = Flask(__name__)
 
-# ================= CONFIG =================
-BYBIT_API_KEY = os.environ.get("BYBIT_API_KEY", "").strip()
+【entity-BYBIT_API_KEY¦canonical_name=Bybit】 = os.environ.get("【entity-BYBIT_API_KEY¦canonical_name=Bybit】", "").strip()
 BYBIT_API_SECRET = os.environ.get("BYBIT_API_SECRET", "").strip()
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
@@ -15,40 +14,22 @@ INTERVAL = "15"
 ATR_PERIOD = 14
 BASE_URL = "https://api.bybit.eu"
 STATE_FILE = "state.json"
-
-# Jouw instellingen uit Telegram
 START_CAPITAL = 100.0
-USE_COMPOUND = True  # Rente-op-rente AAN
-USE_STOP_LOSS = False  # GEEN stop-loss
 
-# ================= STATE IN MEMORY (Render wist state.json) =================
-# Render Free wist files bij elke restart, dus memory is leading.
-# state.json is alleen backup.
-STATE = {
-    "in_position": False,
-    "entry_price": 0.0,
-    "qty": 0.0,
-    "last_signal_time": 0,
-    "last_start_msg": 0,
-    "last_error_msg": 0,
-    "last_check": 0,
-}
+STATE = {"in_position": False, "entry_price": 0.0, "qty": 0.0, "last_check": 0, "last_start_msg": 0, "last_error_msg": 0}
 STATE_LOCK = threading.Lock()
+_LOOP_STARTED = False
 
 def log(msg):
     print(msg, flush=True)
 
-def send_telegram(msg, force=False):
+def send_telegram(msg):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return
     try:
-        requests.post(
-            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-            json={"chat_id": TELEGRAM_CHAT_ID, "text": msg},
-            timeout=10
-        )
+        requests.post("https://api.telegram.org/bot" + TELEGRAM_BOT_TOKEN + "/sendMessage", json={"chat_id": TELEGRAM_CHAT_ID, "text": msg}, timeout=10)
     except Exception as e:
-        log(f"Telegram error: {e}")
+        log("Telegram error: " + str(e))
 
 def load_state():
     try:
@@ -67,32 +48,20 @@ def save_state():
         with open(STATE_FILE, "w") as f:
             json.dump(data, f)
     except Exception as e:
-        log(f"save_state error: {e}")
+        log("save_state error: " + str(e))
 
-# ================= BYBIT V5 SIGNING - CORRECT =================
 def _sign(params_str, timestamp):
     recv_window = "5000"
-    payload = timestamp + BYBIT_API_KEY + recv_window + params_str
-    sign = hmac.new(
-        BYBIT_API_SECRET.encode("utf-8"),
-        payload.encode("utf-8"),
-        hashlib.sha256
-    ).hexdigest()
+    payload = timestamp + 【entity-BYBIT_API_KEY¦canonical_name=Bybit】 + recv_window + params_str
+    sign = hmac.new(BYBIT_API_SECRET.encode("utf-8"), payload.encode("utf-8"), hashlib.sha256).hexdigest()
     return sign, recv_window
 
 def _headers(sign, recv_window, timestamp):
-    return {
-        "X-BAPI-API-KEY": BYBIT_API_KEY,
-        "X-BAPI-SIGN": sign,
-        "X-BAPI-SIGN-TYPE": "2",
-        "X-BAPI-TIMESTAMP": timestamp,
-        "X-BAPI-RECV-WINDOW": recv_window,
-        "Content-Type": "application/json"
-    }
+    return {"X-BAPI-API-KEY": 【entity-BYBIT_API_KEY¦canonical_name=Bybit】, "X-BAPI-SIGN": sign, "X-BAPI-SIGN-TYPE": "2", "X-BAPI-TIMESTAMP": timestamp, "X-BAPI-RECV-WINDOW": recv_window, "Content-Type": "application/json"}
 
 def bybit_get(path, params):
     timestamp = str(int(time.time() * 1000))
-    query = "&".join([f"{k}={params[k]}" for k in sorted(params.keys())])
+    query = "&".join([str(k) + "=" + str(params[k]) for k in sorted(params.keys())])
     sign, recv_window = _sign(query, timestamp)
     headers = _headers(sign, recv_window, timestamp)
     url = BASE_URL + path + "?" + query
@@ -101,80 +70,68 @@ def bybit_get(path, params):
 
 def bybit_post(path, body):
     timestamp = str(int(time.time() * 1000))
-    body_str = json.dumps(body, separators=(',', ':'))
+    body_str = json.dumps(body, separators=(",", ":"))
     sign, recv_window = _sign(body_str, timestamp)
     headers = _headers(sign, recv_window, timestamp)
     url = BASE_URL + path
     r = requests.post(url, headers=headers, data=body_str, timeout=15)
     return r.json()
 
-# ================= SALDO - UNIFIED EERST, DAN SPOT =================
 def get_balances():
-    """Geeft (usdt, pepe_qty, account_type) terug. None als 10003."""
     for account_type in ["UNIFIED", "SPOT"]:
         try:
             data = bybit_get("/v5/account/wallet-balance", {"accountType": account_type, "coin": "USDT,PEPE"})
-            log(f"Saldo check {account_type}: retCode={data.get('retCode')}")
-
+            log("Saldo check " + account_type + ": retCode=" + str(data.get("retCode")))
             if data.get("retCode") == 10003:
-                log("FOUT 10003: Key heeft geen toestemming. bybit.eu > API > Read + Spot Trade + Wallet AAN, IP restrictie UIT")
+                log("FOUT 10003: Key geen toestemming. bybit.eu API Read + Spot Trade + Wallet AAN, IP UIT")
                 return None, None, "10003"
-
-            if data.get("retCode") == 10006:
-                log("FOUT 10006: Te veel requests, even wachten")
-                return None, None, "RATE_LIMIT"
-
             if data.get("retCode") != 0:
-                log(f"Saldo error {account_type}: {data}")
+                log("Saldo error " + account_type + ": " + str(data))
                 continue
-
             lst = data.get("result", {}).get("list", [])
             if not lst:
                 continue
-            coins = {c.get("coin"): float(c.get("walletBalance", 0) or 0) for c in lst[0].get("coin", [])}
-            usdt = coins.get("USDT", 0.0)
-            pepe = coins.get("PEPE", 0.0)
-            return usdt, pepe, account_type
+            coins = {}
+            for c in lst[0].get("coin", []):
+                coins[c.get("coin")] = float(c.get("walletBalance", 0) or 0)
+            return coins.get("USDT", 0.0), coins.get("PEPE", 0.0), account_type
         except Exception as e:
-            log(f"Saldo exception {account_type}: {e}")
+            log("Saldo exception " + account_type + ": " + str(e))
             continue
     return None, None, "ERROR"
 
-# ================= MARKT DATA =================
 def get_klines():
     try:
-        url = f"{BASE_URL}/v5/market/kline"
+        url = BASE_URL + "/v5/market/kline"
         r = requests.get(url, params={"category": CATEGORY, "symbol": SYMBOL, "interval": INTERVAL, "limit": 100}, timeout=15)
         data = r.json()
         lst = data.get("result", {}).get("list", [])
-        # Bybit: nieuwste eerst -> omdraaien naar oudste eerst
         return list(reversed(lst))
     except Exception as e:
-        log(f"Klines error: {e}")
+        log("Klines error: " + str(e))
         return []
 
 def get_price():
     try:
-        url = f"{BASE_URL}/v5/market/tickers"
+        url = BASE_URL + "/v5/market/tickers"
         r = requests.get(url, params={"category": CATEGORY, "symbol": SYMBOL}, timeout=10)
         lst = r.json().get("result", {}).get("list", [])
         if lst:
             return float(lst[0].get("lastPrice", 0))
     except Exception as e:
-        log(f"Price error: {e}")
+        log("Price error: " + str(e))
     return 0
 
 def get_qty_step():
-    """Haalt qtyStep en minOrderQty op, anders fallback."""
     try:
-        url = f"{BASE_URL}/v5/market/instruments-info"
+        url = BASE_URL + "/v5/market/instruments-info"
         r = requests.get(url, params={"category": CATEGORY, "symbol": SYMBOL}, timeout=10)
         lst = r.json().get("result", {}).get("list", [])
         if lst:
             f = lst[0].get("lotSizeFilter", {})
             return float(f.get("qtyStep", 1)), float(f.get("minOrderQty", 1))
     except Exception as e:
-        log(f"Instrument error: {e}")
+        log("Instrument error: " + str(e))
     return 1.0, 1.0
 
 def calc_atr(klines):
@@ -189,64 +146,142 @@ def calc_atr(klines):
         trs.append(tr)
     return sum(trs[-ATR_PERIOD:]) / ATR_PERIOD
 
-# ================= ORDERS =================
 def place_market_order(side, qty):
-    """side = Buy of Sell, qty = hoeveelheid PEPE"""
     try:
         qty_step, min_qty = get_qty_step()
-        # Afronden naar qtyStep, anders weigert Bybit
         qty = int(qty / qty_step) * qty_step
         if qty < min_qty:
-            log(f"Order te klein: qty={qty} < min={min_qty}, skip")
+            log("Order te klein: " + str(qty))
             return None
-
-        body = {
-            "category": CATEGORY,
-            "symbol": SYMBOL,
-            "side": side,
-            "orderType": "Market",
-            "qty": str(qty)
-        }
-        log(f"Plaats order: {body}")
+        body = {"category": CATEGORY, "symbol": SYMBOL, "side": side, "orderType": "Market", "qty": str(qty)}
+        log("Plaats order: " + str(body))
         data = bybit_post("/v5/order/create", body)
-        log(f"Order result: {data}")
-
-        if data.get("retCode") == 10003:
-            send_telegram("⚠️ Pepebot: Order geweigerd (10003). Zet in bybit.eu API ook 'Spot Trade' AAN.")
-            return None
+        log("Order result: " + str(data))
         if data.get("retCode") != 0:
-            log(f"Order error: {data}")
             return None
         return data
     except Exception as e:
-        log(f"Order exception: {e}")
+        log("Order exception: " + str(e))
         return None
 
-# ================= STRATEGIE =================
-# Simpel en robuust, passend bij jouw instelling:
-# - GEEN stop-loss
-# - Rente-op-rente: we gebruiken elke keer je volledige USDT saldo
-# - Koop als laatste candle groen is en sluit boven vorige close
-# - Verkoop als laatste candle rood is en sluit onder vorige close
 def check_bot():
     with STATE_LOCK:
         if time.time() - STATE["last_check"] < 60:
-            return  # voorkom dubbele checks binnen 60 sec
+            return
         STATE["last_check"] = time.time()
-
     log("=== Bot check gestart ===")
     usdt, pepe_qty, acc_type = get_balances()
-
     if usdt is None:
         if acc_type == "10003":
             with STATE_LOCK:
                 if time.time() - STATE["last_error_msg"] > 600:
                     STATE["last_error_msg"] = time.time()
-                    send_telegram("⚠️ Pepebot: Kan saldo niet lezen (10003).\nFix: bybit.eu > API > Read + Spot Trade + Wallet AAN, IP restrictie UIT.\nNieuwe key in Render zetten + redeploy.")
-        log("Bot stopt deze ronde: geen saldo")
+                    send_telegram("Pepebot: Kan saldo niet lezen (10003). Fix: bybit.eu API Read + Spot Trade + Wallet AAN, IP UIT.")
+        log("Bot stopt: geen saldo")
         return
-
-    log(f"Saldo USDT {acc_type}: {usdt} | PEPE: {pepe_qty}")
-
+    log("Saldo USDT " + acc_type + ": " + str(usdt) + " | PEPE: " + str(pepe_qty))
     klines = get_klines()
-    if len(klines) < 5
+    if len(klines) < 5:
+        log("Te weinig klines, skip")
+        return
+    price = get_price()
+    if price == 0:
+        price = float(klines[-1][4])
+    atr = calc_atr(klines)
+    last = klines[-1]
+    prev = klines[-2]
+    last_open = float(last[1])
+    last_close = float(last[4])
+    prev_close = float(prev[4])
+    log("Prijs: " + str(price) + " | ATR: " + str(atr))
+    with STATE_LOCK:
+        in_pos = STATE["in_position"]
+        if pepe_qty > 0 and not in_pos:
+            STATE["in_position"] = True
+            STATE["qty"] = pepe_qty
+            in_pos = True
+        if pepe_qty == 0 and in_pos:
+            STATE["in_position"] = False
+            STATE["qty"] = 0
+            in_pos = False
+    if not in_pos and last_close > last_open and last_close > prev_close:
+        if usdt < 5:
+            log("Te weinig USDT")
+            return
+        qty = usdt / price
+        res = place_market_order("Buy", qty)
+        if res:
+            with STATE_LOCK:
+                STATE["in_position"] = True
+                STATE["entry_price"] = price
+                STATE["qty"] = qty
+            save_state()
+            send_telegram("GEKOCHT PEPEUSDT Prijs: " + str(price) + " Inleg: " + str(usdt) + " USDT GEEN stop-loss Rente-op-rente AAN")
+            log("KOOP uitgevoerd")
+        return
+    if in_pos and last_close < last_open and last_close < prev_close:
+        qty_to_sell = pepe_qty if pepe_qty > 0 else STATE["qty"]
+        if qty_to_sell <= 0:
+            return
+        res = place_market_order("Sell", qty_to_sell)
+        if res:
+            with STATE_LOCK:
+                STATE["in_position"] = False
+                STATE["qty"] = 0
+                STATE["entry_price"] = 0
+            save_state()
+            send_telegram("VERKOCHT PEPEUSDT Prijs: " + str(price) + " Saldo: " + str(usdt) + " USDT")
+            log("VERKOOP uitgevoerd")
+        return
+    log("Geen signaal. In positie: " + str(in_pos))
+    with STATE_LOCK:
+        if time.time() - STATE["last_start_msg"] > 3600:
+            STATE["last_start_msg"] = time.time()
+            need_start = True
+        else:
+            need_start = False
+    if need_start:
+        send_telegram("Bot gestart: GEEN stop-loss - Start met 100 - Rente-op-rente AAN - SPOT via bybit.eu Saldo: " + str(usdt) + " USDT")
+    save_state()
+    log("=== Bot check klaar ===")
+
+def loop():
+    check_bot()
+    while True:
+        time.sleep(900)
+        try:
+            check_bot()
+        except Exception as e:
+            log("Loop error: " + str(e))
+
+def start_loop_once():
+    global _LOOP_STARTED
+    if _LOOP_STARTED:
+        return
+    _LOOP_STARTED = True
+    load_state()
+    threading.Thread(target=loop, daemon=True).start()
+
+@app.route("/")
+def home():
+    with STATE_LOCK:
+        st = dict(STATE)
+    return jsonify({"status": "running", "symbol": SYMBOL, "in_position": st["in_position"]})
+
+@app.route("/check")
+def manual_check():
+    threading.Thread(target=check_bot, daemon=True).start()
+    return jsonify({"ok": True})
+
+@app.route("/webhook", methods=["POST"])
+def webhook():
+    data = request.get_json(force=True, silent=True) or {}
+    log("Webhook: " + str(data))
+    threading.Thread(target=check_bot, daemon=True).start()
+    return jsonify({"ok": True})
+
+start_loop_once()
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host="0.0.0.0", port=port)
