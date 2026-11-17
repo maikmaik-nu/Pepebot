@@ -1,58 +1,62 @@
-import os, time, hmac, hashlib, requests
-from flask import Flask, jsonify
+import os, json, time, threading, hmac, hashlib, urllib.parse
+import requests
+from flask import Flask, request, jsonify
 
 app = Flask(__name__)
 
-API_KEY = os.getenv("BYBIT_API_KEY", "").strip()
-API_SECRET = os.getenv("BYBIT_API_SECRET", "").strip()
-BASE = "https://api.bybit.eu"
+BYBIT_API_KEY = os.environ.get("BYBIT_API_KEY", "").strip()
+BYBIT_API_SECRET = os.environ.get("BYBIT_API_SECRET", "").strip()
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 
-print(f"KEY LOADED: {API_KEY[:4]}**** len={len(API_KEY)} secret_len={len(API_SECRET)}", flush=True)
+SYMBOL = "PEPEUSDT"
+CATEGORY = "spot"
+INTERVAL = "15"
+ATR_PERIOD = 14
+BASE_URL = "https://api.bybit.eu"
+STATE_FILE = "state.json"
 
-def bybit_get(path, params):
-    params = dict(params)
-    params["api_key"] = API_KEY
-    params["timestamp"] = str(int(time.time() * 1000))
-    params["recv_window"] = "5000"
-    # sorteren voor signature
-    query = "&".join(f"{k}={params[k]}" for k in sorted(params))
-    sign = hmac.new(API_SECRET.encode(), query.encode(), hashlib.sha256).hexdigest()
-    url = f"{BASE}{path}?{query}&sign={sign}"
-    r = requests.get(url, timeout=10)
+STATE = {"in_position": False, "entry_price": 0.0, "qty": 0.0, "last_check": 0, "last_start_msg": 0, "last_error_msg": 0}
+STATE_LOCK = threading.Lock()
+_LOOP_STARTED = False
+
+def log(msg):
+    print(msg, flush=True)
+
+log(f"KEY LOADED: {BYBIT_API_KEY[:4] if BYBIT_API_KEY else 'LEEG'}**** len={len(BYBIT_API_KEY)} secret_len={len(BYBIT_API_SECRET)}")
+
+def send_telegram(msg):
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return
     try:
-        return r.status_code, r.json()
-    except:
-        return r.status_code, {"retCode": -1, "retMsg": "empty", "body": r.text[:200]}
+        requests.post("https://api.telegram.org/bot" + TELEGRAM_BOT_TOKEN + "/sendMessage", json={"chat_id": TELEGRAM_CHAT_ID, "text": msg}, timeout=10)
+    except Exception as e:
+        log("Telegram error: " + str(e))
 
-def get_balances():
-    for account in ["SPOT", "UNIFIED"]:
-        status, data = bybit_get("/v5/account/wallet-balance", {"accountType": account})
-        print(f"Saldo check {account}: http={status} retCode={data.get('retCode')} retMsg={data.get('retMsg')}", flush=True)
-        if data.get("retCode") == 0:
-            coins = {}
-            for lst in data.get("result", {}).get("list", []):
-                for c in lst.get("coin", []):
-                    coins[c["coin"]] = float(c.get("walletBalance", 0))
-            return coins, account, data
-    return None, None, data
+def load_state():
+    try:
+        if os.path.exists(STATE_FILE):
+            with open(STATE_FILE, "r") as f:
+                data = json.load(f)
+                with STATE_LOCK:
+                    STATE.update(data)
+    except Exception:
+        pass
 
-@app.route("/")
-def home():
-    return "Pepebot live"
+def save_state():
+    try:
+        with STATE_LOCK:
+            data = dict(STATE)
+        with open(STATE_FILE, "w") as f:
+            json.dump(data, f)
+    except Exception as e:
+        log("save_state error: " + str(e))
 
-@app.route("/test-key")
-def test_key():
-    coins, account, raw = get_balances()
-    if coins is None:
-        return jsonify({"key_start": API_KEY[:4] + "****", "status": "ERROR", "usdt": None, "pepe": None, "【entity-bybit¦canonical_name=Bybit】": raw})
-    return jsonify({"key_start": API_KEY[:4] + "****", "status": "OK", "account": account, "usdt": coins.get("USDT"), "pepe": coins.get("PEPE")})
+def _sign(params_str, timestamp):
+    recv_window = "5000"
+    payload = timestamp + BYBIT_API_KEY + recv_window + params_str
+    sign = hmac.new(BYBIT_API_SECRET.encode("utf-8"), payload.encode("utf-8"), hashlib.sha256).hexdigest()
+    return sign, recv_window
 
-@app.route("/run")
-def run():
-    coins, account, raw = get_balances()
-    if coins is None:
-        return jsonify({"error": "geen saldo", "bybit": raw}), 401
-    return jsonify({"status": "OK", "account": account, "usdt": coins.get("USDT"), "pepe": coins.get("PEPE")})
-
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 10000)))
+def _headers(sign, recv_window, timestamp):
+    return {"X-BAPI-API-KEY": BYBIT_API_KEY, "
