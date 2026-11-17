@@ -23,11 +23,7 @@ _LOOP_STARTED = False
 def log(msg):
     print(msg, flush=True)
 
-# Bij opstart meteen zien of key wel geladen is
 log(f"KEY LOADED: {len(BYBIT_API_KEY)} chars, start={BYBIT_API_KEY[:4] if BYBIT_API_KEY else 'LEEG'}****")
-log(f"SECRET LOADED: {len(BYBIT_API_SECRET)} chars")
-if not BYBIT_API_KEY or not BYBIT_API_SECRET:
-    log("FOUT: BYBIT_API_KEY of SECRET ontbreekt in Environment!")
 
 def send_telegram(msg):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
@@ -104,15 +100,13 @@ def get_balances():
     total_pepe = 0.0
     seen_ok = False
     last_error = "ERROR"
-    results = {}
-    # Geld staat in Spot & Margin, dus SPOT eerst
+    # OPLOSSING: geen coin param meer, dat gaf ERROR voor SPOT
     for account_type in ["SPOT", "UNIFIED"]:
         try:
-            data = bybit_get("/v5/account/wallet-balance", {"accountType": account_type, "coin": "USDT,PEPE"})
-            results[account_type] = data.get("retCode")
+            data = bybit_get("/v5/account/wallet-balance", {"accountType": account_type})
             log(f"Saldo check {account_type}: retCode={data.get('retCode')} retMsg={data.get('retMsg')}")
             if data.get("retCode") == 10003:
-                log(f"FOUT 10003 in {account_type}: Key geen toestemming. 【entity-bybit¦canonical_name=Bybit】.eu API Read + Spot Trade + Wallet AAN, IP UIT")
+                log(f"FOUT 10003 in {account_type}: Key geen toestemming. bybit.eu API Read + Spot Trade + Wallet AAN, IP UIT")
                 last_error = "10003"
                 continue
             if data.get("retCode") != 0:
@@ -257,7 +251,7 @@ def check_bot():
         else:
             need_start = False
     if need_start:
-        send_telegram(f"Bot gestart: GEEN stop-loss - Start met 100 - Rente-op-rente AAN - SPOT via 【entity-bybit¦canonical_name=Bybit】.eu Saldo: {usdt} USDT")
+        send_telegram(f"Bot gestart: GEEN stop-loss - Start met 100 - Rente-op-rente AAN - SPOT via 【entity-bybit¦canonical_name=BYBIT】.eu Saldo: {usdt} USDT")
     save_state()
     log("=== Bot check klaar ===")
 
@@ -291,7 +285,6 @@ def manual_check():
 
 @app.route("/test-key")
 def test_key():
-    # Test zonder te traden, alleen saldo lezen
     usdt, pepe, acc = get_balances()
     return jsonify({"key_start": BYBIT_API_KEY[:4] + "****" if BYBIT_API_KEY else "LEEG", "usdt": usdt, "pepe": pepe, "status": acc})
 
