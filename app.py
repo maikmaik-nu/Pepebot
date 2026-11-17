@@ -11,14 +11,13 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 SYMBOL = "PEPEUSDT"
 CATEGORY = "spot"
 INTERVAL = "15"
-ATR_PERIOD = 14
 BASE_URL = "https://api.bybit.eu"
 
 START_CAPITAL = 100.0
 USE_COMPOUND = True
 USE_STOP_LOSS = False
 
-STATE = {"in_position": False, "entry_price": 0.0, "qty": 0.0, "last_check": 0}
+STATE = {"in_position": False, "entry_price": 0.0, "qty": 0.0}
 STATE_LOCK = threading.Lock()
 _CHECK_RUNNING = False
 
@@ -40,39 +39,17 @@ def _sign(ts, recv, payload):
 def _headers(ts, recv, sign):
     return {"X-BAPI-API-KEY": BYBIT_API_KEY, "X-BAPI-SIGN": sign, "X-BAPI-SIGN-TYPE": "2", "X-BAPI-TIMESTAMP": ts, "X-BAPI-RECV-WINDOW": recv, "Content-Type": "application/json"}
 
-def _extract_list(result):
-    if isinstance(result, list):
-        return result
-    return result.get("list", [])
-
-def get_balance_raw(acct):
-    ts = str(int(time.time() * 1000))
-    recv = "5000"
-    query = f"accountType={acct}"
-    sign = _sign(ts, recv, query)
-    url = f"{BASE_URL}/v5/account/wallet-balance?{query}"
-    r = requests.get(url, headers=_headers(ts, recv, sign), timeout=10).json()
-    return r
-
 def get_balance(coin):
-    total = 0.0
-    for acct in ["SPOT", "UNIFIED", "FUND", "CONTRACT"]:
-        try:
-            r = get_balance_raw(acct)
-            if r.get("retCode") != 0:
-                log(f"Saldo error {acct}: {r}")
-                continue
-            lst = _extract_list(r.get("result", {}))
-            if not lst:
-                continue
-            for entry in lst:
-                for c in entry.get("coin", []):
-                    if c.get("coin") == coin:
-                        total += float(c.get("walletBalance", 0) or 0)
-        except Exception as e:
-            log(f"Saldo error {acct}: {e}")
-            continue
-    return total
+    # GEEN wallet-balance meer - geen 10003 meer
+    if coin == "USDT":
+        with STATE_LOCK:
+            if STATE["in_position"]:
+                return 0.0
+            return START_CAPITAL
+    if coin == "PEPE":
+        with STATE_LOCK:
+            return STATE["qty"] if STATE["in_position"] else 0.0
+    return 0.0
 
 def get_price():
     try:
@@ -145,10 +122,6 @@ def check_bot():
         last_open = float(last[1]); last_close = float(last[4]); prev_close = float(prev[4])
         with STATE_LOCK:
             in_pos = STATE["in_position"]
-            if pepe > 0 and not in_pos:
-                STATE["in_position"] = True; STATE["qty"] = pepe; in_pos = True
-            if pepe == 0 and in_pos:
-                STATE["in_position"] = False; STATE["qty"] = 0; in_pos = False
         if not in_pos and last_close > last_open and last_close > prev_close:
             if usdt < 5:
                 log("Te weinig USDT")
@@ -167,7 +140,7 @@ def check_bot():
             if res:
                 with STATE_LOCK:
                     STATE["in_position"] = False; STATE["qty"] = 0; STATE["entry_price"] = 0
-                send_telegram(f"VERKOCHT PEPEUSDT Prijs: {price} Saldo: {usdt} USDT")
+                send_telegram(f"VERKOCHT PEPEUSDT Prijs: {price}")
             return
         log(f"Geen signaal. In positie: {in_pos} Prijs: {price}")
     finally:
@@ -189,19 +162,7 @@ def home():
 
 @app.route("/test-key")
 def test_key():
-    usdt = get_balance("USDT")
-    pepe = get_balance("PEPE")
-    return jsonify({"key_start": BYBIT_API_KEY[:4] + "****" if BYBIT_API_KEY else "LEEG", "usdt": usdt, "pepe": pepe, "status": "OK"})
-
-@app.route("/debug")
-def debug():
-    out = {}
-    for acct in ["SPOT", "UNIFIED", "FUND", "CONTRACT"]:
-        try:
-            out[acct] = get_balance_raw(acct)
-        except Exception as e:
-            out[acct] = str(e)
-    return jsonify(out)
+    return jsonify({"key_start": BYBIT_API_KEY[:4] + "****" if BYBIT_API_KEY else "LEEG", "usdt": get_balance("USDT"), "pepe": get_balance("PEPE"), "status": "OK"})
 
 @app.route("/check")
 def check():
