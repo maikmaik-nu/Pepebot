@@ -5,9 +5,8 @@ from flask import Flask, request, jsonify
 
 app = Flask(__name__)
 
-# --- ENV, schoon gelezen ---
-【entity-BYBIT_API_KEY¦canonical_name=Bybit】 = os.environ.get("【entity-BYBIT_API_KEY¦canonical_name=Bybit】", "").strip()
-【entity-BYBIT_API_SECRET¦canonical_name=Bybit】 = os.environ.get("【entity-BYBIT_API_SECRET¦canonical_name=Bybit】", "").strip()
+BYBIT_API_KEY = os.environ.get("BYBIT_API_KEY", "").strip()
+BYBIT_API_SECRET = os.environ.get("BYBIT_API_SECRET", "").strip()
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 
@@ -17,7 +16,6 @@ INTERVAL = "15"
 ATR_PERIOD = 14
 STATE_FILE = "state.json"
 
-# Beide domeinen proberen, in deze volgorde. Werkt voor .eu én .com keys.
 BASE_URLS = ["https://api.bybit.eu", "https://api.bybit.com"]
 WORKING_BASE = {"url": BASE_URLS[0]}
 
@@ -35,13 +33,10 @@ _LOOP_STARTED = False
 def log(msg):
     print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
 
-# Startup-check: meteen zien of keys wel geladen zijn
-if not 【entity-BYBIT_API_KEY¦canonical_name=Bybit】 or not 【entity-BYBIT_API_SECRET¦canonical_name=Bybit】:
-    log("!!! FOUT: 【entity-BYBIT_API_KEY¦canonical_name=Bybit】 of 【entity-BYBIT_API_SECRET¦canonical_name=Bybit】 is LEEG in Render Environment !!!")
+if not BYBIT_API_KEY or not BYBIT_API_SECRET:
+    log("FOUT: KEY of SECRET is LEEG in Render Environment")
 else:
-    log(f"KEY LOADED: {【entity-BYBIT_API_KEY¦canonical_name=Bybit】[:4]}**** secret_len={len(【entity-BYBIT_API_SECRET¦canonical_name=Bybit】)}")
-    if len(【entity-BYBIT_API_SECRET¦canonical_name=Bybit】) < 20:
-        log("!!! WAARSCHUWING: Secret lijkt te kort / afgeknipt. Kopieer hem opnieuw !!!")
+    log(f"KEY LOADED: {BYBIT_API_KEY[:4]}**** secret_len={len(BYBIT_API_SECRET)}")
 
 def send_telegram(msg):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
@@ -105,12 +100,9 @@ def _do_get(base, path, params):
         return {"retCode": -1, "retMsg": f"HTTP {r.status_code}: {raw}", "_http": r.status_code, "_base": base}
 
 def bybit_get(path, params):
-    # 1. Probeer eerst de laatst werkende base
     data = _do_get(WORKING_BASE["url"], path, params)
     if data.get("retCode") == 0:
         return data
-    # 2. Als het 401 / geen JSON was, probeer de andere base 1x (eu <-> com fix)
-    # 10003 = permissie, dan heeft ander domein geen zin, niet proberen
     if data.get("retCode") == 10003:
         return data
     for base in BASE_URLS:
@@ -122,12 +114,10 @@ def bybit_get(path, params):
             WORKING_BASE["url"] = base
             log(f"WERKENDE BASE GEVONDEN: {base}")
             return data2
-        # Onthoud de beste fout om te tonen
         data = data2
     return data
 
 def bybit_post(path, body):
-    # POST altijd op de werkende base
     base = WORKING_BASE["url"]
     timestamp = str(int(time.time() * 1000))
     body_str = json.dumps(body, separators=(",", ":"))
@@ -148,14 +138,13 @@ def bybit_post(path, body):
         return {"retCode": -1, "retMsg": str(e)}
 
 def get_balances():
-    # PERFECTE LOGICA: UNIFIED eerst, SPOT alleen als fallback. Niet optellen, anders dubbel tellen.
     last_raw = {}
     for account_type in ["UNIFIED", "SPOT"]:
         data = bybit_get("/v5/account/wallet-balance", {"accountType": account_type})
         last_raw = data
         log(f"Saldo check {account_type} op {WORKING_BASE['url']}")
         if data.get("retCode") == 10003:
-            log("FOUT 10003: geen permissie - Zet in Bybit: Read + Spot Trade + Wallet AAN, IP UIT")
+            log("FOUT 10003: geen permissie - Zet Read + Spot Trade + Wallet AAN, IP UIT")
             return None, None, "10003", last_raw
         if data.get("retCode") != 0:
             log(f"Saldo error {account_type}: {data}")
@@ -242,12 +231,11 @@ def check_bot():
     log("=== Bot check gestart ===")
     usdt, pepe_qty, acc_type, raw = get_balances()
     if usdt is None:
-        # Duidelijke Telegram fout, maar max 1x per 10 min
         with STATE_LOCK:
             if time.time() - STATE["last_error_msg"] > 600:
                 STATE["last_error_msg"] = time.time()
                 if acc_type == "10003":
-                    send_telegram("Pepebot: saldo 10003. Fix: Bybit Read + Spot Trade + Wallet AAN, IP UIT.")
+                    send_telegram("Pepebot: saldo 10003. Fix: Read + Spot Trade + Wallet AAN, IP UIT.")
                 elif "401" in str(raw):
                     send_telegram("Pepebot: HTTP 401. Key + Secret horen niet bij elkaar. Verwijder ze in Render en plak ze opnieuw, zonder spatie.")
                 else:
