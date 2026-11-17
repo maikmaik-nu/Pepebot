@@ -1,4 +1,4 @@
-import os, time, requests, hmac, hashlib, json, threading
+import os, time, requests, hmac, hashlib, json, threading, urllib.parse
 from flask import Flask, request, jsonify
 
 app = Flask(__name__)
@@ -61,12 +61,21 @@ def _headers(sign, recv_window, timestamp):
 
 def bybit_get(path, params):
     timestamp = str(int(time.time() * 1000))
-    query = "&".join([str(k) + "=" + str(params[k]) for k in sorted(params.keys())])
+    # urlencode zorgt dat de komma in USDT,PEPE goed wordt als %2C
+    query = urllib.parse.urlencode(sorted(params.items()))
     sign, recv_window = _sign(query, timestamp)
     headers = _headers(sign, recv_window, timestamp)
     url = BASE_URL + path + "?" + query
-    r = requests.get(url, headers=headers, timeout=15)
-    return r.json()
+    try:
+        r = requests.get(url, headers=headers, timeout=15)
+        try:
+            return r.json()
+        except:
+            log("bybit_get geen JSON terug, status=" + str(r.status_code))
+            return {"retCode": -1, "retMsg": "empty"}
+    except Exception as e:
+        log("bybit_get exception: " + str(e))
+        return {"retCode": -1, "retMsg": str(e)}
 
 def bybit_post(path, body):
     timestamp = str(int(time.time() * 1000))
@@ -75,7 +84,10 @@ def bybit_post(path, body):
     headers = _headers(sign, recv_window, timestamp)
     url = BASE_URL + path
     r = requests.post(url, headers=headers, data=body_str, timeout=15)
-    return r.json()
+    try:
+        return r.json()
+    except:
+        return {"retCode": -1, "retMsg": "empty"}
 
 def get_balances():
     total_usdt = 0.0
