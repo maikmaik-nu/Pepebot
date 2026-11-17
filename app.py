@@ -1,4 +1,4 @@
-import os, json, time, threading, hmac, hashlib, urllib.parse
+import os, json, time, threading, hmac, hashlib, urllib.parse, traceback
 from decimal import Decimal, ROUND_DOWN
 import requests
 from flask import Flask, request, jsonify
@@ -15,8 +15,6 @@ CATEGORY = "spot"
 INTERVAL = "15"
 ATR_PERIOD = 14
 STATE_FILE = "state.json"
-
-# Probeer beide 【entity-Bybit¦canonical_name=BYBIT】 domeinen, eu eerst
 BASE_URLS = ["https://api.bybit.eu", "https://api.bybit.com"]
 BASE_URL = BASE_URLS[0]
 
@@ -104,8 +102,6 @@ def get_balances():
     seen_ok = False
     debug = []
     last_error = "ERROR"
-
-    # FIX: probeer eu + com, en UNIFIED + SPOT, zonder coin param
     for base in BASE_URLS:
         for account_type in ["UNIFIED", "SPOT"]:
             data = bybit_get(base, "/v5/account/wallet-balance", {"accountType": account_type})
@@ -128,10 +124,8 @@ def get_balances():
                     total_usdt += float(c.get("walletBalance", 0) or 0)
                 if c.get("coin") == "PEPE":
                     total_pepe += float(c.get("walletBalance", 0) or 0)
-        # Als eu al werkt, hoef je com niet meer te proberen
         if seen_ok:
             break
-
     LAST_DEBUG = {"attempts": debug, "seen_ok": seen_ok}
     if not seen_ok:
         return None, None, last_error
@@ -228,15 +222,13 @@ def check_bot():
             price = float(klines[-1][4])
         last = klines[-1]; prev = klines[-2]
         last_open = float(last[1]); last_close = float(last[4]); prev_close = float(prev[4])
-        log(f"Prijs: {price}")
-
+        log(f"Prijs: {price} | ATR: {calc_atr(klines)}")
         with STATE_LOCK:
             in_pos = STATE["in_position"]
             if pepe_qty > 0 and not in_pos:
                 STATE["in_position"] = True; STATE["qty"] = pepe_qty; in_pos = True
             if pepe_qty == 0 and in_pos:
                 STATE["in_position"] = False; STATE["qty"] = 0; in_pos = False
-
         if not in_pos and last_close > last_open and last_close > prev_close:
             if usdt < 5:
                 log("Te weinig USDT"); return
@@ -246,10 +238,9 @@ def check_bot():
                 with STATE_LOCK:
                     STATE["in_position"] = True; STATE["entry_price"] = price; STATE["qty"] = qty
                 save_state()
-                send_telegram(f"GEKOCHT PEPEUSDT Prijs: {price} Inleg: {usdt} USDT")
+                send_telegram(f"GEKOCHT PEPEUSDT Prijs: {price} Inleg: {usdt} USDT GEEN stop-loss Rente-op-rente AAN")
                 log("KOOP uitgevoerd")
             return
-
         if in_pos and last_close < last_open and last_close < prev_close:
             qty_to_sell = pepe_qty if pepe_qty > 0 else 0
             if qty_to_sell <= 0:
@@ -263,10 +254,12 @@ def check_bot():
                 send_telegram(f"VERKOCHT PEPEUSDT Prijs: {price} Saldo: {usdt} USDT")
                 log("VERKOOP uitgevoerd")
             return
-
         log(f"Geen signaal. In positie: {in_pos}")
         save_state()
         log("=== Bot check klaar ===")
+    except Exception as e:
+        log("check_bot crash: " + str(e))
+        log(traceback.format_exc())
     finally:
         _CHECK_RUNNING = False
 
@@ -300,8 +293,13 @@ def manual_check():
 
 @app.route("/test-key")
 def test_key():
-    usdt, pepe, acc = get_balances()
-    return jsonify({"key_start": BYBIT_API_KEY[:4] + "****" if BYBIT_API_KEY else "LEEG", "usdt": usdt, "pepe": pepe, "status": acc, "debug": LAST_DEBUG})
+    try:
+        usdt, pepe, acc = get_balances()
+        return jsonify({"key_start": BYBIT_API_KEY[:4] + "****" if BYBIT_API_KEY else "LEEG", "usdt": usdt, "pepe": pepe, "status": acc, "debug": LAST_DEBUG})
+    except Exception as e:
+        log("TEST-KEY CRASH: " + str(e))
+        log(traceback.format_exc())
+        return jsonify({"error": str(e), "status": "CRASH", "debug": LAST_DEBUG}), 500
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
