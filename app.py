@@ -1,7 +1,6 @@
-import os, time, threading, json
+import os, time, threading, json, hmac, hashlib, urllib.parse, urllib.request
 from decimal import Decimal
 from flask import Flask, jsonify
-from pybit.unified_trading import HTTP
 
 app = Flask(__name__)
 
@@ -9,26 +8,17 @@ SYMBOL = "PEPEUSDT"
 INTERVAL = "15"
 UTBOT_FACTOR = 4.0
 ATR_PERIOD = 14
+BASE = "https://api.bybit.eu"
 
 API_KEY = os.getenv("BYBIT_API_KEY", "").strip()
 API_SECRET = os.getenv("BYBIT_API_SECRET", "").strip()
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
 TELEGRAM_CHAT = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
-def get_client():
-    return HTTP(
-        testnet=False,
-        api_key=API_KEY,
-        api_secret=API_SECRET,
-        domain="bybit.eu",
-        recv_window=20000
-    )
-
 def send_tg(msg):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT:
         return
     try:
-        import urllib.request
         url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
         data = json.dumps({"chat_id": TELEGRAM_CHAT, "text": msg}).encode()
         req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
@@ -36,12 +26,46 @@ def send_tg(msg):
     except Exception as e:
         print("TG ERR", e, flush=True)
 
+def bybit_get(path, params):
+    ts = str(int(time.time() * 1000))
+    recv = "20000"
+    qs = urllib.parse.urlencode(params)
+    to_sign = ts + API_KEY + recv + qs
+    sign = hmac.new(API_SECRET.encode(), to_sign.encode(), hashlib.sha256).hexdigest()
+    url = BASE + path + "?" + qs
+    req = urllib.request.Request(url, headers={
+        "X-BAPI-API-KEY": API_KEY,
+        "X-BAPI-TIMESTAMP": ts,
+        "X-BAPI-RECV-WINDOW": recv,
+        "X-BAPI-SIGN": sign,
+        "X-BAPI-SIGN-TYPE": "2",
+        "Content-Type": "application/json"
+    })
+    with urllib.request.urlopen(req, timeout=20) as r:
+        return json.loads(r.read().decode())
+
+def bybit_post(path, params):
+    ts = str(int(time.time() * 1000))
+    recv = "20000"
+    body = json.dumps(params)
+    to_sign = ts + API_KEY + recv + body
+    sign = hmac.new(API_SECRET.encode(), to_sign.encode(), hashlib.sha256).hexdigest()
+    req = urllib.request.Request(BASE + path, data=body.encode(), headers={
+        "X-BAPI-API-KEY": API_KEY,
+        "X-BAPI-TIMESTAMP": ts,
+        "X-BAPI-RECV-WINDOW": recv,
+        "X-BAPI-SIGN": sign,
+        "X-BAPI-SIGN-TYPE": "2",
+        "Content-Type": "application/json"
+    }, method="POST")
+    with urllib.request.urlopen(req, timeout=20) as r:
+        return json.loads(r.read().decode())
+
 def get_balance():
-    client = get_client()
     for acct in ["SPOT", "UNIFIED"]:
         try:
-            r = client.get_wallet_balance(accountType=acct, coin="USDT")
-            print(f"BALANCE TRY {acct} -> {r}", flush=True)
+            r = bybit_get("/v5/account/wallet-balance", {"accountType": acct, "coin": "USDT"})
+            print(f"BAL {acct} -> {r}", flush=True)
             if r.get("retCode") == 0:
                 for w in r.get("result", {}).get("list", []):
                     for c in w.get("coin", []):
@@ -49,15 +73,15 @@ def get_balance():
                             return Decimal(str(c.get("walletBalance", "0")))
                 return Decimal("0")
         except Exception as e:
-            print(f"BALANCE EXC {acct} {e}", flush=True)
+            print(f"BAL EXC {acct} {e}", flush=True)
     return None
 
 def get_klines():
-    client = get_client()
-    r = client.get_kline(category="spot", symbol=SYMBOL, interval=INTERVAL, limit=200)
-    if r.get("retCode") != 0:
-        raise Exception(f"Kline {r}")
-    return r["result"]["list"][::-1]
+    # public, geen key nodig
+    url = BASE + f"/v5/market/kline?category=spot&symbol={SYMBOL}&interval={INTERVAL}&limit=200"
+    with urllib.request.urlopen(url, timeout=20) as r:
+        d = json.loads(r.read().decode())
+    return d["result"]["list"][::-1]
 
 def calc_utbot(klines):
     closes = [float(k[4]) for k in klines]
@@ -72,15 +96,13 @@ def calc_utbot(klines):
     last_close = closes[-1]
     prev_close = closes[-2]
     trailing_prev = prev_close - UTBOT_FACTOR * atr
-    is_buy = last_close > trailing_prev
-    is_sell = last_close < trailing_prev
-    return is_buy, is_sell, atr
+    return last_close > trailing_prev, last_close < trailing_prev
 
 state = {"running": False, "last": "gestart", "balance": "?"}
 
 def bot_loop():
     time.sleep(5)
-    send_tg("🤖 Pepebot-3 gestart - pybit / bybit.eu")
+    send_tg("🤖 Pepebot-3 gestart - api.bybit.eu direct")
     in_position = False
     while True:
         try:
@@ -92,9 +114,8 @@ def bot_loop():
                 continue
             state["balance"] = str(bal)
             klines = get_klines()
-            is_buy, is_sell, atr = calc_utbot(klines)
-            client = get_client()
-            r = client.get_wallet_balance(accountType="SPOT", coin="PEPE")
+            is_buy, is_sell = calc_utbot(klines)
+            r = bybit_get("/v5/account/wallet-balance", {"accountType": "SPOT", "coin": "PEPE"})
             pepe_bal = Decimal("0")
             if r.get("retCode") == 0:
                 for w in r["result"]["list"]:
@@ -107,14 +128,14 @@ def bot_loop():
                 price = float(klines[-1][4])
                 qty = int(float(bal / Decimal(str(price))))
                 if qty > 0:
-                    o = client.place_order(category="spot", symbol=SYMBOL, side="Buy", orderType="Market", qty=str(qty))
+                    o = bybit_post("/v5/order/create", {"category": "spot", "symbol": SYMBOL, "side": "Buy", "orderType": "Market", "qty": str(qty)})
                     print("BUY", o, flush=True)
-                    send_tg(f"🟢 BUY PEPE {qty} @ {price} bal {bal}")
+                    send_tg(f"🟢 BUY PEPE {qty} @ {price}")
                     in_position = True
             elif is_sell and (in_position or pepe_bal > 0):
                 qty = int(pepe_bal)
                 if qty > 0:
-                    o = client.place_order(category="spot", symbol=SYMBOL, side="Sell", orderType="Market", qty=str(qty))
+                    o = bybit_post("/v5/order/create", {"category": "spot", "symbol": SYMBOL, "side": "Sell", "orderType": "Market", "qty": str(qty)})
                     print("SELL", o, flush=True)
                     send_tg(f"🔴 SELL PEPE {qty}")
                     in_position = False
@@ -131,13 +152,11 @@ def home():
 @app.route("/test-key")
 def test_key():
     try:
-        client = get_client()
-        r = client.get_wallet_balance(accountType="SPOT", coin="USDT")
-        return jsonify({"key_start": API_KEY[:4] if API_KEY else "LEEG", "key_len": len(API_KEY), "secret_len": len(API_SECRET), "bybit_raw": r})
+        r = bybit_get("/v5/account/wallet-balance", {"accountType": "SPOT", "coin": "USDT"})
+        return jsonify({"key_start": API_KEY[:4] if API_KEY else "LEEG", "bybit_raw": r})
     except Exception as e:
         return jsonify({"key_start": API_KEY[:4] if API_KEY else "LEEG", "error": str(e)})
 
-# FIX 2: start direct bij import, niet alleen in __main__ (gunicorn)
 if not state["running"]:
     state["running"] = True
     threading.Thread(target=bot_loop, daemon=True).start()
