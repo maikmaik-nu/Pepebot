@@ -8,12 +8,15 @@ SYMBOL = "PEPEUSDT"
 INTERVAL = "15"
 UTBOT_FACTOR = 4.0
 ATR_PERIOD = 14
-BASE = "https://api.bybit.com"
+BASES = ["https://api.bybit.com", "https://api.bybit.eu"]
 
-API_KEY = os.getenv("BYBIT_API_KEY", "").strip()
-API_SECRET = os.getenv("BYBIT_API_SECRET", "").strip()
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
-TELEGRAM_CHAT = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+def clean(v):
+    return (v or "").strip().strip('"').strip("'").strip()
+
+API_KEY = clean(os.getenv("BYBIT_API_KEY"))
+API_SECRET = clean(os.getenv("BYBIT_API_SECRET"))
+TELEGRAM_TOKEN = clean(os.getenv("TELEGRAM_TOKEN"))
+TELEGRAM_CHAT = clean(os.getenv("TELEGRAM_CHAT_ID"))
 
 def send_tg(msg):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT:
@@ -26,13 +29,13 @@ def send_tg(msg):
     except Exception as e:
         print("TG ERR", e, flush=True)
 
-def bybit_get(path, params):
+def _signed_get_one(base, path, params):
     ts = str(int(time.time() * 1000))
     recv = "20000"
     qs = urllib.parse.urlencode(params)
     to_sign = ts + API_KEY + recv + qs
     sign = hmac.new(API_SECRET.encode(), to_sign.encode(), hashlib.sha256).hexdigest()
-    url = BASE + path + "?" + qs
+    url = base + path + "?" + qs
     req = urllib.request.Request(url, headers={
         "X-BAPI-API-KEY": API_KEY,
         "X-BAPI-TIMESTAMP": ts,
@@ -44,28 +47,50 @@ def bybit_get(path, params):
     with urllib.request.urlopen(req, timeout=20) as r:
         return json.loads(r.read().decode())
 
+def bybit_get(path, params):
+    last = None
+    for base in BASES:
+        try:
+            r = _signed_get_one(base, path, params)
+            print(f"TRY {base} -> {r.get('retCode')} {r.get('retMsg')}", flush=True)
+            if r.get("retCode") == 0:
+                return r
+            last = r
+        except Exception as e:
+            print(f"TRY {base} EXC {e}", flush=True)
+            last = {"retCode": -1, "retMsg": str(e)}
+    return last or {"retCode": -1}
+
 def bybit_post(path, params):
-    ts = str(int(time.time() * 1000))
-    recv = "20000"
-    body = json.dumps(params)
-    to_sign = ts + API_KEY + recv + body
-    sign = hmac.new(API_SECRET.encode(), to_sign.encode(), hashlib.sha256).hexdigest()
-    req = urllib.request.Request(BASE + path, data=body.encode(), headers={
-        "X-BAPI-API-KEY": API_KEY,
-        "X-BAPI-TIMESTAMP": ts,
-        "X-BAPI-RECV-WINDOW": recv,
-        "X-BAPI-SIGN": sign,
-        "X-BAPI-SIGN-TYPE": "2",
-        "Content-Type": "application/json"
-    }, method="POST")
-    with urllib.request.urlopen(req, timeout=20) as r:
-        return json.loads(r.read().decode())
+    # order: probeer .com eerst, dan .eu
+    for base in BASES:
+        try:
+            ts = str(int(time.time() * 1000))
+            recv = "20000"
+            body = json.dumps(params, separators=(",", ":"))
+            to_sign = ts + API_KEY + recv + body
+            sign = hmac.new(API_SECRET.encode(), to_sign.encode(), hashlib.sha256).hexdigest()
+            req = urllib.request.Request(base + path, data=body.encode(), headers={
+                "X-BAPI-API-KEY": API_KEY,
+                "X-BAPI-TIMESTAMP": ts,
+                "X-BAPI-RECV-WINDOW": recv,
+                "X-BAPI-SIGN": sign,
+                "X-BAPI-SIGN-TYPE": "2",
+                "Content-Type": "application/json"
+            }, method="POST")
+            with urllib.request.urlopen(req, timeout=20) as r:
+                d = json.loads(r.read().decode())
+            if d.get("retCode") == 0:
+                return d
+        except Exception as e:
+            print(f"POST {base} EXC {e}", flush=True)
+            continue
+    return {"retCode": -1}
 
 def get_balance():
     for acct in ["SPOT", "UNIFIED"]:
         try:
             r = bybit_get("/v5/account/wallet-balance", {"accountType": acct, "coin": "USDT"})
-            print(f"BAL {acct} -> {r}", flush=True)
             if r.get("retCode") == 0:
                 for w in r.get("result", {}).get("list", []):
                     for c in w.get("coin", []):
@@ -77,10 +102,15 @@ def get_balance():
     return None
 
 def get_klines():
-    url = BASE + f"/v5/market/kline?category=spot&symbol={SYMBOL}&interval={INTERVAL}&limit=200"
-    with urllib.request.urlopen(url, timeout=20) as r:
-        d = json.loads(r.read().decode())
-    return d["result"]["list"][::-1]
+    for base in BASES:
+        try:
+            url = base + f"/v5/market/kline?category=spot&symbol={SYMBOL}&interval={INTERVAL}&limit=200"
+            with urllib.request.urlopen(url, timeout=20) as r:
+                d = json.loads(r.read().decode())
+            return d["result"]["list"][::-1]
+        except Exception:
+            continue
+    raise Exception("kline fail")
 
 def calc_utbot(klines):
     closes = [float(k[4]) for k in klines]
@@ -101,7 +131,7 @@ state = {"running": False, "last": "gestart", "balance": "?"}
 
 def bot_loop():
     time.sleep(5)
-    send_tg("🤖 Pepebot-3 gestart - api.bybit.com")
+    send_tg("🤖 Pepebot-3 gestart - auto .com/.eu")
     in_position = False
     while True:
         try:
@@ -152,7 +182,7 @@ def home():
 def test_key():
     try:
         r = bybit_get("/v5/account/wallet-balance", {"accountType": "SPOT", "coin": "USDT"})
-        return jsonify({"key_start": API_KEY[:4] if API_KEY else "LEEG", "bybit_raw": r})
+        return jsonify({"key_start": API_KEY[:4] if API_KEY else "LEEG", "key_len": len(API_KEY), "secret_len": len(API_SECRET), "bybit_raw": r})
     except Exception as e:
         return jsonify({"key_start": API_KEY[:4] if API_KEY else "LEEG", "error": str(e)})
 
