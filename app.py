@@ -61,16 +61,28 @@ def bybit_post(path, params):
     with urllib.request.urlopen(req, timeout=20) as r:
         return json.loads(r.read().decode())
 
-def get_balance():
-    r = bybit_get("/v5/account/wallet-balance", {"accountType": "SPOT", "coin": "USDT"})
-    print(f"BAL SPOT -> {r}", flush=True)
-    if r.get("retCode") == 0:
-        for w in r.get("result", {}).get("list", []):
-            for c in w.get("coin", []):
-                if c.get("coin") == "USDT":
-                    return Decimal(str(c.get("walletBalance", "0")))
-        return Decimal("0")
+# --- FIX: auto-detect accountType ---
+ACCOUNT_TYPE = [None]
+
+def get_coin_balance(coin):
+    for at in ["UNIFIED", "SPOT", "FUND"]:
+        try:
+            r = bybit_get("/v5/account/wallet-balance", {"accountType": at, "coin": coin})
+            print(f"BAL {at} {coin} -> {r}", flush=True)
+            if r.get("retCode") == 0:
+                if ACCOUNT_TYPE[0] is None:
+                    ACCOUNT_TYPE[0] = at
+                for w in r.get("result", {}).get("list", []):
+                    for c in w.get("coin", []):
+                        if c.get("coin") == coin:
+                            return Decimal(str(c.get("walletBalance", "0")))
+                return Decimal("0")
+        except Exception as e:
+            print(f"BAL {at} ERR {e}", flush=True)
     return None
+
+def get_balance():
+    return get_coin_balance("USDT")
 
 def get_klines():
     url = BASE + f"/v5/market/kline?category=spot&symbol={SYMBOL}&interval={INTERVAL}&limit=200"
@@ -110,14 +122,10 @@ def bot_loop():
             state["balance"] = str(bal)
             klines = get_klines()
             is_buy, is_sell = calc_utbot(klines)
-            r = bybit_get("/v5/account/wallet-balance", {"accountType": "SPOT", "coin": "PEPE"})
-            pepe_bal = Decimal("0")
-            if r.get("retCode") == 0:
-                for w in r["result"]["list"]:
-                    for c in w.get("coin", []):
-                        if c.get("coin") == "PEPE":
-                            pepe_bal = Decimal(str(c.get("walletBalance", "0")))
-            state["last"] = f"bal={bal} PEPE={pepe_bal} buy={is_buy} sell={is_sell}"
+            pepe_bal = get_coin_balance("PEPE")
+            if pepe_bal is None:
+                pepe_bal = Decimal("0")
+            state["last"] = f"bal={bal} PEPE={pepe_bal} buy={is_buy} sell={is_sell} acct={ACCOUNT_TYPE[0]}"
             print(state["last"], flush=True)
             if is_buy and not in_position and pepe_bal == 0 and bal > 5:
                 price = float(klines[-1][4])
@@ -147,7 +155,7 @@ def home():
 @app.route("/test-key")
 def test_key():
     try:
-        r = bybit_get("/v5/account/wallet-balance", {"accountType": "SPOT", "coin": "USDT"})
+        r = bybit_get("/v5/account/wallet-balance", {"accountType": "UNIFIED", "coin": "USDT"})
         return jsonify({"key_start": API_KEY[:4] if API_KEY else "LEEG", "bybit_raw": r})
     except Exception as e:
         return jsonify({"key_start": API_KEY[:4] if API_KEY else "LEEG", "error": str(e)})
