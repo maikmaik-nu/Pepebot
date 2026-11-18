@@ -64,6 +64,7 @@ def _sign(params_str, timestamp):
 def _headers(sign, recv_window, timestamp):
     return {"X-BAPI-API-KEY": BYBIT_API_KEY, "X-BAPI-SIGN": sign, "X-BAPI-SIGN-TYPE": "2", "X-BAPI-TIMESTAMP": timestamp, "X-BAPI-RECV-WINDOW": recv_window, "Content-Type": "application/json"}
 
+# --- UIT DE OUDE CODE: Bybit verbinding ---
 def bybit_get(path, params):
     timestamp = str(int(time.time() * 1000))
     query = urllib.parse.urlencode(sorted(params.items()))
@@ -75,12 +76,13 @@ def bybit_get(path, params):
         try:
             return r.json()
         except:
+            log(f"bybit_get geen JSON, status={r.status_code} body={r.text[:200]}")
             return {"retCode": -1, "retMsg": "empty", "http_status": r.status_code}
     except Exception as e:
         log("bybit_get exception: " + str(e))
         return {"retCode": -1, "retMsg": str(e)}
 
-def bybit_post(path, body):
+def 【entity-bybit_post¦canonical_name=Bybit】(path, body):
     timestamp = str(int(time.time() * 1000))
     body_str = json.dumps(body, separators=(",", ":"))
     sign, recv_window = _sign(body_str, timestamp)
@@ -91,9 +93,10 @@ def bybit_post(path, body):
         try:
             return r.json()
         except:
+            log(f"【entity-bybit_post¦canonical_name=Bybit】 geen JSON, status={r.status_code} body={r.text[:200]}")
             return {"retCode": -1, "retMsg": "empty"}
     except Exception as e:
-        log("bybit_post exception: " + str(e))
+        log("【entity-bybit_post¦canonical_name=Bybit】 exception: " + str(e))
         return {"retCode": -1, "retMsg": str(e)}
 
 def get_balances():
@@ -101,14 +104,17 @@ def get_balances():
     total_pepe = 0.0
     seen_ok = False
     last_error = "ERROR"
+    # UIT DE OUDE: geen coin param meer, alleen accountType - dat was de oplossing
     for account_type in ["SPOT", "UNIFIED"]:
         try:
             data = bybit_get("/v5/account/wallet-balance", {"accountType": account_type})
             log(f"Saldo check {account_type}: retCode={data.get('retCode')} retMsg={data.get('retMsg')}")
             if data.get("retCode") == 10003:
+                log(f"FOUT 10003 in {account_type}: Key geen toestemming. 【entity-bybit¦canonical_name=Bybit】.eu API Read + Spot Trade + Wallet AAN, IP UIT")
                 last_error = "10003"
                 continue
             if data.get("retCode") != 0:
+                log(f"Saldo error {account_type}: {data}")
                 last_error = "ERROR"
                 continue
             lst = data.get("result", {}).get("list", [])
@@ -207,6 +213,12 @@ def check_bot():
         if usdt is None:
             with STATE_LOCK:
                 STATE["last_check"] = 0
+            # UIT DE OUDE: Telegram bij 10003
+            if acc_type == "10003":
+                with STATE_LOCK:
+                    if time.time() - STATE["last_error_msg"] > 600:
+                        STATE["last_error_msg"] = time.time()
+                        send_telegram("Pepebot: Kan saldo niet lezen (10003). Fix: bybit.eu API Read + Spot Trade + Wallet AAN, IP UIT.")
             log("Bot stopt: geen saldo")
             return
         log(f"Saldo USDT {acc_type}: {usdt} | PEPE: {pepe_qty}")
@@ -226,25 +238,21 @@ def check_bot():
             in_pos = STATE["in_position"]
             prev_trailing = STATE.get("trailing", 0.0)
             stored_prev_close = STATE.get("prev_close", 0.0)
-            # sync positie met echt saldo
             if pepe_qty > 0 and not in_pos:
                 STATE["in_position"] = True; STATE["qty"] = pepe_qty; in_pos = True
             if pepe_qty == 0 and in_pos:
                 STATE["in_position"] = False; STATE["qty"] = 0; in_pos = False
 
         # --- UT BOT LOGICA ---
-        # Eerste keer: trailing initialiseren
         if prev_trailing == 0.0:
             prev_trailing = last_close - UT_FACTOR * atr if last_close > prev_close else last_close + UT_FACTOR * atr
             stored_prev_close = prev_close
 
-        # Trailing updaten zoals in 【entity-TradingView¦canonical_name=TradingView】 UT Bot
         if last_close > prev_trailing:
             trailing = max(prev_trailing, last_close - UT_FACTOR * atr)
         else:
             trailing = min(prev_trailing, last_close + UT_FACTOR * atr)
 
-        # Kruising checken: vorige close vs vorige trailing, nu vs nieuwe trailing
         buy_signal = (not in_pos) and (stored_prev_close <= prev_trailing) and (last_close > trailing)
         sell_signal = (in_pos) and (stored_prev_close >= prev_trailing) and (last_close < trailing)
 
