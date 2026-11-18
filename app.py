@@ -5,7 +5,6 @@ from pybit.unified_trading import HTTP
 
 app = Flask(__name__)
 
-# --- CONFIG ---
 SYMBOL = "PEPEUSDT"
 INTERVAL = "15"
 UTBOT_FACTOR = 4.0
@@ -16,14 +15,13 @@ API_SECRET = os.getenv("BYBIT_API_SECRET", "").strip()
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
 TELEGRAM_CHAT = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
-# FIX: pybit doet nu de signature, geen handmatige hmac meer
 def get_client():
     return HTTP(
         testnet=False,
         api_key=API_KEY,
         api_secret=API_SECRET,
-        endpoint="https://api.bybit.eu",
-        recv_window=10000
+        domain="bybit.eu",
+        recv_window=20000
     )
 
 def send_tg(msg):
@@ -45,14 +43,11 @@ def get_balance():
             r = client.get_wallet_balance(accountType=acct, coin="USDT")
             print(f"BALANCE TRY {acct} -> {r}", flush=True)
             if r.get("retCode") == 0:
-                lst = r.get("result", {}).get("list", [])
-                for w in lst:
+                for w in r.get("result", {}).get("list", []):
                     for c in w.get("coin", []):
                         if c.get("coin") == "USDT":
                             return Decimal(str(c.get("walletBalance", "0")))
                 return Decimal("0")
-            else:
-                print(f"BALANCE FAIL {acct} {r.get('retCode')} {r.get('retMsg')}", flush=True)
         except Exception as e:
             print(f"BALANCE EXC {acct} {e}", flush=True)
     return None
@@ -77,28 +72,27 @@ def calc_utbot(klines):
     last_close = closes[-1]
     prev_close = closes[-2]
     trailing_prev = prev_close - UTBOT_FACTOR * atr
-    trailing_now = last_close - UTBOT_FACTOR * atr
     is_buy = last_close > trailing_prev
     is_sell = last_close < trailing_prev
-    return is_buy, is_sell, atr, trailing_now
+    return is_buy, is_sell, atr
 
 state = {"running": False, "last": "gestart", "balance": "?"}
 
 def bot_loop():
     time.sleep(5)
-    send_tg("🤖 Pepebot-3 gestart - pybit versie (geen handmatige signature)")
+    send_tg("🤖 Pepebot-3 gestart - pybit / bybit.eu")
     in_position = False
     while True:
         try:
             bal = get_balance()
             if bal is None:
-                state["last"] = "Kan saldo niet lezen - check /test-key"
+                state["last"] = "Kan saldo niet lezen"
                 send_tg("⚠️ Kan saldo niet lezen")
                 time.sleep(60)
                 continue
             state["balance"] = str(bal)
             klines = get_klines()
-            is_buy, is_sell, atr, trail = calc_utbot(klines)
+            is_buy, is_sell, atr = calc_utbot(klines)
             client = get_client()
             r = client.get_wallet_balance(accountType="SPOT", coin="PEPE")
             pepe_bal = Decimal("0")
@@ -111,8 +105,7 @@ def bot_loop():
             print(state["last"], flush=True)
             if is_buy and not in_position and pepe_bal == 0 and bal > 5:
                 price = float(klines[-1][4])
-                qty = float(bal / Decimal(str(price)))
-                qty = int(qty)
+                qty = int(float(bal / Decimal(str(price))))
                 if qty > 0:
                     o = client.place_order(category="spot", symbol=SYMBOL, side="Buy", orderType="Market", qty=str(qty))
                     print("BUY", o, flush=True)
@@ -133,7 +126,7 @@ def bot_loop():
 
 @app.route("/")
 def home():
-    return jsonify({"status": "Pepebot-3 live", "state": state, "key_start": API_KEY[:4] if API_KEY else "LEEG", "key_len": len(API_KEY)})
+    return jsonify({"status": "Pepebot-3 live", "state": state, "key_start": API_KEY[:4] if API_KEY else "LEEG"})
 
 @app.route("/test-key")
 def test_key():
@@ -144,15 +137,10 @@ def test_key():
     except Exception as e:
         return jsonify({"key_start": API_KEY[:4] if API_KEY else "LEEG", "error": str(e)})
 
-@app.route("/start")
-def start():
-    if not state["running"]:
-        state["running"] = True
-        threading.Thread(target=bot_loop, daemon=True).start()
-        return jsonify({"started": True})
-    return jsonify({"already": True})
+# FIX 2: start direct bij import, niet alleen in __main__ (gunicorn)
+if not state["running"]:
+    state["running"] = True
+    threading.Thread(target=bot_loop, daemon=True).start()
 
 if __name__ == "__main__":
-    threading.Thread(target=bot_loop, daemon=True).start()
-    state["running"] = True
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "10000")))
