@@ -3,17 +3,19 @@ from decimal import Decimal
 from flask import Flask, jsonify
 
 app = Flask(__name__)
-
 SYMBOL = "PEPEUSDT"
 INTERVAL = "15"
 UTBOT_FACTOR = 4.0
 ATR_PERIOD = 14
 BASE = "https://api.bybit.eu"
 
-API_KEY = os.getenv("BYBIT_API_KEY", "").strip()
-API_SECRET = os.getenv("BYBIT_API_SECRET", "").strip()
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
-TELEGRAM_CHAT = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+def clean(v):
+    return (v or "").strip().strip('"').strip("'").replace("\n", "").replace("\r", "").strip()
+
+API_KEY = clean(os.getenv("BYBIT_API_KEY"))
+API_SECRET = clean(os.getenv("BYBIT_API_SECRET"))
+TELEGRAM_TOKEN = clean(os.getenv("TELEGRAM_TOKEN"))
+TELEGRAM_CHAT = clean(os.getenv("TELEGRAM_CHAT_ID"))
 
 def send_tg(msg):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT:
@@ -33,14 +35,7 @@ def _signed_get(path, params):
     to_sign = ts + API_KEY + recv + qs
     sign = hmac.new(API_SECRET.encode(), to_sign.encode(), hashlib.sha256).hexdigest()
     url = BASE + path + "?" + qs
-    req = urllib.request.Request(url, headers={
-        "X-BAPI-API-KEY": API_KEY,
-        "X-BAPI-TIMESTAMP": ts,
-        "X-BAPI-RECV-WINDOW": recv,
-        "X-BAPI-SIGN": sign,
-        "X-BAPI-SIGN-TYPE": "2",
-        "Content-Type": "application/json"
-    })
+    req = urllib.request.Request(url, headers={"X-BAPI-API-KEY": API_KEY, "X-BAPI-TIMESTAMP": ts, "X-BAPI-RECV-WINDOW": recv, "X-BAPI-SIGN": sign, "X-BAPI-SIGN-TYPE": "2", "Content-Type": "application/json"})
     with urllib.request.urlopen(req, timeout=20) as r:
         return json.loads(r.read().decode())
 
@@ -50,14 +45,7 @@ def _signed_post(path, params):
     body = json.dumps(params)
     to_sign = ts + API_KEY + recv + body
     sign = hmac.new(API_SECRET.encode(), to_sign.encode(), hashlib.sha256).hexdigest()
-    req = urllib.request.Request(BASE + path, data=body.encode(), headers={
-        "X-BAPI-API-KEY": API_KEY,
-        "X-BAPI-TIMESTAMP": ts,
-        "X-BAPI-RECV-WINDOW": recv,
-        "X-BAPI-SIGN": sign,
-        "X-BAPI-SIGN-TYPE": "2",
-        "Content-Type": "application/json"
-    }, method="POST")
+    req = urllib.request.Request(BASE + path, data=body.encode(), headers={"X-BAPI-API-KEY": API_KEY, "X-BAPI-TIMESTAMP": ts, "X-BAPI-RECV-WINDOW": recv, "X-BAPI-SIGN": sign, "X-BAPI-SIGN-TYPE": "2", "Content-Type": "application/json"}, method="POST")
     with urllib.request.urlopen(req, timeout=20) as r:
         return json.loads(r.read().decode())
 
@@ -100,7 +88,8 @@ state = {"running": False, "last": "gestart", "balance": "?"}
 
 def bot_loop():
     time.sleep(5)
-    send_tg("🤖 Pepebot-3 gestart - origineel + UTBOT 4 / 14")
+    print(f"KEY_LEN={len(API_KEY)} SECRET_LEN={len(API_SECRET)} KEY_START={API_KEY[:4]}", flush=True)
+    send_tg("🤖 Pepebot-3 gestart - origineel + UTBOT 4 / 14 - key-clean fix")
     in_position = False
     while True:
         try:
@@ -141,7 +130,7 @@ def bot_loop():
 
 @app.route("/")
 def home():
-    return jsonify({"status": "Pepebot-3 live EU only", "state": state, "key_start": API_KEY[:4] if API_KEY else "LEEG"})
+    return jsonify({"status": "Pepebot-3 live EU only", "state": state, "key_start": API_KEY[:4] if API_KEY else "LEEG", "key_len": len(API_KEY)})
 
 @app.route("/test-key")
 def test_key():
