@@ -2,8 +2,25 @@ import os, time, hmac, hashlib, json, requests
 from flask import Flask
 
 app = Flask(__name__)
-API_KEY = os.environ.get("BYBIT_API_KEY", "").strip()
-API_SECRET = os.environ.get("BYBIT_API_SECRET", "").strip()
+
+# --- FIX: lees key/secret op ELKE naam die in Render kan staan ---
+def find_env(*names, contains=""):
+    for n in names:
+        v = os.environ.get(n, "").strip().strip('"').strip("'")
+        if v:
+            return v
+    for k, v in os.environ.items():
+        ku = k.upper()
+        if "BYBIT" in ku or "BYBI" in ku or "API" in ku:
+            if contains in ku and v.strip():
+                return v.strip().strip('"').strip("'")
+    return ""
+
+API_KEY = find_env("BYBIT_API_KEY", "BYBIT_KEY", "BYBI_API_KEY", "BYBI_KEY", "API_KEY", contains="KEY")
+API_SECRET = find_env("BYBIT_API_SECRET", "BYBIT_SECRET", "BYBI_API_SECRET", "BYBI_SECRET", "API_SECRET", contains="SECRET")
+
+print(f"KEY_START={API_KEY[:4]} KEY_LEN={len(API_KEY)} SECRET_LEN={len(API_SECRET)}", flush=True)
+
 SYMBOL = "PEPEUSDT"
 UTBOT_FACTOR = 4.0
 UTBOT_ATR = 14
@@ -20,11 +37,10 @@ def headers(q=""):
     ts = str(int(time.time()*1000))
     recv = "5000"
     sig = hmac.new(API_SECRET.encode(), (ts + API_KEY + recv + q).encode(), hashlib.sha256).hexdigest()
-    return {"X-BAPI-API-KEY": API_KEY, "X-BAPI-TIMESTAMP": ts, "X-BAPI-RECV-WINDOW": recv, "X-BAPI-SIGN": sig, "Content-Type": "application/json"}
+    return {"X-BAPI-API-KEY": API_KEY, "X-BAPI-TIMESTAMP": ts, "X-BAPI-RECV-WINDOW": recv, "X-BAPI-SIGN": sig, "X-BAPI-SIGN-TYPE": "2", "Content-Type": "application/json"}
 
 def p_get(path, params):
     qs = "&".join(f"{k}={params[k]}" for k in sorted(params))
-    # Probeer eerst laatst werkende domein, daarna de andere
     for base in [WORKING["base"]] + [d for d in DOMAINS if d != WORKING["base"]]:
         r = requests.get(base + path + "?" + qs, headers=headers(qs), timeout=15)
         j = safe_json(r)
@@ -36,8 +52,7 @@ def p_get(path, params):
 
 def p_post(path, body):
     payload = json.dumps(body, separators=(",", ":"))
-    base = WORKING["base"]
-    r = requests.post(base + path, headers=headers(payload), data=payload, timeout=15)
+    r = requests.post(WORKING["base"] + path, headers=headers(payload), data=payload, timeout=15)
     return safe_json(r)
 
 def get_balance(coin):
