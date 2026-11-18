@@ -1,60 +1,66 @@
-import os, time, hmac, hashlib, requests
+import os, time, hmac, hashlib, json, requests
 from flask import Flask
 
 app = Flask(__name__)
 
 API_KEY = os.environ.get("BYBIT_API_KEY", "").strip()
 API_SECRET = os.environ.get("BYBIT_API_SECRET", "").strip()
-BASE = "https://api.bybit.eu"
+PRIVATE = "https://api.bybit.eu"
+PUBLIC = "https://api.bybit.com"
 SYMBOL = "PEPEUSDT"
 UTBOT_FACTOR = 4.0
 UTBOT_ATR = 14
-INTERVAL = "15"
 
-def sign(params):
+def headers(query_or_body=""):
+    ts = str(int(time.time() * 1000))
+    recv = "5000"
+    msg = ts + API_KEY + recv + query_or_body
+    sig = hmac.new(API_SECRET.encode(), msg.encode(), hashlib.sha256).hexdigest()
+    return {
+        "X-BAPI-API-KEY": API_KEY,
+        "X-BAPI-TIMESTAMP": ts,
+        "X-BAPI-RECV-WINDOW": recv,
+        "X-BAPI-SIGN": sig,
+        "Content-Type": "application/json",
+    }
+
+def p_get(path, params):
     qs = "&".join(f"{k}={params[k]}" for k in sorted(params))
-    return hmac.new(API_SECRET.encode(), qs.encode(), hashlib.sha256).hexdigest()
-
-def auth_get(path, extra={}):
-    ts = str(int(time.time()*1000))
-    p = {"api_key": API_KEY, "timestamp": ts, "recv_window": "5000", **extra}
-    p["sign"] = sign(p)
-    r = requests.get(BASE + path, params=p, timeout=15)
+    r = requests.get(PRIVATE + path + "?" + qs, headers=headers(qs), timeout=15)
     return r.json()
 
-def auth_post(path, extra={}):
-    ts = str(int(time.time()*1000))
-    p = {"api_key": API_KEY, "timestamp": ts, "recv_window": "5000", **extra}
-    p["sign"] = sign(p)
-    r = requests.post(BASE + path, data=p, timeout=15)
+def p_post(path, body):
+    payload = json.dumps(body, separators=(",", ":"))
+    r = requests.post(PRIVATE + path, headers=headers(payload), data=payload, timeout=15)
     return r.json()
 
-def get_balance():
-    d = auth_get("/v5/account/wallet-balance", {"accountType": "SPOT", "coin": "USDT"})
-    print("BAL SPOT USDT ->", d, flush=True)
+def get_balance(coin):
+    d = p_get("/v5/account/wallet-balance", {"accountType": "SPOT", "coin": coin})
+    print(f"BAL {coin} ->", d, flush=True)
     try:
         return float(d["result"]["list"][0]["coin"][0]["walletBalance"])
     except Exception:
         return 0.0
 
 def get_klines():
+    # Public data: hier staat PEPE wel, op EU kline is hij leeg
     try:
-        r = requests.get(BASE + "/v5/market/kline", params={"category": "spot", "symbol": SYMBOL, "interval": INTERVAL, "limit": "100"}, timeout=15).json()
+        r = requests.get(PUBLIC + "/v5/market/kline", params={"category": "spot", "symbol": SYMBOL, "interval": "15", "limit": "100"}, timeout=15).json()
         lst = r.get("result", {}).get("list", []) or []
         if not lst:
-            print("KLINE LEEG ->", r, flush=True)
+            print("KLINE LEEG PUBLIC ->", r, flush=True)
             return []
-        closes = [float(x[4]) for x in lst][::-1]
-        return closes
+        return [float(x[4]) for x in lst][::-1]
     except Exception as e:
         print("KLINE ERR", e, flush=True)
         return []
 
-def utbot_signal(closes):
+def utbot(closes):
     if len(closes) < 30:
         return "HOLD"
-    trs = [abs(closes[i]-closes[i-1]) for i in range(1, len(closes))]
+    trs = [abs(closes[i] - closes[i-1]) for i in range(1, len(closes))]
     atr = sum(trs[-UTBOT_ATR:]) / UTBOT_ATR
+    # UTBOT 4 / 14
     if closes[-1] > closes[-2] + UTBOT_FACTOR * atr * 0.1:
         return "BUY"
     if closes[-1] < closes[-2] - UTBOT_FACTOR * atr * 0.1:
@@ -63,29 +69,25 @@ def utbot_signal(closes):
 
 @app.route("/")
 def home():
-    bal = get_balance()
+    bal = get_balance("USDT")
     closes = get_klines()
     if not closes:
         return f"OK BAL={bal} NO KLINES"
-    sig = utbot_signal(closes)
-    print(f"BAL={bal} SIG={sig} PRICE={closes[-1]}", flush=True)
+    sig = utbot(closes)
+    price = closes[-1]
+    print(f"BAL={bal} SIG={sig} PRICE={price}", flush=True)
     if bal > 5 and sig == "BUY":
-        price = closes[-1]
         qty = str(int((bal * 0.99) / price))
-        res = auth_post("/v5/order/create", {"category": "spot", "symbol": SYMBOL, "side": "Buy", "orderType": "Market", "qty": qty})
+        res = p_post("/v5/order/create", {"category": "spot", "symbol": SYMBOL, "side": "Buy", "orderType": "Market", "qty": qty})
         print("BUY ->", res, flush=True)
         return f"BUY {qty} BAL={bal}"
     if sig == "SELL":
-        b = auth_get("/v5/account/wallet-balance", {"accountType": "SPOT", "coin": "PEPE"})
-        try:
-            pepe = float(b["result"]["list"][0]["coin"][0]["walletBalance"])
-        except Exception:
-            pepe = 0
+        pepe = get_balance("PEPE")
         if pepe > 0:
-            res = auth_post("/v5/order/create", {"category": "spot", "symbol": SYMBOL, "side": "Sell", "orderType": "Market", "qty": str(int(pepe))})
+            res = p_post("/v5/order/create", {"category": "spot", "symbol": SYMBOL, "side": "Sell", "orderType": "Market", "qty": str(int(pepe))})
             print("SELL ->", res, flush=True)
             return f"SELL {pepe}"
-    return f"OK BAL={bal} SIG={sig} PRICE={closes[-1]}"
+    return f"OK BAL={bal} SIG={sig} PRICE={price}"
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)
