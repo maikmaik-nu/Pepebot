@@ -8,11 +8,11 @@ SYMBOL = "PEPEUSDT"
 INTERVAL = "15"
 UTBOT_FACTOR = 4.0
 ATR_PERIOD = 14
-BASES = ["https://api.bybit.eu", "https://api.bybit.com"]
+BASES = ["https://api.bybit.eu", "https://api-demo.bybit.eu", "https://api.bybit.com", "https://api-demo.bybit.com"]
 BASE = BASES[0]
 
-API_KEY = os.getenv("BYBIT_API_KEY", "").strip()
-API_SECRET = os.getenv("BYBIT_API_SECRET", "").strip()
+API_KEY = os.getenv("【entity-BYBIT_API_KEY¦canonical_name=Bybit】", "").strip()
+API_SECRET = os.getenv("【entity-BYBIT_API_SECRET¦canonical_name=Bybit】", "").strip()
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
 TELEGRAM_CHAT = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
@@ -130,7 +130,7 @@ state = {"running": False, "last": "gestart", "balance": "?"}
 
 def bot_loop():
     time.sleep(5)
-    send_tg("🤖 Pepebot-3 gestart - werkend + UTBOT 4 / 14")
+    send_tg("🤖 Pepebot-3 gestart - werkend + UTBOT 4 / 14 - 4 domeinen")
     in_position = False
     while True:
         try:
@@ -177,7 +177,7 @@ def home():
 def test_key():
     try:
         r = bybit_get("/v5/account/wallet-balance", {"accountType": "UNIFIED", "coin": "USDT"})
-        return jsonify({"key_start": API_KEY[:4] if API_KEY else "LEEG", "bybit_raw": r})
+        return jsonify({"key_start": API_KEY[:4] if API_KEY else "LEEG", "bybit_raw": r, "working_base": BASE})
     except Exception as e:
         return jsonify({"key_start": API_KEY[:4] if API_KEY else "LEEG", "error": str(e)})
 
