@@ -22,34 +22,28 @@ def tg(msg):
 def get_balance():
     try:
         from pybit.unified_trading import HTTP
-        for domain in ["bybit.eu", "bytick.com"]:
+        s = HTTP(testnet=False, api_key=KEY, api_secret=SECRET, domain="bybit.eu")
+        for acct in ["UNIFIED", "SPOT"]:
             try:
-                s = HTTP(testnet=False, api_key=KEY, api_secret=SECRET, domain=domain)
-                r = s.get_wallet_balance(accountType="UNIFIED", coin="USDT")
-                print("PYBIT " + domain + " UNIFIED: " + str(r), flush=True)
+                r = s.get_wallet_balance(accountType=acct, coin="USDT")
+                print("BALANCE " + acct + " -> " + str(r), flush=True)
                 if r.get("retCode") == 0:
-                    c = r["result"]["list"][0]["coin"][0]
-                    return float(c["walletBalance"]), "UNIFIED-" + domain
-                r2 = s.get_wallet_balance(accountType="SPOT", coin="USDT")
-                print("PYBIT " + domain + " SPOT: " + str(r2), flush=True)
-                if r2.get("retCode") == 0:
-                    c = r2["result"]["list"][0]["coin"][0]
-                    return float(c["walletBalance"]), "SPOT-" + domain
+                    coins = r["result"]["list"][0]["coin"]
+                    for c in coins:
+                        if c["coin"] == "USDT":
+                            return float(c["walletBalance"]), acct, s
             except Exception as e:
-                print("PYBIT " + domain + " fail: " + str(e), flush=True)
-                continue
+                print("BALANCE fail " + acct + " " + str(e), flush=True)
     except Exception as e:
         print("pybit fail", e, flush=True)
-    return 0, None
+    return 0, None, None
 
 def get_price():
-    for domain in ["api.bybit.eu", "api.bytick.com"]:
-        try:
-            r = requests.get("https://" + domain + "/v5/market/tickers", params={"category": "spot", "symbol": "PEPEUSDT"}, timeout=10)
-            return float(r.json()["result"]["list"][0]["lastPrice"])
-        except Exception:
-            continue
-    return 0
+    try:
+        r = requests.get("https://api.bybit.eu/v5/market/tickers", params={"category": "spot", "symbol": "PEPEUSDT"}, timeout=10)
+        return float(r.json()["result"]["list"][0]["lastPrice"])
+    except Exception:
+        return 0
 
 def get_klines():
     try:
@@ -78,33 +72,19 @@ def utbot(closes, highs, lows):
         return "SELL"
     return None
 
-def place_order(side, usdt_val):
-    try:
-        from pybit.unified_trading import HTTP
-        price = get_price()
-        if price == 0:
-            return {"retCode": -1, "retMsg": "no price"}
-        qty = str(int(usdt_val / price))
-        s = HTTP(testnet=False, api_key=KEY, api_secret=SECRET, domain="bybit.eu")
-        r = s.place_order(category="spot", symbol="PEPEUSDT", side=side, orderType="Market", qty=qty)
-        print("ORDER " + side + " " + qty + " -> " + str(r), flush=True)
-        return r
-    except Exception as e:
-        return {"retCode": -1, "retMsg": str(e)}
-
 @app.route("/")
 def home():
     return "Pepebot-3 live"
 
 @app.route("/test-key")
 def test_key():
-    usdt, acct = get_balance()
+    usdt, acct, s = get_balance()
     return jsonify({"status": "OK" if acct else "FOUT", "account": acct, "usdt": usdt, "key_start": KEY[:4]})
 
 @app.route("/check")
 def check():
     print("=== Bot check gestart ===", flush=True)
-    usdt, acct = get_balance()
+    usdt, acct, s = get_balance()
     if usdt < 5:
         tg("Bot stopt: geen saldo. USDT=" + str(usdt) + " acct=" + str(acct))
         return jsonify({"status": "geen saldo", "usdt": usdt, "acct": acct})
@@ -112,13 +92,23 @@ def check():
     sig = utbot(closes, highs, lows)
     print("UTBOT sig=" + str(sig) + " usdt=" + str(usdt) + " acct=" + str(acct), flush=True)
     if sig == "BUY" and usdt >= 20:
-        res = place_order("Buy", 20)
-        tg("BUY PEPE 20 USDT -> " + str(res.get("retMsg")) + " " + str(res.get("retCode")))
-        return jsonify({"signal": sig, "order": res})
+        try:
+            price = get_price()
+            qty = str(int(20 / price))
+            res = s.place_order(category="spot", symbol="PEPEUSDT", side="Buy", orderType="Market", qty=qty)
+            tg("BUY PEPE 20 USDT -> " + str(res.get("retMsg")))
+            return jsonify({"signal": sig, "order": res})
+        except Exception as e:
+            return jsonify({"signal": sig, "error": str(e)})
     if sig == "SELL":
-        res = place_order("Sell", 20)
-        tg("SELL PEPE -> " + str(res.get("retMsg")) + " " + str(res.get("retCode")))
-        return jsonify({"signal": sig, "order": res})
+        try:
+            price = get_price()
+            qty = str(int(20 / price))
+            res = s.place_order(category="spot", symbol="PEPEUSDT", side="Sell", orderType="Market", qty=qty)
+            tg("SELL PEPE -> " + str(res.get("retMsg")))
+            return jsonify({"signal": sig, "order": res})
+        except Exception as e:
+            return jsonify({"signal": sig, "error": str(e)})
     return jsonify({"status": "geen signaal", "signal": sig, "usdt": usdt, "acct": acct})
 
 @app.route("/webhook", methods=["POST"])
