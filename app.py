@@ -8,7 +8,7 @@ SYMBOL = "PEPEUSDT"
 INTERVAL = "15"
 UTBOT_FACTOR = 4.0
 ATR_PERIOD = 14
-BASE = "https://api.bybit.eu"
+BASE = "https://api.bybit.com"
 
 API_KEY = os.getenv("BYBIT_API_KEY", "").strip()
 API_SECRET = os.getenv("BYBIT_API_SECRET", "").strip()
@@ -77,7 +77,6 @@ def get_balance():
     return None
 
 def get_klines():
-    # public, geen key nodig
     url = BASE + f"/v5/market/kline?category=spot&symbol={SYMBOL}&interval={INTERVAL}&limit=200"
     with urllib.request.urlopen(url, timeout=20) as r:
         d = json.loads(r.read().decode())
@@ -102,7 +101,7 @@ state = {"running": False, "last": "gestart", "balance": "?"}
 
 def bot_loop():
     time.sleep(5)
-    send_tg("🤖 Pepebot-3 gestart - api.bybit.eu direct")
+    send_tg("🤖 Pepebot-3 gestart - api.bybit.com")
     in_position = False
     while True:
         try:
