@@ -6,20 +6,33 @@ import requests
 app = Flask(__name__)
 
 DOMAIN = "by" + "bit"
-TLD = "eu"
 KL_URL = "https://api." + "by" + "bit.com/v5/market/kline"
-
-session = HTTP(testnet=False, api_key=os.getenv("BYBIT_API_KEY"), api_secret=os.getenv("BYBIT_API_SECRET"), domain=DOMAIN, tld=TLD)
 
 SYMBOL = "PEPEUSDT"
 QTY_USDT = 20.0
 FACTOR = 4.0
 ATR_PERIOD = 14
 
-def get_bal(coin):
-    r = session.get_wallet_balance(accountType="SPOT", coin=coin)
-    coins = r["result"]["list"][0]["coin"]
-    for c in coins:
+def make_session(tld):
+    return HTTP(testnet=False, api_key=os.getenv("BYBIT_API_KEY"), api_secret=os.getenv("BYBIT_API_SECRET"), domain=DOMAIN, tld=tld)
+
+def find_working():
+    for tld in ["eu", "com"]:
+        for acct in ["SPOT", "UNIFIED"]:
+            try:
+                s = make_session(tld)
+                r = s.get_wallet_balance(accountType=acct, coin="USDT")
+                if r.get("retCode") == 0:
+                    print(f"WORKING tld={tld} acct={acct}", flush=True)
+                    return s, tld, acct
+                print(f"TRY tld={tld} acct={acct} -> {r.get('retCode')} {r.get('retMsg')}", flush=True)
+            except Exception as e:
+                print(f"TRY tld={tld} acct={acct} ERR {e}", flush=True)
+    return None, None, None
+
+def get_bal(session, acct, coin):
+    r = session.get_wallet_balance(accountType=acct, coin=coin)
+    for c in r["result"]["list"][0]["coin"]:
         if c["coin"] == coin:
             return float(c["walletBalance"])
     return 0.0
@@ -68,11 +81,14 @@ def utbot(kl):
 @app.route("/")
 def home():
     try:
-        bal_usdt = get_bal("USDT")
-        bal_pepe = get_bal("PEPE")
+        session, tld, acct = find_working()
+        if not session:
+            return "ERR geen werkende combinatie - check key in Render"
+        bal_usdt = get_bal(session, acct, "USDT")
+        bal_pepe = get_bal(session, acct, "PEPE")
         kl = get_klines()
         sig, price, atr = utbot(kl)
-        print(f"BAL_USDT={bal_usdt} BAL_PEPE={bal_pepe} SIG={sig} PRICE={price} ATR={atr}", flush=True)
+        print(f"BAL_USDT={bal_usdt} BAL_PEPE={bal_pepe} SIG={sig} PRICE={price} ATR={atr} TLD={tld} ACCT={acct}", flush=True)
         if sig == "BUY" and bal_usdt >= QTY_USDT and bal_pepe == 0:
             qty = int(QTY_USDT / price)
             session.place_order(category="spot", symbol=SYMBOL, side="Buy", orderType="Market", qty=str(qty))
@@ -80,7 +96,7 @@ def home():
         if sig == "SELL" and bal_pepe > 0:
             session.place_order(category="spot", symbol=SYMBOL, side="Sell", orderType="Market", qty=str(int(bal_pepe)))
             return f"SELL geplaatst BAL_PEPE={bal_pepe} PRICE={price}"
-        return f"BAL_USDT={bal_usdt} BAL_PEPE={bal_pepe} SIG={sig} PRICE={price} ATR={atr}"
+        return f"BAL_USDT={bal_usdt} BAL_PEPE={bal_pepe} SIG={sig} PRICE={price} ATR={atr} TLD={tld} ACCT={acct}"
     except Exception as e:
         print(f"ERR {e}", flush=True)
         return f"ERR {e}"
