@@ -14,7 +14,7 @@ SYMBOL = "PEPEUSDT"
 CATEGORY = "spot"
 INTERVAL = "15"
 ATR_PERIOD = 14
-UT_FACTOR = 4.0  # UT Bot Alerts 4 14 van je grafiek
+UT_FACTOR = 4.0
 BASE_URL = "https://api.bybit.eu"
 STATE_FILE = "state.json"
 
@@ -64,7 +64,7 @@ def _sign(params_str, timestamp):
 def _headers(sign, recv_window, timestamp):
     return {"X-BAPI-API-KEY": BYBIT_API_KEY, "X-BAPI-SIGN": sign, "X-BAPI-SIGN-TYPE": "2", "X-BAPI-TIMESTAMP": timestamp, "X-BAPI-RECV-WINDOW": recv_window, "Content-Type": "application/json"}
 
-# --- UIT DE OUDE CODE: Bybit verbinding ---
+# --- UIT VORIGE: Bybit verbinding die het deed ---
 def bybit_get(path, params):
     timestamp = str(int(time.time() * 1000))
     query = urllib.parse.urlencode(sorted(params.items()))
@@ -82,7 +82,7 @@ def bybit_get(path, params):
         log("bybit_get exception: " + str(e))
         return {"retCode": -1, "retMsg": str(e)}
 
-def 【entity-bybit_post¦canonical_name=Bybit】(path, body):
+def bybit_post(path, body):
     timestamp = str(int(time.time() * 1000))
     body_str = json.dumps(body, separators=(",", ":"))
     sign, recv_window = _sign(body_str, timestamp)
@@ -93,10 +93,10 @@ def 【entity-bybit_post¦canonical_name=Bybit】(path, body):
         try:
             return r.json()
         except:
-            log(f"【entity-bybit_post¦canonical_name=Bybit】 geen JSON, status={r.status_code} body={r.text[:200]}")
+            log(f"bybit_post geen JSON, status={r.status_code} body={r.text[:200]}")
             return {"retCode": -1, "retMsg": "empty"}
     except Exception as e:
-        log("【entity-bybit_post¦canonical_name=Bybit】 exception: " + str(e))
+        log("bybit_post exception: " + str(e))
         return {"retCode": -1, "retMsg": str(e)}
 
 def get_balances():
@@ -104,13 +104,13 @@ def get_balances():
     total_pepe = 0.0
     seen_ok = False
     last_error = "ERROR"
-    # UIT DE OUDE: geen coin param meer, alleen accountType - dat was de oplossing
+    # OPLOSSING UIT VORIGE: alleen accountType, GEEN coin param
     for account_type in ["SPOT", "UNIFIED"]:
         try:
             data = bybit_get("/v5/account/wallet-balance", {"accountType": account_type})
             log(f"Saldo check {account_type}: retCode={data.get('retCode')} retMsg={data.get('retMsg')}")
             if data.get("retCode") == 10003:
-                log(f"FOUT 10003 in {account_type}: Key geen toestemming. 【entity-bybit¦canonical_name=Bybit】.eu API Read + Spot Trade + Wallet AAN, IP UIT")
+                log(f"FOUT 10003 in {account_type}: Key geen toestemming. bybit.eu API Read + Spot Trade + Wallet AAN, IP UIT")
                 last_error = "10003"
                 continue
             if data.get("retCode") != 0:
@@ -213,7 +213,6 @@ def check_bot():
         if usdt is None:
             with STATE_LOCK:
                 STATE["last_check"] = 0
-            # UIT DE OUDE: Telegram bij 10003
             if acc_type == "10003":
                 with STATE_LOCK:
                     if time.time() - STATE["last_error_msg"] > 600:
@@ -233,7 +232,6 @@ def check_bot():
         last = klines[-1]; prev = klines[-2]
         last_close = float(last[4]); prev_close = float(prev[4])
         log(f"Prijs: {price} | ATR: {atr} | Last close: {last_close} | Prev close: {prev_close}")
-
         with STATE_LOCK:
             in_pos = STATE["in_position"]
             prev_trailing = STATE.get("trailing", 0.0)
@@ -242,31 +240,25 @@ def check_bot():
                 STATE["in_position"] = True; STATE["qty"] = pepe_qty; in_pos = True
             if pepe_qty == 0 and in_pos:
                 STATE["in_position"] = False; STATE["qty"] = 0; in_pos = False
-
-        # --- UT BOT LOGICA ---
+        # --- UT BOT 4 / 14 ---
         if prev_trailing == 0.0:
             prev_trailing = last_close - UT_FACTOR * atr if last_close > prev_close else last_close + UT_FACTOR * atr
             stored_prev_close = prev_close
-
         if last_close > prev_trailing:
             trailing = max(prev_trailing, last_close - UT_FACTOR * atr)
         else:
             trailing = min(prev_trailing, last_close + UT_FACTOR * atr)
-
         buy_signal = (not in_pos) and (stored_prev_close <= prev_trailing) and (last_close > trailing)
         sell_signal = (in_pos) and (stored_prev_close >= prev_trailing) and (last_close < trailing)
-
         log(f"UT Bot: prev_trailing={prev_trailing} trailing={trailing} buy={buy_signal} sell={sell_signal} in_pos={in_pos}")
-
         with STATE_LOCK:
             STATE["trailing"] = trailing
             STATE["prev_close"] = last_close
         save_state()
-
         if buy_signal:
             if usdt < 5:
                 log("Te weinig USDT"); return
-            qty = usdt / price
+            qty = (usdt * 0.999) / price
             res = place_market_order("Buy", qty)
             if res:
                 with STATE_LOCK:
@@ -275,7 +267,6 @@ def check_bot():
                 send_telegram(f"GEKOCHT PEPEUSDT - UT Bot BUY - Prijs: {price} Inleg: {usdt} USDT")
                 log("KOOP uitgevoerd - UT Bot")
             return
-
         if sell_signal:
             qty_to_sell = pepe_qty if pepe_qty > 0 else 0
             if qty_to_sell <= 0:
@@ -289,7 +280,6 @@ def check_bot():
                 send_telegram(f"VERKOCHT PEPEUSDT - UT Bot SELL - Prijs: {price} Saldo: {usdt} USDT")
                 log("VERKOOP uitgevoerd - UT Bot")
             return
-
         log(f"Geen UT Bot signaal. In positie: {in_pos}")
         with STATE_LOCK:
             if time.time() - STATE["last_start_msg"] > 3600:
@@ -325,6 +315,10 @@ def home():
     with STATE_LOCK:
         st = dict(STATE)
     return jsonify({"status": "running", "symbol": SYMBOL, "in_position": st["in_position"], "trailing": st.get("trailing", 0), "key_start": BYBIT_API_KEY[:4] + "****" if BYBIT_API_KEY else "LEEG"})
+
+@app.route("/ping")
+def ping():
+    return jsonify({"ok": True})
 
 @app.route("/check")
 def manual_check():
