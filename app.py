@@ -61,7 +61,6 @@ def bybit_post(path, params):
     with urllib.request.urlopen(req, timeout=20) as r:
         return json.loads(r.read().decode())
 
-# --- FIX: auto-detect accountType ---
 ACCOUNT_TYPE = [None]
 
 def get_coin_balance(coin):
