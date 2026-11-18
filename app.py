@@ -3,13 +3,20 @@ from flask import Flask
 
 app = Flask(__name__)
 
-API_KEY = os.environ.get("【entity-BYBIT_API_KEY¦canonical_name=Bybit】", "").strip()
+API_KEY = os.environ.get("BYBIT_API_KEY", "").strip()
 API_SECRET = os.environ.get("BYBIT_API_SECRET", "").strip()
 PRIVATE = "https://api.bybit.eu"
 PUBLIC = "https://api.bybit.com"
 SYMBOL = "PEPEUSDT"
 UTBOT_FACTOR = 4.0
 UTBOT_ATR = 14
+
+def safe_json(r):
+    try:
+        return r.json()
+    except Exception:
+        print("GEEN JSON, status", r.status_code, "body:", r.text[:300], flush=True)
+        return {"retCode": -1, "result": {}}
 
 def headers(query_or_body=""):
     ts = str(int(time.time() * 1000))
@@ -21,15 +28,14 @@ def headers(query_or_body=""):
 def p_get(path, params):
     qs = "&".join(f"{k}={params[k]}" for k in sorted(params))
     r = requests.get(PRIVATE + path + "?" + qs, headers=headers(qs), timeout=15)
-    return r.json()
+    return safe_json(r)
 
 def p_post(path, body):
     payload = json.dumps(body, separators=(",", ":"))
     r = requests.post(PRIVATE + path, headers=headers(payload), data=payload, timeout=15)
-    return r.json()
+    return safe_json(r)
 
 def get_balance(coin):
-    # Eerst UNIFIED = Spot & Margin waar je geld staat, daarna SPOT als backup
     for acct in ["UNIFIED", "SPOT"]:
         d = p_get("/v5/account/wallet-balance", {"accountType": acct, "coin": coin})
         print(f"BAL {acct} {coin} ->", d, flush=True)
@@ -43,8 +49,9 @@ def get_balance(coin):
 
 def get_klines():
     try:
-        r = requests.get(PUBLIC + "/v5/market/kline", params={"category": "spot", "symbol": SYMBOL, "interval": "15", "limit": "100"}, timeout=15).json()
-        lst = r.get("result", {}).get("list", []) or []
+        r = requests.get(PUBLIC + "/v5/market/kline", params={"category": "spot", "symbol": SYMBOL, "interval": "15", "limit": "100"}, timeout=15)
+        j = safe_json(r)
+        lst = j.get("result", {}).get("list", []) or []
         if not lst:
             return []
         return [float(x[4]) for x in lst][::-1]
