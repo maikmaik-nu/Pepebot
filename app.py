@@ -40,16 +40,16 @@ def s_get(path, params):
 def bal():
     for a in ["UNIFIED", "SPOT"]:
         d = s_get("/v5/account/wallet-balance", {"accountType": a, "coin": "USDT"})
-        print("BAL " + a + " " + str(d)[:300], flush=True)
+        print("BAL " + a + " " + str(d)[:400], flush=True)
         if d.get("retCode") == 0:
             try:
                 coins = d["result"]["list"][0]["coin"]
                 for c in coins:
                     if c["coin"] == "USDT":
-                        return float(c["walletBalance"]), a
+                        return float(c["walletBalance"]), a, d
             except Exception as e:
                 print("BAL parse " + str(e), flush=True)
-    return 0.0, None
+    return 0.0, None, {}
 
 def price():
     try:
@@ -98,7 +98,7 @@ def order(side, val):
         s = hmac.new(SECRET.encode(), msg.encode(), hashlib.sha256).hexdigest()
         h = {"X-BAPI-API-KEY": KEY, "X-BAPI-TIMESTAMP": ts, "X-BAPI-RECV-WINDOW": "5000", "X-BAPI-SIGN": s, "X-BAPI-SIGN-TYPE": "2", "Content-Type": "application/json"}
         rr = requests.post(BASE + "/v5/order/create", headers=h, data=bs, timeout=15)
-        print("ORDER " + side + " " + rr.text[:300], flush=True)
+        print("ORDER " + side + " " + rr.text[:400], flush=True)
         return rr.json()
     except Exception as e:
         return {"retCode": -1, "retMsg": str(e)}
@@ -109,14 +109,22 @@ def home():
 
 @app.route("/test-key")
 def tk():
-    u, a = bal()
-    return jsonify({"status": "OK" if a else "FOUT", "account": a, "usdt": u, "key_len": len(KEY), "secret_len": len(SECRET), "key_start": KEY[:4]})
+    u, a, raw = bal()
+    return jsonify({"status": "OK" if a else "FOUT", "account": a, "usdt": u, "key_len": len(KEY), "secret_len": len(SECRET), "key_start": KEY[:4], "bybit_raw": raw})
+
+@app.route("/debug")
+def dbg():
+    out = {}
+    for a in ["UNIFIED", "SPOT"]:
+        d = s_get("/v5/account/wallet-balance", {"accountType": a, "coin": "USDT"})
+        out[a] = d
+    return jsonify(out)
 
 @app.route("/check")
 def chk():
-    u, a = bal()
+    u, a, raw = bal()
     if u < 5:
-        return jsonify({"status": "geen saldo", "usdt": u, "acct": a})
+        return jsonify({"status": "geen saldo", "usdt": u, "acct": a, "bybit_raw": raw})
     c, h, l = klines()
     s = sig(c, h, l)
     if s == "BUY" and u >= 20:
