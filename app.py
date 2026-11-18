@@ -8,7 +8,8 @@ SYMBOL = "PEPEUSDT"
 INTERVAL = "15"
 UTBOT_FACTOR = 4.0
 ATR_PERIOD = 14
-BASE = "https://api.bybit.com"
+BASES = ["https://api.bybit.eu", "https://api.bybit.com"]
+BASE = BASES[0]
 
 API_KEY = os.getenv("BYBIT_API_KEY", "").strip()
 API_SECRET = os.getenv("BYBIT_API_SECRET", "").strip()
@@ -26,13 +27,13 @@ def send_tg(msg):
     except Exception as e:
         print("TG ERR", e, flush=True)
 
-def bybit_get(path, params):
+def _signed_get(base, path, params):
     ts = str(int(time.time() * 1000))
     recv = "20000"
     qs = urllib.parse.urlencode(params)
     to_sign = ts + API_KEY + recv + qs
     sign = hmac.new(API_SECRET.encode(), to_sign.encode(), hashlib.sha256).hexdigest()
-    url = BASE + path + "?" + qs
+    url = base + path + "?" + qs
     req = urllib.request.Request(url, headers={
         "X-BAPI-API-KEY": API_KEY,
         "X-BAPI-TIMESTAMP": ts,
@@ -44,13 +45,13 @@ def bybit_get(path, params):
     with urllib.request.urlopen(req, timeout=20) as r:
         return json.loads(r.read().decode())
 
-def bybit_post(path, params):
+def _signed_post(base, path, params):
     ts = str(int(time.time() * 1000))
     recv = "20000"
     body = json.dumps(params)
     to_sign = ts + API_KEY + recv + body
     sign = hmac.new(API_SECRET.encode(), to_sign.encode(), hashlib.sha256).hexdigest()
-    req = urllib.request.Request(BASE + path, data=body.encode(), headers={
+    req = urllib.request.Request(base + path, data=body.encode(), headers={
         "X-BAPI-API-KEY": API_KEY,
         "X-BAPI-TIMESTAMP": ts,
         "X-BAPI-RECV-WINDOW": recv,
@@ -60,6 +61,27 @@ def bybit_post(path, params):
     }, method="POST")
     with urllib.request.urlopen(req, timeout=20) as r:
         return json.loads(r.read().decode())
+
+def bybit_get(path, params):
+    global BASE
+    last = None
+    for b in BASES:
+        try:
+            r = _signed_get(b, path, params)
+            print(f"GET {b}{path} -> {r}", flush=True)
+            if r.get("retCode") == 0:
+                BASE = b
+                return r
+            last = r
+        except Exception as e:
+            print(f"GET {b} ERR {e}", flush=True)
+            last = e
+    if isinstance(last, Exception):
+        raise last
+    return last
+
+def bybit_post(path, params):
+    return _signed_post(BASE, path, params)
 
 ACCOUNT_TYPE = [None]
 
@@ -124,7 +146,7 @@ def bot_loop():
             pepe_bal = get_coin_balance("PEPE")
             if pepe_bal is None:
                 pepe_bal = Decimal("0")
-            state["last"] = f"bal={bal} PEPE={pepe_bal} buy={is_buy} sell={is_sell} acct={ACCOUNT_TYPE[0]}"
+            state["last"] = f"bal={bal} PEPE={pepe_bal} buy={is_buy} sell={is_sell} acct={ACCOUNT_TYPE[0]} base={BASE}"
             print(state["last"], flush=True)
             if is_buy and not in_position and pepe_bal == 0 and bal > 5:
                 price = float(klines[-1][4])
