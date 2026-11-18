@@ -1,158 +1,86 @@
-import os, time, threading, json, hmac, hashlib, urllib.parse, urllib.request
-from decimal import Decimal
-from flask import Flask, jsonify
+import os, time, hmac, hashlib, requests
+from flask import Flask
 
 app = Flask(__name__)
 
+API_KEY = os.environ.get("BYBIT_API_KEY", "").strip()
+API_SECRET = os.environ.get("BYBIT_API_SECRET", "").strip()
+BASE = "https://api.bybit.eu"  # EU ONLY, geen .com
 SYMBOL = "PEPEUSDT"
-INTERVAL = "15"
 UTBOT_FACTOR = 4.0
-ATR_PERIOD = 14
-BASE = "https://api.bybit.eu"
+UTBOT_ATR = 14
+INTERVAL = "15"
 
-API_KEY = os.getenv("BYBIT_API_KEY", "").strip()
-API_SECRET = os.getenv("BYBIT_API_SECRET", "").strip()
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
-TELEGRAM_CHAT = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+def sign(params):
+    qs = "&".join(f"{k}={params[k]}" for k in sorted(params))
+    return hmac.new(API_SECRET.encode(), qs.encode(), hashlib.sha256).hexdigest()
 
-def send_tg(msg):
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT:
-        return
-    try:
-        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-        data = json.dumps({"chat_id": TELEGRAM_CHAT, "text": msg}).encode()
-        req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
-        urllib.request.urlopen(req, timeout=10)
-    except Exception as e:
-        print("TG ERR", e, flush=True)
+def auth_get(path, extra={}):
+    ts = str(int(time.time()*1000))
+    p = {"api_key": API_KEY, "timestamp": ts, "recv_window": "5000", **extra}
+    p["sign"] = sign(p)
+    r = requests.get(BASE + path, params=p, timeout=15)
+    return r.json()
 
-def _signed_get(path, params):
-    ts = str(int(time.time() * 1000))
-    recv = "5000"
-    qs = urllib.parse.urlencode(params)
-    to_sign = ts + API_KEY + recv + qs
-    sign = hmac.new(API_SECRET.encode(), to_sign.encode(), hashlib.sha256).hexdigest()
-    url = BASE + path + "?" + qs
-    req = urllib.request.Request(url, headers={
-        "X-BAPI-API-KEY": API_KEY,
-        "X-BAPI-TIMESTAMP": ts,
-        "X-BAPI-RECV-WINDOW": recv,
-        "X-BAPI-SIGN": sign,
-        "X-BAPI-SIGN-TYPE": "2",
-        "Content-Type": "application/json"
-    })
-    with urllib.request.urlopen(req, timeout=20) as r:
-        return json.loads(r.read().decode())
-
-def _signed_post(path, params):
-    ts = str(int(time.time() * 1000))
-    recv = "5000"
-    body = json.dumps(params)
-    to_sign = ts + API_KEY + recv + body
-    sign = hmac.new(API_SECRET.encode(), to_sign.encode(), hashlib.sha256).hexdigest()
-    req = urllib.request.Request(BASE + path, data=body.encode(), headers={
-        "X-BAPI-API-KEY": API_KEY,
-        "X-BAPI-TIMESTAMP": ts,
-        "X-BAPI-RECV-WINDOW": recv,
-        "X-BAPI-SIGN": sign,
-        "X-BAPI-SIGN-TYPE": "2",
-        "Content-Type": "application/json"
-    }, method="POST")
-    with urllib.request.urlopen(req, timeout=20) as r:
-        return json.loads(r.read().decode())
-
-def get_coin_balance(coin):
-    r = _signed_get("/v5/account/wallet-balance", {"accountType": "SPOT", "coin": coin})
-    print(f"BAL SPOT {coin} -> {r}", flush=True)
-    if r.get("retCode") == 0:
-        for w in r.get("result", {}).get("list", []):
-            for c in w.get("coin", []):
-                if c.get("coin") == coin:
-                    return Decimal(str(c.get("walletBalance", "0")))
-        return Decimal("0")
-    return None
+def auth_post(path, extra={}):
+    ts = str(int(time.time()*1000))
+    p = {"api_key": API_KEY, "timestamp": ts, "recv_window": "5000", **extra}
+    p["sign"] = sign(p)
+    r = requests.post(BASE + path, data=p, timeout=15)
+    return r.json()
 
 def get_balance():
-    return get_coin_balance("USDT")
+    d = auth_get("/v5/account/wallet-balance", {"accountType": "SPOT", "coin": "USDT"})
+    print("BAL SPOT USDT ->", d, flush=True)
+    try:
+        return float(d["result"]["list"][0]["coin"][0]["walletBalance"])
+    except Exception:
+        return 0.0
 
 def get_klines():
-    url = BASE + f"/v5/market/kline?category=spot&symbol={SYMBOL}&interval={INTERVAL}&limit=200"
-    with urllib.request.urlopen(url, timeout=20) as r:
-        d = json.loads(r.read().decode())
-    return d["result"]["list"][::-1]
+    r = requests.get(BASE + "/v5/market/kline", params={"category": "spot", "symbol": SYMBOL, "interval": INTERVAL, "limit": "100"}, timeout=15).json()
+    closes = [float(x[4]) for x in r["result"]["list"]][::-1]
+    return closes
 
-def calc_utbot(klines):
-    closes = [float(k[4]) for k in klines]
-    highs = [float(k[2]) for k in klines]
-    lows = [float(k[3]) for k in klines]
-    trs = []
-    for i in range(1, len(klines)):
-        trs.append(max(highs[i] - lows[i], abs(highs[i] - closes[i - 1]), abs(lows[i] - closes[i - 1])))
-    atr = sum(trs[:ATR_PERIOD]) / ATR_PERIOD
-    for i in range(ATR_PERIOD, len(trs)):
-        atr = (atr * (ATR_PERIOD - 1) + trs[i]) / ATR_PERIOD
-    last_close = closes[-1]
-    prev_close = closes[-2]
-    trailing_prev = prev_close - UTBOT_FACTOR * atr
-    return last_close > trailing_prev, last_close < trailing_prev
-
-state = {"running": False, "last": "gestart", "balance": "?"}
-
-def bot_loop():
-    time.sleep(5)
-    send_tg("🤖 Pepebot-3 gestart - SPOT + UTBOT 4 / 14")
-    in_position = False
-    while True:
-        try:
-            bal = get_balance()
-            if bal is None:
-                state["last"] = "Kan saldo niet lezen"
-                time.sleep(60)
-                continue
-            state["balance"] = str(bal)
-            klines = get_klines()
-            is_buy, is_sell = calc_utbot(klines)
-            pepe_bal = get_coin_balance("PEPE")
-            if pepe_bal is None:
-                pepe_bal = Decimal("0")
-            state["last"] = f"bal={bal} PEPE={pepe_bal} buy={is_buy} sell={is_sell}"
-            print(state["last"], flush=True)
-            if is_buy and not in_position and pepe_bal == 0 and bal > 5:
-                price = float(klines[-1][4])
-                qty = int(float(bal / Decimal(str(price))))
-                if qty > 0:
-                    o = _signed_post("/v5/order/create", {"category": "spot", "symbol": SYMBOL, "side": "Buy", "orderType": "Market", "qty": str(qty)})
-                    print("BUY", o, flush=True)
-                    send_tg(f"🟢 BUY PEPE {qty} @ {price}")
-                    in_position = True
-            elif is_sell and (in_position or pepe_bal > 0):
-                qty = int(pepe_bal)
-                if qty > 0:
-                    o = _signed_post("/v5/order/create", {"category": "spot", "symbol": SYMBOL, "side": "Sell", "orderType": "Market", "qty": str(qty)})
-                    print("SELL", o, flush=True)
-                    send_tg(f"🔴 SELL PEPE {qty}")
-                    in_position = False
-            time.sleep(60)
-        except Exception as e:
-            print("LOOP ERR", e, flush=True)
-            state["last"] = f"ERR {e}"
-            time.sleep(60)
+def utbot_signal(closes):
+    # UTBOT 4 / 14 - simpele ATR trailing versie
+    import statistics
+    if len(closes) < 30:
+        return "HOLD"
+    trs = [abs(closes[i]-closes[i-1]) for i in range(1, len(closes))]
+    atr = sum(trs[-UTBOT_ATR:]) / UTBOT_ATR
+    # trailing stop: prijs boven vorig slot + factor*atr = BUY, eronder = SELL
+    if closes[-1] > closes[-2] + UTBOT_FACTOR * atr * 0.1:
+        return "BUY"
+    if closes[-1] < closes[-2] - UTBOT_FACTOR * atr * 0.1:
+        return "SELL"
+    return "HOLD"
 
 @app.route("/")
 def home():
-    return jsonify({"status": "Pepebot-3 live SPOT", "state": state, "key_start": API_KEY[:4] if API_KEY else "LEEG"})
-
-@app.route("/test-key")
-def test_key():
-    try:
-        r = _signed_get("/v5/account/wallet-balance", {"accountType": "SPOT", "coin": "USDT"})
-        return jsonify({"key_start": API_KEY[:4] if API_KEY else "LEEG", "bybit_raw": r})
-    except Exception as e:
-        return jsonify({"key_start": API_KEY[:4] if API_KEY else "LEEG", "error": str(e)})
-
-if not state["running"]:
-    state["running"] = True
-    threading.Thread(target=bot_loop, daemon=True).start()
+    bal = get_balance()
+    closes = get_klines()
+    sig = utbot_signal(closes)
+    print(f"BAL={bal} SIG={sig} PRICE={closes[-1]}", flush=True)
+    if bal > 5 and sig == "BUY":
+        # compound: volledige USDT balans gebruiken
+        price = closes[-1]
+        qty = str(int((bal * 0.99) / price))
+        res = auth_post("/v5/order/create", {"category": "spot", "symbol": SYMBOL, "side": "Buy", "orderType": "Market", "qty": qty})
+        print("BUY ->", res, flush=True)
+        return f"BUY {qty} BAL={bal}"
+    if sig == "SELL":
+        # verkoop alle PEPE
+        b = auth_get("/v5/account/wallet-balance", {"accountType": "SPOT", "coin": "PEPE"})
+        try:
+            pepe = float(b["result"]["list"][0]["coin"][0]["walletBalance"])
+        except Exception:
+            pepe = 0
+        if pepe > 0:
+            res = auth_post("/v5/order/create", {"category": "spot", "symbol": SYMBOL, "side": "Sell", "orderType": "Market", "qty": str(int(pepe))})
+            print("SELL ->", res, flush=True)
+            return f"SELL {pepe}"
+    return f"OK BAL={bal} SIG={sig} PRICE={closes[-1]}"
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "10000")))
+    app.run(host="0.0.0.0", port=10000)
