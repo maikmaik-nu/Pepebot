@@ -10,13 +10,10 @@ UTBOT_FACTOR = 4.0
 ATR_PERIOD = 14
 BASE = "https://api.bybit.eu"
 
-def clean(v):
-    return (v or "").strip().strip('"').strip("'").strip()
-
-API_KEY = clean(os.getenv("BYBIT_API_KEY"))
-API_SECRET = clean(os.getenv("BYBIT_API_SECRET"))
-TELEGRAM_TOKEN = clean(os.getenv("TELEGRAM_TOKEN"))
-TELEGRAM_CHAT = clean(os.getenv("TELEGRAM_CHAT_ID"))
+API_KEY = os.getenv("BYBIT_API_KEY", "").strip()
+API_SECRET = os.getenv("BYBIT_API_SECRET", "").strip()
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
+TELEGRAM_CHAT = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
 def send_tg(msg):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT:
@@ -29,17 +26,9 @@ def send_tg(msg):
     except Exception as e:
         print("TG ERR", e, flush=True)
 
-def get_server_time():
-    try:
-        with urllib.request.urlopen(BASE + "/v5/market/time", timeout=10) as r:
-            d = json.loads(r.read().decode())
-            return str(int(d["result"]["timeSecond"]) * 1000)
-    except Exception:
-        return str(int(time.time() * 1000))
-
 def bybit_get(path, params):
-    ts = get_server_time()
-    recv = "5000"
+    ts = str(int(time.time() * 1000))
+    recv = "20000"
     qs = urllib.parse.urlencode(params)
     to_sign = ts + API_KEY + recv + qs
     sign = hmac.new(API_SECRET.encode(), to_sign.encode(), hashlib.sha256).hexdigest()
@@ -56,9 +45,9 @@ def bybit_get(path, params):
         return json.loads(r.read().decode())
 
 def bybit_post(path, params):
-    ts = get_server_time()
-    recv = "5000"
-    body = json.dumps(params, separators=(",", ":"))
+    ts = str(int(time.time() * 1000))
+    recv = "20000"
+    body = json.dumps(params)
     to_sign = ts + API_KEY + recv + body
     sign = hmac.new(API_SECRET.encode(), to_sign.encode(), hashlib.sha256).hexdigest()
     req = urllib.request.Request(BASE + path, data=body.encode(), headers={
@@ -73,18 +62,14 @@ def bybit_post(path, params):
         return json.loads(r.read().decode())
 
 def get_balance():
-    for acct in ["UNIFIED", "SPOT"]:
-        try:
-            r = bybit_get("/v5/account/wallet-balance", {"accountType": acct, "coin": "USDT"})
-            print(f"BAL {acct} -> {r}", flush=True)
-            if r.get("retCode") == 0:
-                for w in r.get("result", {}).get("list", []):
-                    for c in w.get("coin", []):
-                        if c.get("coin") == "USDT":
-                            return Decimal(str(c.get("walletBalance", "0")))
-                return Decimal("0")
-        except Exception as e:
-            print(f"BAL EXC {acct} {e}", flush=True)
+    r = bybit_get("/v5/account/wallet-balance", {"accountType": "SPOT", "coin": "USDT"})
+    print(f"BAL SPOT -> {r}", flush=True)
+    if r.get("retCode") == 0:
+        for w in r.get("result", {}).get("list", []):
+            for c in w.get("coin", []):
+                if c.get("coin") == "USDT":
+                    return Decimal(str(c.get("walletBalance", "0")))
+        return Decimal("0")
     return None
 
 def get_klines():
@@ -93,6 +78,7 @@ def get_klines():
         d = json.loads(r.read().decode())
     return d["result"]["list"][::-1]
 
+# --- ALLEEN DIT IS NIEUW: UTBOT ---
 def calc_utbot(klines):
     closes = [float(k[4]) for k in klines]
     highs = [float(k[2]) for k in klines]
@@ -112,7 +98,7 @@ state = {"running": False, "last": "gestart", "balance": "?"}
 
 def bot_loop():
     time.sleep(5)
-    send_tg("🤖 Pepebot-3 gestart - EU + Bybit-tijd")
+    send_tg("🤖 Pepebot-3 gestart - origineel + UTBOT")
     in_position = False
     while True:
         try:
@@ -125,9 +111,7 @@ def bot_loop():
             state["balance"] = str(bal)
             klines = get_klines()
             is_buy, is_sell = calc_utbot(klines)
-            r = bybit_get("/v5/account/wallet-balance", {"accountType": "UNIFIED", "coin": "PEPE"})
-            if r.get("retCode") != 0:
-                r = bybit_get("/v5/account/wallet-balance", {"accountType": "SPOT", "coin": "PEPE"})
+            r = bybit_get("/v5/account/wallet-balance", {"accountType": "SPOT", "coin": "PEPE"})
             pepe_bal = Decimal("0")
             if r.get("retCode") == 0:
                 for w in r["result"]["list"]:
@@ -164,8 +148,8 @@ def home():
 @app.route("/test-key")
 def test_key():
     try:
-        r = bybit_get("/v5/account/wallet-balance", {"accountType": "UNIFIED", "coin": "USDT"})
-        return jsonify({"key_start": API_KEY[:4] if API_KEY else "LEEG", "key_len": len(API_KEY), "secret_len": len(API_SECRET), "bybit_raw": r})
+        r = bybit_get("/v5/account/wallet-balance", {"accountType": "SPOT", "coin": "USDT"})
+        return jsonify({"key_start": API_KEY[:4] if API_KEY else "LEEG", "bybit_raw": r})
     except Exception as e:
         return jsonify({"key_start": API_KEY[:4] if API_KEY else "LEEG", "error": str(e)})
 
