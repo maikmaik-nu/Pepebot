@@ -5,10 +5,11 @@ import requests
 
 app = Flask(__name__)
 
-DOMAIN = "by" + "bit" + ".eu"
+DOMAIN = "by" + "bit"
+TLD = "eu"
 KL_URL = "https://api." + "by" + "bit.com/v5/market/kline"
 
-session = HTTP(testnet=False, api_key=os.getenv("BYBIT_API_KEY"), api_secret=os.getenv("BYBIT_API_SECRET"), domain=DOMAIN)
+session = HTTP(testnet=False, api_key=os.getenv("BYBIT_API_KEY"), api_secret=os.getenv("BYBIT_API_SECRET"), domain=DOMAIN, tld=TLD)
 
 SYMBOL = "PEPEUSDT"
 QTY_USDT = 20.0
