@@ -9,7 +9,9 @@ SECRET = os.getenv("BYBIT_API_SECRET", "").strip().strip('"').strip("'")
 TG_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
 TG_CHAT = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
+IS_RSA = SECRET.startswith("-----BEGIN")
 print("KEY LOADED: " + str(len(KEY)) + " chars, start=" + KEY[:4] + "****", flush=True)
+print("SECRET LOADED: " + str(len(SECRET)) + " chars, type=" + ("RSA" if IS_RSA else "HMAC"), flush=True)
 
 def tg(msg):
     if not TG_TOKEN or not TG_CHAT:
@@ -22,25 +24,35 @@ def tg(msg):
 def get_balance():
     try:
         from pybit.unified_trading import HTTP
-        s = HTTP(testnet=False, api_key=KEY, api_secret=SECRET, domain="bybit.eu")
-        for acct in ["UNIFIED", "SPOT"]:
+        # Probeer alle domeinen met de key die er NU in staat, geen nieuwe key nodig
+        for domain in ["bybit.eu", "bybit.com", "bytick.com"]:
             try:
-                r = s.get_wallet_balance(accountType=acct, coin="USDT")
-                print("BALANCE " + acct + " -> " + str(r), flush=True)
-                if r.get("retCode") == 0:
-                    coins = r["result"]["list"][0]["coin"]
-                    for c in coins:
-                        if c["coin"] == "USDT":
-                            return float(c["walletBalance"]), acct, s
+                # Als secret RSA is, moet pybit RSA gebruiken, anders HMAC
+                if IS_RSA:
+                    s = HTTP(testnet=False, api_key=KEY, api_secret=SECRET, domain=domain, rsa_auth=True)
+                else:
+                    s = HTTP(testnet=False, api_key=KEY, api_secret=SECRET, domain=domain)
+                for acct in ["UNIFIED", "SPOT"]:
+                    try:
+                        r = s.get_wallet_balance(accountType=acct, coin="USDT")
+                        print("TRY " + domain + " " + acct + " -> retCode=" + str(r.get("retCode")) + " retMsg=" + str(r.get("retMsg")), flush=True)
+                        if r.get("retCode") == 0:
+                            coins = r["result"]["list"][0]["coin"]
+                            for c in coins:
+                                if c["coin"] == "USDT":
+                                    return float(c["walletBalance"]), acct + "-" + domain, s
+                    except Exception as e:
+                        print("TRY fail " + domain + " " + acct + " " + str(e), flush=True)
             except Exception as e:
-                print("BALANCE fail " + acct + " " + str(e), flush=True)
+                print("DOMAIN fail " + domain + " " + str(e), flush=True)
     except Exception as e:
         print("pybit fail", e, flush=True)
     return 0, None, None
 
-def get_price():
+def get_price(domain):
+    base = "https://api.bybit.eu" if domain == "【entity-bybit¦canonical_name=Bybit】.eu" else "https://api.bytick.com"
     try:
-        r = requests.get("https://api.bybit.eu/v5/market/tickers", params={"category": "spot", "symbol": "PEPEUSDT"}, timeout=10)
+        r = requests.get(base + "/v5/market/tickers", params={"category": "spot", "symbol": "PEPEUSDT"}, timeout=10)
         return float(r.json()["result"]["list"][0]["lastPrice"])
     except Exception:
         return 0
@@ -79,7 +91,7 @@ def home():
 @app.route("/test-key")
 def test_key():
     usdt, acct, s = get_balance()
-    return jsonify({"status": "OK" if acct else "FOUT", "account": acct, "usdt": usdt, "key_start": KEY[:4]})
+    return jsonify({"status": "OK" if acct else "FOUT", "account": acct, "usdt": usdt, "key_start": KEY[:4], "key_type": "RSA" if IS_RSA else "HMAC"})
 
 @app.route("/check")
 def check():
@@ -92,29 +104,4 @@ def check():
     sig = utbot(closes, highs, lows)
     print("UTBOT sig=" + str(sig) + " usdt=" + str(usdt) + " acct=" + str(acct), flush=True)
     if sig == "BUY" and usdt >= 20:
-        try:
-            price = get_price()
-            qty = str(int(20 / price))
-            res = s.place_order(category="spot", symbol="PEPEUSDT", side="Buy", orderType="Market", qty=qty)
-            tg("BUY PEPE 20 USDT -> " + str(res.get("retMsg")))
-            return jsonify({"signal": sig, "order": res})
-        except Exception as e:
-            return jsonify({"signal": sig, "error": str(e)})
-    if sig == "SELL":
-        try:
-            price = get_price()
-            qty = str(int(20 / price))
-            res = s.place_order(category="spot", symbol="PEPEUSDT", side="Sell", orderType="Market", qty=qty)
-            tg("SELL PEPE -> " + str(res.get("retMsg")))
-            return jsonify({"signal": sig, "order": res})
-        except Exception as e:
-            return jsonify({"signal": sig, "error": str(e)})
-    return jsonify({"status": "geen signaal", "signal": sig, "usdt": usdt, "acct": acct})
-
-@app.route("/webhook", methods=["POST"])
-def webhook():
-    print("Webhook:", request.get_json(force=True, silent=True), flush=True)
-    return check()
-
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 10000)))
+        try
