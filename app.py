@@ -13,7 +13,6 @@ KEY = os.getenv("BYBIT_API_KEY", "").strip()
 SECRET = os.getenv("BYBIT_API_SECRET", "").strip()
 TG_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
 TG_CHAT = os.getenv("TELEGRAM_CHAT_ID", "").strip()
-BASE = "https://api.bybit.eu"
 
 print("KEY_LEN " + str(len(KEY)) + " SECRET_LEN " + str(len(SECRET)) + " START " + KEY[:4], flush=True)
 
@@ -25,20 +24,38 @@ def tg(m):
     except Exception as e:
         print("TG fail " + str(e), flush=True)
 
-def s_get(path, params):
+def s_get_one(base, path, params):
     ts = str(int(time.time() * 1000))
     q = urlencode(sorted(params.items()))
     msg = ts + KEY + "5000" + q
     s = hmac.new(SECRET.encode(), msg.encode(), hashlib.sha256).hexdigest()
     h = {"X-BAPI-API-KEY": KEY, "X-BAPI-TIMESTAMP": ts, "X-BAPI-RECV-WINDOW": "5000", "X-BAPI-SIGN": s, "X-BAPI-SIGN-TYPE": "2"}
-    r = requests.get(BASE + path + "?" + q, headers=h, timeout=15)
     try:
-        return r.json()
-    except Exception:
-        return {"retCode": -1, "retMsg": "empty"}
+        r = requests.get(base + path + "?" + q, headers=h, timeout=15)
+        try:
+            return base, r.json()
+        except Exception:
+            return base, {"retCode": -1, "retMsg": "empty body " + r.text[:100]}
+    except Exception as e:
+        return base, {"retCode": -1, "retMsg": str(e)}
+
+def s_get(path, params):
+    # FOUT IN OUDE CODE: alleen api.bybit.eu. Nu probeert hij beide.
+    for base in ["https://api.bybit.eu", "https://api.bybit.com", "https://api.bytick.com"]:
+        b, d = s_get_one(base, path, params)
+        print("TRY " + b + " " + str(d)[:300], flush=True)
+        if d.get("retCode") == 0:
+            return d
+        # 10003 = verkeerde domein of verkeerde secret, probeer volgende domein
+        if d.get("retCode") == 10003:
+            continue
+        if d.get("retCode") == 0:
+            return d
+    # geen enkele werkte, geef laatste terug voor debug
+    return d
 
 def bal():
-    for a in ["UNIFIED", "SPOT"]:
+    for a in ["SPOT", "UNIFIED"]:
         d = s_get("/v5/account/wallet-balance", {"accountType": a, "coin": "USDT"})
         print("BAL " + a + " " + str(d)[:400], flush=True)
         if d.get("retCode") == 0:
@@ -53,21 +70,25 @@ def bal():
 
 def price():
     try:
-        r = requests.get(BASE + "/v5/market/tickers", params={"category": "spot", "symbol": "PEPEUSDT"}, timeout=10)
-        return float(r.json()["result"]["list"][0]["lastPrice"])
+        for base in ["https://api.bybit.eu", "https://api.bybit.com"]:
+            r = requests.get(base + "/v5/market/tickers", params={"category": "spot", "symbol": "PEPEUSDT"}, timeout=10)
+            return float(r.json()["result"]["list"][0]["lastPrice"])
     except Exception:
         return 0.0
+    return 0.0
 
 def klines():
     try:
-        r = requests.get(BASE + "/v5/market/kline", params={"category": "spot", "symbol": "PEPEUSDT", "interval": "15", "limit": 100}, timeout=15)
-        k = r.json()["result"]["list"][::-1]
-        c = [float(x[4]) for x in k]
-        h = [float(x[2]) for x in k]
-        l = [float(x[3]) for x in k]
-        return c, h, l
+        for base in ["https://api.bybit.eu", "https://api.bybit.com"]:
+            r = requests.get(base + "/v5/market/kline", params={"category": "spot", "symbol": "PEPEUSDT", "interval": "15", "limit": 100}, timeout=15)
+            k = r.json()["result"]["list"][::-1]
+            c = [float(x[4]) for x in k]
+            h = [float(x[2]) for x in k]
+            l = [float(x[3]) for x in k]
+            return c, h, l
     except Exception:
         return [], [], []
+    return [], [], []
 
 def sig(c, h, l):
     if len(c) < 30:
@@ -97,9 +118,13 @@ def order(side, val):
         msg = ts + KEY + "5000" + bs
         s = hmac.new(SECRET.encode(), msg.encode(), hashlib.sha256).hexdigest()
         h = {"X-BAPI-API-KEY": KEY, "X-BAPI-TIMESTAMP": ts, "X-BAPI-RECV-WINDOW": "5000", "X-BAPI-SIGN": s, "X-BAPI-SIGN-TYPE": "2", "Content-Type": "application/json"}
-        rr = requests.post(BASE + "/v5/order/create", headers=h, data=bs, timeout=15)
-        print("ORDER " + side + " " + rr.text[:400], flush=True)
-        return rr.json()
+        for base in ["https://api.bybit.eu", "https://api.bybit.com"]:
+            rr = requests.post(base + "/v5/order/create", headers=h, data=bs, timeout=15)
+            print("ORDER " + side + " " + base + " " + rr.text[:300], flush=True)
+            j = rr.json()
+            if j.get("retCode") == 0:
+                return j
+        return j
     except Exception as e:
         return {"retCode": -1, "retMsg": str(e)}
 
@@ -115,7 +140,7 @@ def tk():
 @app.route("/debug")
 def dbg():
     out = {}
-    for a in ["UNIFIED", "SPOT"]:
+    for a in ["SPOT", "UNIFIED"]:
         d = s_get("/v5/account/wallet-balance", {"accountType": a, "coin": "USDT"})
         out[a] = d
     return jsonify(out)
