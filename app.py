@@ -8,11 +8,10 @@ SYMBOL = "PEPEUSDT"
 INTERVAL = "15"
 UTBOT_FACTOR = 4.0
 ATR_PERIOD = 14
-BASES = ["https://api.bybit.eu", "https://api-demo.bybit.eu", "https://api.bybit.com", "https://api-demo.bybit.com"]
-BASE = BASES[0]
+BASE = "https://api.bybit.eu"
 
-API_KEY = os.getenv("【entity-BYBIT_API_KEY¦canonical_name=Bybit】", "").strip()
-API_SECRET = os.getenv("【entity-BYBIT_API_SECRET¦canonical_name=Bybit】", "").strip()
+API_KEY = os.getenv("BYBIT_API_KEY", "").strip()
+API_SECRET = os.getenv("BYBIT_API_SECRET", "").strip()
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
 TELEGRAM_CHAT = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
@@ -27,13 +26,13 @@ def send_tg(msg):
     except Exception as e:
         print("TG ERR", e, flush=True)
 
-def _signed_get(base, path, params):
+def _signed_get(path, params):
     ts = str(int(time.time() * 1000))
     recv = "20000"
     qs = urllib.parse.urlencode(params)
     to_sign = ts + API_KEY + recv + qs
     sign = hmac.new(API_SECRET.encode(), to_sign.encode(), hashlib.sha256).hexdigest()
-    url = base + path + "?" + qs
+    url = BASE + path + "?" + qs
     req = urllib.request.Request(url, headers={
         "X-BAPI-API-KEY": API_KEY,
         "X-BAPI-TIMESTAMP": ts,
@@ -45,13 +44,13 @@ def _signed_get(base, path, params):
     with urllib.request.urlopen(req, timeout=20) as r:
         return json.loads(r.read().decode())
 
-def _signed_post(base, path, params):
+def _signed_post(path, params):
     ts = str(int(time.time() * 1000))
     recv = "20000"
     body = json.dumps(params)
     to_sign = ts + API_KEY + recv + body
     sign = hmac.new(API_SECRET.encode(), to_sign.encode(), hashlib.sha256).hexdigest()
-    req = urllib.request.Request(base + path, data=body.encode(), headers={
+    req = urllib.request.Request(BASE + path, data=body.encode(), headers={
         "X-BAPI-API-KEY": API_KEY,
         "X-BAPI-TIMESTAMP": ts,
         "X-BAPI-RECV-WINDOW": recv,
@@ -62,37 +61,12 @@ def _signed_post(base, path, params):
     with urllib.request.urlopen(req, timeout=20) as r:
         return json.loads(r.read().decode())
 
-def bybit_get(path, params):
-    global BASE
-    last = None
-    for b in BASES:
-        try:
-            r = _signed_get(b, path, params)
-            print(f"GET {b}{path} -> {r}", flush=True)
-            if r.get("retCode") == 0:
-                BASE = b
-                return r
-            last = r
-        except Exception as e:
-            print(f"GET {b} ERR {e}", flush=True)
-            last = e
-    if isinstance(last, Exception):
-        raise last
-    return last
-
-def bybit_post(path, params):
-    return _signed_post(BASE, path, params)
-
-ACCOUNT_TYPE = [None]
-
 def get_coin_balance(coin):
     for at in ["UNIFIED", "SPOT", "FUND"]:
         try:
-            r = bybit_get("/v5/account/wallet-balance", {"accountType": at, "coin": coin})
+            r = _signed_get("/v5/account/wallet-balance", {"accountType": at, "coin": coin})
             print(f"BAL {at} {coin} -> {r}", flush=True)
             if r.get("retCode") == 0:
-                if ACCOUNT_TYPE[0] is None:
-                    ACCOUNT_TYPE[0] = at
                 for w in r.get("result", {}).get("list", []):
                     for c in w.get("coin", []):
                         if c.get("coin") == coin:
@@ -117,10 +91,10 @@ def calc_utbot(klines):
     lows = [float(k[3]) for k in klines]
     trs = []
     for i in range(1, len(klines)):
-        trs.append(max(highs[i]-lows[i], abs(highs[i]-closes[i-1]), abs(lows[i]-closes[i-1])))
+        trs.append(max(highs[i] - lows[i], abs(highs[i] - closes[i - 1]), abs(lows[i] - closes[i - 1])))
     atr = sum(trs[:ATR_PERIOD]) / ATR_PERIOD
     for i in range(ATR_PERIOD, len(trs)):
-        atr = (atr * (ATR_PERIOD-1) + trs[i]) / ATR_PERIOD
+        atr = (atr * (ATR_PERIOD - 1) + trs[i]) / ATR_PERIOD
     last_close = closes[-1]
     prev_close = closes[-2]
     trailing_prev = prev_close - UTBOT_FACTOR * atr
@@ -130,7 +104,7 @@ state = {"running": False, "last": "gestart", "balance": "?"}
 
 def bot_loop():
     time.sleep(5)
-    send_tg("🤖 Pepebot-3 gestart - werkend + UTBOT 4 / 14 - 4 domeinen")
+    send_tg("🤖 Pepebot-3 gestart - EU only + UTBOT 4 / 14")
     in_position = False
     while True:
         try:
@@ -146,20 +120,20 @@ def bot_loop():
             pepe_bal = get_coin_balance("PEPE")
             if pepe_bal is None:
                 pepe_bal = Decimal("0")
-            state["last"] = f"bal={bal} PEPE={pepe_bal} buy={is_buy} sell={is_sell} acct={ACCOUNT_TYPE[0]} base={BASE}"
+            state["last"] = f"bal={bal} PEPE={pepe_bal} buy={is_buy} sell={is_sell} base={BASE}"
             print(state["last"], flush=True)
             if is_buy and not in_position and pepe_bal == 0 and bal > 5:
                 price = float(klines[-1][4])
                 qty = int(float(bal / Decimal(str(price))))
                 if qty > 0:
-                    o = bybit_post("/v5/order/create", {"category": "spot", "symbol": SYMBOL, "side": "Buy", "orderType": "Market", "qty": str(qty)})
+                    o = _signed_post("/v5/order/create", {"category": "spot", "symbol": SYMBOL, "side": "Buy", "orderType": "Market", "qty": str(qty)})
                     print("BUY", o, flush=True)
                     send_tg(f"🟢 BUY PEPE {qty} @ {price}")
                     in_position = True
             elif is_sell and (in_position or pepe_bal > 0):
                 qty = int(pepe_bal)
                 if qty > 0:
-                    o = bybit_post("/v5/order/create", {"category": "spot", "symbol": SYMBOL, "side": "Sell", "orderType": "Market", "qty": str(qty)})
+                    o = _signed_post("/v5/order/create", {"category": "spot", "symbol": SYMBOL, "side": "Sell", "orderType": "Market", "qty": str(qty)})
                     print("SELL", o, flush=True)
                     send_tg(f"🔴 SELL PEPE {qty}")
                     in_position = False
@@ -171,13 +145,13 @@ def bot_loop():
 
 @app.route("/")
 def home():
-    return jsonify({"status": "Pepebot-3 live", "state": state, "key_start": API_KEY[:4] if API_KEY else "LEEG"})
+    return jsonify({"status": "Pepebot-3 live EU only", "state": state, "key_start": API_KEY[:4] if API_KEY else "LEEG"})
 
 @app.route("/test-key")
 def test_key():
     try:
-        r = bybit_get("/v5/account/wallet-balance", {"accountType": "UNIFIED", "coin": "USDT"})
-        return jsonify({"key_start": API_KEY[:4] if API_KEY else "LEEG", "bybit_raw": r, "working_base": BASE})
+        r = _signed_get("/v5/account/wallet-balance", {"accountType": "UNIFIED", "coin": "USDT"})
+        return jsonify({"key_start": API_KEY[:4] if API_KEY else "LEEG", "bybit_raw": r})
     except Exception as e:
         return jsonify({"key_start": API_KEY[:4] if API_KEY else "LEEG", "error": str(e)})
 
