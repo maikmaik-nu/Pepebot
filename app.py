@@ -1,17 +1,21 @@
 import os
+import time
+import hmac
+import hashlib
+import json
 import requests
+from urllib.parse import urlencode
 from flask import Flask, request, jsonify
 
 app = Flask(__name__)
 
-KEY = os.getenv("BYBIT_API_KEY", "").strip().strip('"').strip("'")
-SECRET = os.getenv("BYBIT_API_SECRET", "").strip().strip('"').strip("'")
+KEY = os.getenv("BYBIT_API_KEY", "").strip()
+SECRET = os.getenv("BYBIT_API_SECRET", "").strip()
 TG_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
 TG_CHAT = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+BASE = "https://api.bybit.eu"
 
-IS_RSA = SECRET.startswith("-----BEGIN")
-print("KEY LOADED: " + str(len(KEY)) + " chars, start=" + KEY[:4] + "****", flush=True)
-print("SECRET LOADED: " + str(len(SECRET)) + " chars, type=" + ("RSA" if IS_RSA else "HMAC"), flush=True)
+print("KEY LOADED " + str(len(KEY)) + " " + KEY[:4], flush=True)
 
 def tg(msg):
     if not TG_TOKEN or not TG_CHAT:
@@ -21,45 +25,51 @@ def tg(msg):
     except Exception as e:
         print("TG fail", e, flush=True)
 
-def get_balance():
+def signed_get(path, params):
+    ts = str(int(time.time() * 1000))
+    recv = "5000"
+    query = urlencode(sorted(params.items()))
+    sign_str = ts + KEY + recv + query
+    sign = hmac.new(SECRET.encode(), sign_str.encode(), hashlib.sha256).hexdigest()
+    headers = {
+        "X-BAPI-API-KEY": KEY,
+        "X-BAPI-TIMESTAMP": ts,
+        "X-BAPI-RECV-WINDOW": recv,
+        "X-BAPI-SIGN": sign,
+        "X-BAPI-SIGN-TYPE": "2",
+        "Content-Type": "application/json"
+    }
+    url = BASE + path + "?" + query
+    r = requests.get(url, headers=headers, timeout=15)
     try:
-        from pybit.unified_trading import HTTP
-        # Probeer alle domeinen met de key die er NU in staat, geen nieuwe key nodig
-        for domain in ["bybit.eu", "bybit.com", "bytick.com"]:
-            try:
-                # Als secret RSA is, moet pybit RSA gebruiken, anders HMAC
-                if IS_RSA:
-                    s = HTTP(testnet=False, api_key=KEY, api_secret=SECRET, domain=domain, rsa_auth=True)
-                else:
-                    s = HTTP(testnet=False, api_key=KEY, api_secret=SECRET, domain=domain)
-                for acct in ["UNIFIED", "SPOT"]:
-                    try:
-                        r = s.get_wallet_balance(accountType=acct, coin="USDT")
-                        print("TRY " + domain + " " + acct + " -> retCode=" + str(r.get("retCode")) + " retMsg=" + str(r.get("retMsg")), flush=True)
-                        if r.get("retCode") == 0:
-                            coins = r["result"]["list"][0]["coin"]
-                            for c in coins:
-                                if c["coin"] == "USDT":
-                                    return float(c["walletBalance"]), acct + "-" + domain, s
-                    except Exception as e:
-                        print("TRY fail " + domain + " " + acct + " " + str(e), flush=True)
-            except Exception as e:
-                print("DOMAIN fail " + domain + " " + str(e), flush=True)
-    except Exception as e:
-        print("pybit fail", e, flush=True)
-    return 0, None, None
+        return r.json()
+    except Exception:
+        return {"retCode": -1, "retMsg": "empty", "status": r.status_code}
 
-def get_price(domain):
-    base = "https://api.bybit.eu" if domain == "【entity-bybit¦canonical_name=Bybit】.eu" else "https://api.bytick.com"
+def get_balance():
+    for acct in ["UNIFIED", "SPOT"]:
+        d = signed_get("/v5/account/wallet-balance", {"accountType": acct, "coin": "USDT"})
+        print("BALANCE " + acct + " " + str(d), flush=True)
+        if d.get("retCode") == 0:
+            try:
+                coins = d["result"]["list"][0]["coin"]
+                for c in coins:
+                    if c["coin"] == "USDT":
+                        return float(c["walletBalance"]), acct
+            except Exception:
+                pass
+    return 0, None
+
+def get_price():
     try:
-        r = requests.get(base + "/v5/market/tickers", params={"category": "spot", "symbol": "PEPEUSDT"}, timeout=10)
+        r = requests.get(BASE + "/v5/market/tickers", params={"category": "spot", "symbol": "PEPEUSDT"}, timeout=10)
         return float(r.json()["result"]["list"][0]["lastPrice"])
     except Exception:
         return 0
 
 def get_klines():
     try:
-        r = requests.get("https://api.bybit.eu/v5/market/kline", params={"category": "spot", "symbol": "PEPEUSDT", "interval": "15", "limit": 100}, timeout=15)
+        r = requests.get(BASE + "/v5/market/kline", params={"category": "spot", "symbol": "PEPEUSDT", "interval": "15", "limit": 100}, timeout=15)
         kl = r.json()["result"]["list"][::-1]
         closes = [float(x[4]) for x in kl]
         highs = [float(x[2]) for x in kl]
@@ -84,24 +94,65 @@ def utbot(closes, highs, lows):
         return "SELL"
     return None
 
+def place_order(side, usdt_val):
+    try:
+        price = get_price()
+        if price == 0:
+            return {"retCode": -1, "retMsg": "no price"}
+        qty = str(int(usdt_val / price))
+        ts = str(int(time.time() * 1000))
+        recv = "5000"
+        body = {"category": "spot", "symbol": "PEPEUSDT", "side": side, "orderType": "Market", "qty": qty}
+        body_str = json.dumps(body)
+        sign_str = ts + KEY + recv + body_str
+        sign = hmac.new(SECRET.encode(), sign_str.encode(), hashlib.sha256).hexdigest()
+        headers = {
+            "X-BAPI-API-KEY": KEY,
+            "X-BAPI-TIMESTAMP": ts,
+            "X-BAPI-RECV-WINDOW": recv,
+            "X-BAPI-SIGN": sign,
+            "X-BAPI-SIGN-TYPE": "2",
+            "Content-Type": "application/json"
+        }
+        r = requests.post(BASE + "/v5/order/create", headers=headers, data=body_str, timeout=15)
+        print("ORDER " + side + " " + qty + " " + r.text[:300], flush=True)
+        return r.json()
+    except Exception as e:
+        return {"retCode": -1, "retMsg": str(e)}
+
 @app.route("/")
 def home():
     return "Pepebot-3 live"
 
 @app.route("/test-key")
 def test_key():
-    usdt, acct, s = get_balance()
-    return jsonify({"status": "OK" if acct else "FOUT", "account": acct, "usdt": usdt, "key_start": KEY[:4], "key_type": "RSA" if IS_RSA else "HMAC"})
+    usdt, acct = get_balance()
+    return jsonify({"status": "OK" if acct else "FOUT", "account": acct, "usdt": usdt, "key_start": KEY[:4]})
 
 @app.route("/check")
 def check():
-    print("=== Bot check gestart ===", flush=True)
-    usdt, acct, s = get_balance()
+    print("BOT CHECK", flush=True)
+    usdt, acct = get_balance()
     if usdt < 5:
-        tg("Bot stopt: geen saldo. USDT=" + str(usdt) + " acct=" + str(acct))
+        tg("Bot stopt geen saldo USDT=" + str(usdt))
         return jsonify({"status": "geen saldo", "usdt": usdt, "acct": acct})
     closes, highs, lows = get_klines()
     sig = utbot(closes, highs, lows)
-    print("UTBOT sig=" + str(sig) + " usdt=" + str(usdt) + " acct=" + str(acct), flush=True)
+    print("SIG " + str(sig) + " USDT " + str(usdt), flush=True)
     if sig == "BUY" and usdt >= 20:
-        try
+        res = place_order("Buy", 20)
+        tg("BUY PEPE 20 USDT " + str(res.get("retMsg")))
+        return jsonify({"signal": sig, "order": res})
+    if sig == "SELL":
+        res = place_order("Sell", 20)
+        tg("SELL PEPE " + str(res.get("retMsg")))
+        return jsonify({"signal": sig, "order": res})
+    return jsonify({"status": "geen signaal", "signal": sig, "usdt": usdt, "acct": acct})
+
+@app.route("/webhook", methods=["POST"])
+def webhook():
+    print("Webhook", request.get_json(force=True, silent=True), flush=True)
+    return check()
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 10000)))
