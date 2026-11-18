@@ -6,7 +6,7 @@ from flask import Flask, request, jsonify
 app = Flask(__name__)
 
 BYBIT_API_KEY = os.environ.get("BYBIT_API_KEY", "").strip()
-【entity-BYBIT_API_SECRET¦canonical_name=Bybit】 = os.environ.get("【entity-BYBIT_API_SECRET¦canonical_name=Bybit】", "").strip()
+BYBIT_API_SECRET = os.environ.get("BYBIT_API_SECRET", "").strip()
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 
@@ -60,7 +60,7 @@ def save_state():
 def _sign(params_str, timestamp):
     recv_window = "5000"
     payload = timestamp + BYBIT_API_KEY + recv_window + params_str
-    sign = hmac.new(【entity-BYBIT_API_SECRET¦canonical_name=Bybit】.encode("utf-8"), payload.encode("utf-8"), hashlib.sha256).hexdigest()
+    sign = hmac.new(BYBIT_API_SECRET.encode("utf-8"), payload.encode("utf-8"), hashlib.sha256).hexdigest()
     return sign, recv_window
 
 def _headers(sign, recv_window, timestamp):
@@ -110,7 +110,7 @@ def get_balances():
             data = bybit_get("/v5/account/wallet-balance", {"accountType": account_type})
             log(f"Saldo check {account_type}: retCode={data.get('retCode')} retMsg={data.get('retMsg')}")
             if data.get("retCode") == 10003:
-                log(f"FOUT 10003 in {account_type}: Key geen toestemming. bybit.eu API Read + Spot Trade + Wallet AAN, IP UIT")
+                log(f"FOUT 10003 in {account_type}: Key geen toestemming")
                 last_error = "10003"
                 continue
             if data.get("retCode") != 0:
@@ -235,7 +235,7 @@ def check_bot():
                 with STATE_LOCK:
                     if time.time() - STATE["last_error_msg"] > 600:
                         STATE["last_error_msg"] = time.time()
-                        send_telegram("Pepebot: Kan saldo niet lezen (10003). Fix: bybit.eu API Read + Spot Trade + Wallet AAN, IP UIT.")
+                        send_telegram("Pepebot: Kan saldo niet lezen (10003).")
             log("Bot stopt: geen saldo")
             return
         log(f"Saldo USDT {acc_type}: {usdt} | PEPE: {pepe_qty}")
@@ -305,7 +305,7 @@ def check_bot():
             else:
                 need_start = False
         if need_start:
-            send_telegram(f"Bot gestart: UT Bot 4 / 14 + Supertrend 10 / 3 - SPOT via bybit.eu Saldo: {usdt} USDT Trailing: {trailing}")
+            send_telegram(f"Bot gestart: UT Bot 4 / 14 + Supertrend 10 / 3 - SPOT via 【entity-bybit¦canonical_name=BYBIT】.eu Saldo: {usdt} USDT Trailing: {trailing}")
         save_state()
         log("=== Bot check klaar ===")
     finally:
