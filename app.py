@@ -130,7 +130,7 @@ state = {"running": False, "last": "gestart", "balance": "?"}
 
 def bot_loop():
     time.sleep(5)
-    send_tg("🤖 Pepebot-3 gestart - origineel + UTBOT")
+    send_tg("🤖 Pepebot-3 gestart - werkend + UTBOT 4 / 14")
     in_position = False
     while True:
         try:
