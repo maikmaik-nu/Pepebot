@@ -1,112 +1,186 @@
-import os, time, hmac, hashlib, json, requests
+import os, time, hmac, hashlib, requests
 from flask import Flask
 
 app = Flask(__name__)
 
-# --- FIX: lees key/secret op ELKE naam die in Render kan staan ---
-def find_env(*names, contains=""):
-    for n in names:
-        v = os.environ.get(n, "").strip().strip('"').strip("'")
-        if v:
-            return v
-    for k, v in os.environ.items():
-        ku = k.upper()
-        if "BYBIT" in ku or "BYBI" in ku or "API" in ku:
-            if contains in ku and v.strip():
-                return v.strip().strip('"').strip("'")
-    return ""
+def clean(v):
+    if not v:
+        return ""
+    return "".join(str(v).split()).strip().strip('"').strip("'")
 
-API_KEY = find_env("BYBIT_API_KEY", "BYBIT_KEY", "BYBI_API_KEY", "BYBI_KEY", "API_KEY", contains="KEY")
-API_SECRET = find_env("BYBIT_API_SECRET", "BYBIT_SECRET", "BYBI_API_SECRET", "BYBI_SECRET", "API_SECRET", contains="SECRET")
+API_KEY = clean(os.getenv("BYBIT_API_KEY", ""))
+API_SECRET = clean(os.getenv("BYBIT_API_SECRET", ""))
+BASE = "https://api.bybit.eu"
+SYMBOL = "PEPEUSDT"
+CATEGORY = "spot"
+INTERVAL = "15"
+QTY_USDT = 20.0
+FACTOR = 4.0
+ATR_PERIOD = 14
 
 print(f"KEY_START={API_KEY[:4]} KEY_LEN={len(API_KEY)} SECRET_LEN={len(API_SECRET)}", flush=True)
 
-SYMBOL = "PEPEUSDT"
-UTBOT_FACTOR = 4.0
-UTBOT_ATR = 14
-DOMAINS = ["https://api.bybit.eu", "https://api.bybit.com"]
-WORKING = {"base": DOMAINS[0]}
-
-def safe_json(r):
-    try:
-        return r.json()
-    except Exception:
-        return {"retCode": -1, "result": {}}
-
-def headers(q=""):
-    ts = str(int(time.time()*1000))
+def sign_get(path, query):
+    ts = str(int(time.time() * 1000))
     recv = "5000"
-    sig = hmac.new(API_SECRET.encode(), (ts + API_KEY + recv + q).encode(), hashlib.sha256).hexdigest()
-    return {"X-BAPI-API-KEY": API_KEY, "X-BAPI-TIMESTAMP": ts, "X-BAPI-RECV-WINDOW": recv, "X-BAPI-SIGN": sig, "X-BAPI-SIGN-TYPE": "2", "Content-Type": "application/json"}
+    s = ts + API_KEY + recv + query
+    sig = hmac.new(API_SECRET.encode(), s.encode(), hashlib.sha256).hexdigest()
+    h = {
+        "X-BAPI-API-KEY": API_KEY,
+        "X-BAPI-TIMESTAMP": ts,
+        "X-BAPI-RECV-WINDOW": recv,
+        "X-BAPI-SIGN": sig,
+        "X-BAPI-SIGN-TYPE": "2",
+        "Content-Type": "application/json"
+    }
+    return h
 
-def p_get(path, params):
-    qs = "&".join(f"{k}={params[k]}" for k in sorted(params))
-    for base in [WORKING["base"]] + [d for d in DOMAINS if d != WORKING["base"]]:
-        r = requests.get(base + path + "?" + qs, headers=headers(qs), timeout=15)
-        j = safe_json(r)
-        print(f"TRY {base} -> {j.get('retCode')}", flush=True)
-        if j.get("retCode") == 0:
-            WORKING["base"] = base
-            return j
-    return {"retCode": -1, "result": {}}
+def sign_post(path, body_str):
+    ts = str(int(time.time() * 1000))
+    recv = "5000"
+    s = ts + API_KEY + recv + body_str
+    sig = hmac.new(API_SECRET.encode(), s.encode(), hashlib.sha256).hexdigest()
+    h = {
+        "X-BAPI-API-KEY": API_KEY,
+        "X-BAPI-TIMESTAMP": ts,
+        "X-BAPI-RECV-WINDOW": recv,
+        "X-BAPI-SIGN": sig,
+        "X-BAPI-SIGN-TYPE": "2",
+        "Content-Type": "application/json"
+    }
+    return h
 
-def p_post(path, body):
-    payload = json.dumps(body, separators=(",", ":"))
-    r = requests.post(WORKING["base"] + path, headers=headers(payload), data=payload, timeout=15)
-    return safe_json(r)
+def get_balance_usdt():
+    q = "accountType=UNIFIED&coin=USDT"
+    try:
+        r = requests.get(BASE + "/v5/account/wallet-balance?" + q, headers=sign_get("/v5/account/wallet-balance", q), timeout=10)
+        print(f"BAL_RAW {r.status_code} {r.text[:300]}", flush=True)
+        j = r.json()
+        if j.get("retCode") != 0:
+            return 0.0
+        for coin in j["result"]["list"][0]["coin"]:
+            if coin["coin"] == "USDT":
+                return float(coin["walletBalance"])
+        return 0.0
+    except Exception as e:
+        print(f"BAL_ERR {e}", flush=True)
+        return 0.0
 
-def get_balance(coin):
-    for acct in ["UNIFIED", "SPOT"]:
-        d = p_get("/v5/account/wallet-balance", {"accountType": acct, "coin": coin})
-        print(f"BAL {acct} {coin} ->", d, flush=True)
-        try:
-            v = float(d["result"]["list"][0]["coin"][0]["walletBalance"])
-            if v > 0:
-                return v
-        except Exception:
-            pass
-    return 0.0
+def get_balance_pepe():
+    q = "accountType=UNIFIED&coin=PEPE"
+    try:
+        r = requests.get(BASE + "/v5/account/wallet-balance?" + q, headers=sign_get("/v5/account/wallet-balance", q), timeout=10)
+        j = r.json()
+        if j.get("retCode") != 0:
+            return 0.0
+        for coin in j["result"]["list"][0]["coin"]:
+            if coin["coin"] == "PEPE":
+                return float(coin["walletBalance"])
+        return 0.0
+    except:
+        return 0.0
 
 def get_klines():
     try:
-        r = requests.get("https://api.bybit.com/v5/market/kline", params={"category": "spot", "symbol": SYMBOL, "interval": "15", "limit": "100"}, timeout=15).json()
-        lst = r.get("result", {}).get("list", []) or []
-        return [float(x[4]) for x in lst][::-1] if lst else []
-    except Exception:
+        r = requests.get("https://api.bybit.com/v5/market/kline", params={"category": CATEGORY, "symbol": SYMBOL, "interval": INTERVAL, "limit": 100}, timeout=10)
+        lst = r.json()["result"]["list"]
+        lst = lst[::-1]
+        return lst
+    except Exception as e:
+        print(f"KLINE_ERR {e}", flush=True)
         return []
 
-def utbot(closes):
-    if len(closes) < 30:
-        return "HOLD"
-    trs = [abs(closes[i]-closes[i-1]) for i in range(1, len(closes))]
-    atr = sum(trs[-UTBOT_ATR:]) / UTBOT_ATR
-    if closes[-1] > closes[-2] + UTBOT_FACTOR * atr * 0.1:
-        return "BUY"
-    if closes[-1] < closes[-2] - UTBOT_FACTOR * atr * 0.1:
-        return "SELL"
-    return "HOLD"
+def utbot_signal(klines):
+    if len(klines) < ATR_PERIOD + 5:
+        return "HOLD", 0.0, 0.0
+    closes = [float(k[4]) for k in klines]
+    highs = [float(k[2]) for k in klines]
+    lows = [float(k[3]) for k in klines]
+    trs = []
+    for i in range(1, len(closes)):
+        tr = max(highs[i] - lows[i], abs(highs[i] - closes[i-1]), abs(lows[i] - closes[i-1]))
+        trs.append(tr)
+    atr = sum(trs[-ATR_PERIOD:]) / ATR_PERIOD
+    # UTBOT trailing
+    trailing = None
+    direction = 1
+    for i in range(len(closes)):
+        if i < ATR_PERIOD:
+            continue
+        src = closes[i]
+        atr_i = sum(trs[max(0, i-ATR_PERIOD):i]) / ATR_PERIOD if i >= ATR_PERIOD else atr
+        upper = src + FACTOR * atr_i
+        lower = src - FACTOR * atr_i
+        if trailing is None:
+            trailing = lower
+            direction = 1
+        if direction == 1:
+            trailing = max(trailing, lower)
+            if src < trailing:
+                direction = -1
+                trailing = upper
+        else:
+            trailing = min(trailing, upper)
+            if src > trailing:
+                direction = 1
+                trailing = lower
+    price = closes[-1]
+    prev_close = closes[-2]
+    # Signaal: crossover met trailing
+    if direction == 1 and prev_close <= trailing:
+        return "BUY", price, atr
+    if direction == -1 and prev_close >= trailing:
+        return "SELL", price, atr
+    if direction == 1:
+        return "BUY_HOLD", price, atr
+    return "SELL_HOLD", price, atr
+
+def place_order(side, qty_usdt, price):
+    qty = int(qty_usdt / price)
+    if qty <= 0:
+        print("QTY_TOO_SMALL", flush=True)
+        return None
+    import json
+    body = {
+        "category": CATEGORY,
+        "symbol": SYMBOL,
+        "side": side,
+        "orderType": "Market",
+        "qty": str(qty),
+        "timeInForce": "GTC"
+    }
+    body_str = json.dumps(body)
+    try:
+        r = requests.post(BASE + "/v5/order/create", headers=sign_post("/v5/order/create", body_str), data=body_str, timeout=10)
+        print(f"ORDER {side} {qty} -> {r.status_code} {r.text[:400]}", flush=True)
+        return r.json()
+    except Exception as e:
+        print(f"ORDER_ERR {e}", flush=True)
+        return None
 
 @app.route("/")
 def home():
-    bal = get_balance("USDT")
-    closes = get_klines()
-    if not closes:
-        return f"OK BAL={bal} NO KLINES"
-    sig = utbot(closes)
-    price = closes[-1]
-    print(f"BAL={bal} SIG={sig} PRICE={price} BASE={WORKING['base']}", flush=True)
-    if bal > 5 and sig == "BUY":
-        qty = str(int((bal*0.99)/price))
-        res = p_post("/v5/order/create", {"category": "spot", "symbol": SYMBOL, "side": "Buy", "orderType": "Market", "qty": qty})
-        print("BUY ->", res, flush=True)
-        return f"BUY {qty} BAL={bal}"
-    if sig == "SELL":
-        pepe = get_balance("PEPE")
-        if pepe > 0:
-            res = p_post("/v5/order/create", {"category": "spot", "symbol": SYMBOL, "side": "Sell", "orderType": "Market", "qty": str(int(pepe))})
-            print("SELL ->", res, flush=True)
-            return f"SELL {pepe}"
-    return f"OK BAL={bal} SIG={sig} PRICE={price}"
+    bal_usdt = get_balance_usdt()
+    bal_pepe = get_balance_pepe()
+    kl = get_klines()
+    sig, price, atr = utbot_signal(kl)
+    print(f"BAL_USDT={bal_usdt} BAL_PEPE={bal_pepe} SIG={sig} PRICE={price} ATR={atr}", flush=True)
+    if bal_usdt == 0.0 and bal_pepe == 0.0:
+        return f"BAL=0 SIG=HOLD PRICE={price} - geen saldo gevonden"
+    # Alleen traden als er saldo is
+    if sig == "BUY" and bal_usdt >= QTY_USDT and bal_pepe == 0.0:
+        place_order("Buy", QTY_USDT, price)
+        return f"BUY geplaatst BAL={bal_usdt} PRICE={price}"
+    if sig == "SELL" and bal_pepe > 0:
+        # verkoop alles in USDT waarde
+        qty_usdt = bal_pepe * price
+        place_order("Sell", qty_usdt, price)
+        return f"SELL geplaatst BAL_PEPE={bal_pepe} PRICE={price}"
+    return f"BAL_USDT={bal_usdt} BAL_PEPE={bal_pepe} SIG={sig} PRICE={price} ATR={atr} - geen actie"
+
+@app.route("/health")
+def health():
+    return "ok"
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=10000)
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 10000)))
