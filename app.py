@@ -5,16 +5,22 @@ import requests
 
 app = Flask(__name__)
 
+def clean(v):
+    return "".join(str(v or "").split()).strip().strip('"').strip("'")
+
+API_KEY = clean(os.getenv("BYBIT_API_KEY", ""))
+API_SECRET = clean(os.getenv("BYBIT_API_SECRET", ""))
+print(f"KEY_LEN={len(API_KEY)} SECRET_LEN={len(API_SECRET)}", flush=True)
+
 DOMAIN = "by" + "bit"
 KL_URL = "https://api." + "by" + "bit.com/v5/market/kline"
-
 SYMBOL = "PEPEUSDT"
 QTY_USDT = 20.0
 FACTOR = 4.0
 ATR_PERIOD = 14
 
 def make_session(tld):
-    return HTTP(testnet=False, api_key=os.getenv("BYBIT_API_KEY"), api_secret=os.getenv("BYBIT_API_SECRET"), domain=DOMAIN, tld=tld)
+    return HTTP(testnet=False, api_key=API_KEY, api_secret=API_SECRET, domain=DOMAIN, tld=tld)
 
 def find_working():
     for tld in ["eu", "com"]:
@@ -25,7 +31,7 @@ def find_working():
                 if r.get("retCode") == 0:
                     print(f"WORKING tld={tld} acct={acct}", flush=True)
                     return s, tld, acct
-                print(f"TRY tld={tld} acct={acct} -> {r.get('retCode')} {r.get('retMsg')}", flush=True)
+                print(f"TRY tld={tld} acct={acct} -> {r.get('retCode')}", flush=True)
             except Exception as e:
                 print(f"TRY tld={tld} acct={acct} ERR {e}", flush=True)
     return None, None, None
@@ -83,7 +89,7 @@ def home():
     try:
         session, tld, acct = find_working()
         if not session:
-            return "ERR geen werkende combinatie - check key in Render"
+            return "ERR geen werkende combinatie"
         bal_usdt = get_bal(session, acct, "USDT")
         bal_pepe = get_bal(session, acct, "PEPE")
         kl = get_klines()
