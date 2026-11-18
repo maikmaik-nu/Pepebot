@@ -26,17 +26,9 @@ def send_tg(msg):
     except Exception as e:
         print("TG ERR", e, flush=True)
 
-def get_server_time():
-    try:
-        with urllib.request.urlopen(BASE + "/v5/market/time", timeout=10) as r:
-            d = json.loads(r.read().decode())
-            return int(d["result"]["timeSecond"]) * 1000
-    except Exception:
-        return int(time.time() * 1000)
-
 def _signed_get(path, params):
-    ts = str(get_server_time())
-    recv = "50000"
+    ts = str(int(time.time() * 1000))
+    recv = "5000"
     qs = urllib.parse.urlencode(params)
     to_sign = ts + API_KEY + recv + qs
     sign = hmac.new(API_SECRET.encode(), to_sign.encode(), hashlib.sha256).hexdigest()
@@ -53,8 +45,8 @@ def _signed_get(path, params):
         return json.loads(r.read().decode())
 
 def _signed_post(path, params):
-    ts = str(get_server_time())
-    recv = "50000"
+    ts = str(int(time.time() * 1000))
+    recv = "5000"
     body = json.dumps(params)
     to_sign = ts + API_KEY + recv + body
     sign = hmac.new(API_SECRET.encode(), to_sign.encode(), hashlib.sha256).hexdigest()
@@ -70,28 +62,14 @@ def _signed_post(path, params):
         return json.loads(r.read().decode())
 
 def get_coin_balance(coin):
-    # 1. V5 wallet-balance - UNIFIED / SPOT / FUND
-    for at in ["SPOT", "UNIFIED", "FUND"]:
-        try:
-            r = _signed_get("/v5/account/wallet-balance", {"accountType": at, "coin": coin})
-            print(f"BAL {at} {coin} -> {r}", flush=True)
-            if r.get("retCode") == 0:
-                for w in r.get("result", {}).get("list", []):
-                    for c in w.get("coin", []):
-                        if c.get("coin") == coin:
-                            return Decimal(str(c.get("walletBalance", "0")))
-                return Decimal("0")
-        except Exception as e:
-            print(f"BAL {at} ERR {e}", flush=True)
-    # 2. Fallback: Spot asset endpoint - werkt ook als wallet-balance geen Spot permissie heeft
-    try:
-        r = _signed_get("/v5/asset/transfer/query-account-coin-balance", {"accountType": "SPOT", "coin": coin})
-        print(f"BAL-FALLBACK SPOT {coin} -> {r}", flush=True)
-        if r.get("retCode") == 0:
-            bal = r.get("result", {}).get("balance", {}).get("walletBalance", "0")
-            return Decimal(str(bal))
-    except Exception as e:
-        print(f"BAL-FALLBACK ERR {e}", flush=True)
+    r = _signed_get("/v5/account/wallet-balance", {"accountType": "UNIFIED", "coin": coin})
+    print(f"BAL UNIFIED {coin} -> {r}", flush=True)
+    if r.get("retCode") == 0:
+        for w in r.get("result", {}).get("list", []):
+            for c in w.get("coin", []):
+                if c.get("coin") == coin:
+                    return Decimal(str(c.get("walletBalance", "0")))
+        return Decimal("0")
     return None
 
 def get_balance():
@@ -122,7 +100,7 @@ state = {"running": False, "last": "gestart", "balance": "?"}
 
 def bot_loop():
     time.sleep(5)
-    send_tg("🤖 Pepebot-3 gestart - EU only + UTBOT 4 / 14 - server-time fix")
+    send_tg("🤖 Pepebot-3 gestart - origineel + UTBOT 4 / 14")
     in_position = False
     while True:
         try:
@@ -168,7 +146,7 @@ def home():
 @app.route("/test-key")
 def test_key():
     try:
-        r = _signed_get("/v5/account/wallet-balance", {"accountType": "SPOT", "coin": "USDT"})
+        r = _signed_get("/v5/account/wallet-balance", {"accountType": "UNIFIED", "coin": "USDT"})
         return jsonify({"key_start": API_KEY[:4] if API_KEY else "LEEG", "bybit_raw": r})
     except Exception as e:
         return jsonify({"key_start": API_KEY[:4] if API_KEY else "LEEG", "error": str(e)})
