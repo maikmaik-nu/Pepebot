@@ -6,7 +6,7 @@ from flask import Flask, request, jsonify
 app = Flask(__name__)
 
 BYBIT_API_KEY = os.environ.get("BYBIT_API_KEY", "").strip()
-BYBIT_API_SECRET = os.environ.get("BYBIT_API_SECRET", "").strip()
+【entity-BYBIT_API_SECRET¦canonical_name=Bybit】 = os.environ.get("【entity-BYBIT_API_SECRET¦canonical_name=Bybit】", "").strip()
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 
@@ -15,6 +15,8 @@ CATEGORY = "spot"
 INTERVAL = "15"
 ATR_PERIOD = 14
 UT_FACTOR = 4.0
+ST_ATR = 10
+ST_MULT = 3.0
 BASE_URL = "https://api.bybit.eu"
 STATE_FILE = "state.json"
 
@@ -58,13 +60,12 @@ def save_state():
 def _sign(params_str, timestamp):
     recv_window = "5000"
     payload = timestamp + BYBIT_API_KEY + recv_window + params_str
-    sign = hmac.new(BYBIT_API_SECRET.encode("utf-8"), payload.encode("utf-8"), hashlib.sha256).hexdigest()
+    sign = hmac.new(【entity-BYBIT_API_SECRET¦canonical_name=Bybit】.encode("utf-8"), payload.encode("utf-8"), hashlib.sha256).hexdigest()
     return sign, recv_window
 
 def _headers(sign, recv_window, timestamp):
     return {"X-BAPI-API-KEY": BYBIT_API_KEY, "X-BAPI-SIGN": sign, "X-BAPI-SIGN-TYPE": "2", "X-BAPI-TIMESTAMP": timestamp, "X-BAPI-RECV-WINDOW": recv_window, "Content-Type": "application/json"}
 
-# --- UIT VORIGE: Bybit verbinding die het deed ---
 def bybit_get(path, params):
     timestamp = str(int(time.time() * 1000))
     query = urllib.parse.urlencode(sorted(params.items()))
@@ -104,7 +105,6 @@ def get_balances():
     total_pepe = 0.0
     seen_ok = False
     last_error = "ERROR"
-    # OPLOSSING UIT VORIGE: alleen accountType, GEEN coin param
     for account_type in ["SPOT", "UNIFIED"]:
         try:
             data = bybit_get("/v5/account/wallet-balance", {"accountType": account_type})
@@ -164,20 +164,38 @@ def get_qty_step():
         log("Instrument error: " + str(e))
     return 1.0, 1.0
 
-def calc_atr(klines):
-    if len(klines) < ATR_PERIOD + 1:
-        return 0
+def calc_atr_list(klines, period):
     trs = []
     for i in range(1, len(klines)):
         high = float(klines[i][2]); low = float(klines[i][3]); prev_close = float(klines[i-1][4])
         trs.append(max(high - low, abs(high - prev_close), abs(low - prev_close)))
-    return sum(trs[-ATR_PERIOD:]) / ATR_PERIOD
+    if len(trs) < period:
+        return 0
+    return sum(trs[-period:]) / period
 
 def round_qty(qty, qty_step):
     step = Decimal(str(qty_step))
     q = Decimal(str(qty))
     rounded = (q / step).to_integral_value(rounding=ROUND_DOWN) * step
     return float(rounded)
+
+def supertrend_dir(klines):
+    if len(klines) < 20:
+        return "down"
+    atr = calc_atr_list(klines, ST_ATR)
+    if atr == 0:
+        return "down"
+    last = klines[-1]
+    high = float(last[2]); low = float(last[3]); close = float(last[4])
+    hl2 = (high + low) / 2
+    upper = hl2 + ST_MULT * atr
+    lower = hl2 - ST_MULT * atr
+    if close > upper:
+        return "up"
+    if close < lower:
+        return "down"
+    prev_close = float(klines[-2][4])
+    return "up" if prev_close > close else "down"
 
 def place_market_order(side, qty):
     try:
@@ -228,10 +246,11 @@ def check_bot():
         price = get_price()
         if price == 0:
             price = float(klines[-1][4])
-        atr = calc_atr(klines)
+        atr = calc_atr_list(klines, ATR_PERIOD)
         last = klines[-1]; prev = klines[-2]
         last_close = float(last[4]); prev_close = float(prev[4])
-        log(f"Prijs: {price} | ATR: {atr} | Last close: {last_close} | Prev close: {prev_close}")
+        st = supertrend_dir(klines)
+        log(f"Prijs: {price} | ATR: {atr} | Last close: {last_close} | Prev close: {prev_close} | Supertrend: {st}")
         with STATE_LOCK:
             in_pos = STATE["in_position"]
             prev_trailing = STATE.get("trailing", 0.0)
@@ -240,7 +259,6 @@ def check_bot():
                 STATE["in_position"] = True; STATE["qty"] = pepe_qty; in_pos = True
             if pepe_qty == 0 and in_pos:
                 STATE["in_position"] = False; STATE["qty"] = 0; in_pos = False
-        # --- UT BOT 4 / 14 ---
         if prev_trailing == 0.0:
             prev_trailing = last_close - UT_FACTOR * atr if last_close > prev_close else last_close + UT_FACTOR * atr
             stored_prev_close = prev_close
@@ -250,7 +268,7 @@ def check_bot():
             trailing = min(prev_trailing, last_close + UT_FACTOR * atr)
         buy_signal = (not in_pos) and (stored_prev_close <= prev_trailing) and (last_close > trailing)
         sell_signal = (in_pos) and (stored_prev_close >= prev_trailing) and (last_close < trailing)
-        log(f"UT Bot: prev_trailing={prev_trailing} trailing={trailing} buy={buy_signal} sell={sell_signal} in_pos={in_pos}")
+        log(f"UT Bot: prev_trailing={prev_trailing} trailing={trailing} buy={buy_signal} sell={sell_signal} in_pos={in_pos} ST={st}")
         with STATE_LOCK:
             STATE["trailing"] = trailing
             STATE["prev_close"] = last_close
@@ -280,14 +298,14 @@ def check_bot():
                 send_telegram(f"VERKOCHT PEPEUSDT - UT Bot SELL - Prijs: {price} Saldo: {usdt} USDT")
                 log("VERKOOP uitgevoerd - UT Bot")
             return
-        log(f"Geen UT Bot signaal. In positie: {in_pos}")
+        log(f"Geen UT Bot signaal. In positie: {in_pos} ST: {st}")
         with STATE_LOCK:
             if time.time() - STATE["last_start_msg"] > 3600:
                 STATE["last_start_msg"] = time.time(); need_start = True
             else:
                 need_start = False
         if need_start:
-            send_telegram(f"Bot gestart: UT Bot 4 / 14 - SPOT via bybit.eu Saldo: {usdt} USDT Trailing: {trailing}")
+            send_telegram(f"Bot gestart: UT Bot 4 / 14 + Supertrend 10 / 3 - SPOT via bybit.eu Saldo: {usdt} USDT Trailing: {trailing}")
         save_state()
         log("=== Bot check klaar ===")
     finally:
