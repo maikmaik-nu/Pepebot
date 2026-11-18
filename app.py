@@ -5,7 +5,7 @@ app = Flask(__name__)
 
 API_KEY = os.environ.get("BYBIT_API_KEY", "").strip()
 API_SECRET = os.environ.get("BYBIT_API_SECRET", "").strip()
-BASE = "https://api.bybit.eu"  # EU ONLY, geen .com
+BASE = "https://api.bybit.eu"
 SYMBOL = "PEPEUSDT"
 UTBOT_FACTOR = 4.0
 UTBOT_ATR = 14
@@ -38,18 +38,23 @@ def get_balance():
         return 0.0
 
 def get_klines():
-    r = requests.get(BASE + "/v5/market/kline", params={"category": "spot", "symbol": SYMBOL, "interval": INTERVAL, "limit": "100"}, timeout=15).json()
-    closes = [float(x[4]) for x in r["result"]["list"]][::-1]
-    return closes
+    try:
+        r = requests.get(BASE + "/v5/market/kline", params={"category": "spot", "symbol": SYMBOL, "interval": INTERVAL, "limit": "100"}, timeout=15).json()
+        lst = r.get("result", {}).get("list", []) or []
+        if not lst:
+            print("KLINE LEEG ->", r, flush=True)
+            return []
+        closes = [float(x[4]) for x in lst][::-1]
+        return closes
+    except Exception as e:
+        print("KLINE ERR", e, flush=True)
+        return []
 
 def utbot_signal(closes):
-    # UTBOT 4 / 14 - simpele ATR trailing versie
-    import statistics
     if len(closes) < 30:
         return "HOLD"
     trs = [abs(closes[i]-closes[i-1]) for i in range(1, len(closes))]
     atr = sum(trs[-UTBOT_ATR:]) / UTBOT_ATR
-    # trailing stop: prijs boven vorig slot + factor*atr = BUY, eronder = SELL
     if closes[-1] > closes[-2] + UTBOT_FACTOR * atr * 0.1:
         return "BUY"
     if closes[-1] < closes[-2] - UTBOT_FACTOR * atr * 0.1:
@@ -60,17 +65,17 @@ def utbot_signal(closes):
 def home():
     bal = get_balance()
     closes = get_klines()
+    if not closes:
+        return f"OK BAL={bal} NO KLINES"
     sig = utbot_signal(closes)
     print(f"BAL={bal} SIG={sig} PRICE={closes[-1]}", flush=True)
     if bal > 5 and sig == "BUY":
-        # compound: volledige USDT balans gebruiken
         price = closes[-1]
         qty = str(int((bal * 0.99) / price))
         res = auth_post("/v5/order/create", {"category": "spot", "symbol": SYMBOL, "side": "Buy", "orderType": "Market", "qty": qty})
         print("BUY ->", res, flush=True)
         return f"BUY {qty} BAL={bal}"
     if sig == "SELL":
-        # verkoop alle PEPE
         b = auth_get("/v5/account/wallet-balance", {"accountType": "SPOT", "coin": "PEPE"})
         try:
             pepe = float(b["result"]["list"][0]["coin"][0]["walletBalance"])
