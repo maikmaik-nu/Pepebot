@@ -8,7 +8,7 @@ SYMBOL = "PEPEUSDT"
 INTERVAL = "15"
 UTBOT_FACTOR = 4.0
 ATR_PERIOD = 14
-BASE = "https://api.bybit.eu"
+BASE = "https://api.bybit.com"
 
 API_KEY = os.getenv("BYBIT_API_KEY", "").strip()
 API_SECRET = os.getenv("BYBIT_API_SECRET", "").strip()
@@ -78,7 +78,6 @@ def get_klines():
         d = json.loads(r.read().decode())
     return d["result"]["list"][::-1]
 
-# --- ALLEEN DIT IS NIEUW: UTBOT ---
 def calc_utbot(klines):
     closes = [float(k[4]) for k in klines]
     highs = [float(k[2]) for k in klines]
