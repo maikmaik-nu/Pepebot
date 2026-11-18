@@ -1,7 +1,5 @@
-import os
-from pybit.unified_trading import HTTP
+import os, time, hmac, hashlib, requests, json
 from flask import Flask
-import requests
 
 app = Flask(__name__)
 
@@ -10,41 +8,35 @@ def clean(v):
 
 API_KEY = clean(os.getenv("BYBIT_API_KEY", ""))
 API_SECRET = clean(os.getenv("BYBIT_API_SECRET", ""))
-print(f"KEY_LEN={len(API_KEY)} SECRET_LEN={len(API_SECRET)}", flush=True)
-
-DOMAIN = "by" + "bit"
-KL_URL = "https://api." + "by" + "bit.com/v5/market/kline"
+BASE = "https://api.bybit.eu"
 SYMBOL = "PEPEUSDT"
 QTY_USDT = 20.0
 FACTOR = 4.0
 ATR_PERIOD = 14
 
-def make_session(tld):
-    return HTTP(testnet=False, api_key=API_KEY, api_secret=API_SECRET, domain=DOMAIN, tld=tld)
+print(f"KEY_LEN={len(API_KEY)} SECRET_LEN={len(API_SECRET)}", flush=True)
 
-def find_working():
-    for tld in ["eu", "com"]:
-        for acct in ["SPOT", "UNIFIED"]:
-            try:
-                s = make_session(tld)
-                r = s.get_wallet_balance(accountType=acct, coin="USDT")
-                if r.get("retCode") == 0:
-                    print(f"WORKING tld={tld} acct={acct}", flush=True)
-                    return s, tld, acct
-                print(f"TRY tld={tld} acct={acct} -> {r.get('retCode')}", flush=True)
-            except Exception as e:
-                print(f"TRY tld={tld} acct={acct} ERR {e}", flush=True)
-    return None, None, None
+def headers_for(q):
+    ts = str(int(time.time() * 1000))
+    recv = "5000"
+    s = ts + API_KEY + recv + q
+    sig = hmac.new(API_SECRET.encode(), s.encode(), hashlib.sha256).hexdigest()
+    return {"X-BAPI-API-KEY": API_KEY, "X-BAPI-TIMESTAMP": ts, "X-BAPI-RECV-WINDOW": recv, "X-BAPI-SIGN": sig, "X-BAPI-SIGN-TYPE": "2", "Content-Type": "application/json"}
 
-def get_bal(session, acct, coin):
-    r = session.get_wallet_balance(accountType=acct, coin=coin)
-    for c in r["result"]["list"][0]["coin"]:
+def get_bal(coin):
+    q = f"accountType=SPOT&coin={coin}"
+    r = requests.get(BASE + "/v5/account/wallet-balance?" + q, headers=headers_for(q), timeout=10)
+    print(f"BAL_RAW {r.status_code} {r.text[:200]}", flush=True)
+    j = r.json()
+    if j.get("retCode") != 0:
+        return 0.0
+    for c in j["result"]["list"][0]["coin"]:
         if c["coin"] == coin:
             return float(c["walletBalance"])
     return 0.0
 
 def get_klines():
-    r = requests.get(KL_URL, params={"category": "spot", "symbol": SYMBOL, "interval": "15", "limit": 100}, timeout=10)
+    r = requests.get("https://api.bybit.com/v5/market/kline", params={"category": "spot", "symbol": SYMBOL, "interval": "15", "limit": 100}, timeout=10)
     return r.json()["result"]["list"][::-1]
 
 def utbot(kl):
@@ -84,25 +76,34 @@ def utbot(kl):
         return "SELL", price, atr
     return ("BUY_HOLD" if direction == 1 else "SELL_HOLD"), price, atr
 
+def place_order(side, qty_usdt, price):
+    qty = int(qty_usdt / price)
+    body = {"category": "spot", "symbol": SYMBOL, "side": side, "orderType": "Market", "qty": str(qty), "timeInForce": "GTC"}
+    body_str = json.dumps(body)
+    ts = str(int(time.time() * 1000))
+    recv = "5000"
+    s = ts + API_KEY + recv + body_str
+    sig = hmac.new(API_SECRET.encode(), s.encode(), hashlib.sha256).hexdigest()
+    h = {"X-BAPI-API-KEY": API_KEY, "X-BAPI-TIMESTAMP": ts, "X-BAPI-RECV-WINDOW": recv, "X-BAPI-SIGN": sig, "X-BAPI-SIGN-TYPE": "2", "Content-Type": "application/json"}
+    r = requests.post(BASE + "/v5/order/create", headers=h, data=body_str, timeout=10)
+    print(f"ORDER {side} {qty} -> {r.status_code} {r.text[:300]}", flush=True)
+    return r.json()
+
 @app.route("/")
 def home():
     try:
-        session, tld, acct = find_working()
-        if not session:
-            return "ERR geen werkende combinatie"
-        bal_usdt = get_bal(session, acct, "USDT")
-        bal_pepe = get_bal(session, acct, "PEPE")
+        bal_usdt = get_bal("USDT")
+        bal_pepe = get_bal("PEPE")
         kl = get_klines()
         sig, price, atr = utbot(kl)
-        print(f"BAL_USDT={bal_usdt} BAL_PEPE={bal_pepe} SIG={sig} PRICE={price} ATR={atr} TLD={tld} ACCT={acct}", flush=True)
+        print(f"BAL_USDT={bal_usdt} BAL_PEPE={bal_pepe} SIG={sig} PRICE={price} ATR={atr}", flush=True)
         if sig == "BUY" and bal_usdt >= QTY_USDT and bal_pepe == 0:
-            qty = int(QTY_USDT / price)
-            session.place_order(category="spot", symbol=SYMBOL, side="Buy", orderType="Market", qty=str(qty))
+            place_order("Buy", QTY_USDT, price)
             return f"BUY geplaatst BAL={bal_usdt} PRICE={price}"
         if sig == "SELL" and bal_pepe > 0:
-            session.place_order(category="spot", symbol=SYMBOL, side="Sell", orderType="Market", qty=str(int(bal_pepe)))
+            place_order("Sell", bal_pepe * price, price)
             return f"SELL geplaatst BAL_PEPE={bal_pepe} PRICE={price}"
-        return f"BAL_USDT={bal_usdt} BAL_PEPE={bal_pepe} SIG={sig} PRICE={price} ATR={atr} TLD={tld} ACCT={acct}"
+        return f"BAL_USDT={bal_usdt} BAL_PEPE={bal_pepe} SIG={sig} PRICE={price} ATR={atr}"
     except Exception as e:
         print(f"ERR {e}", flush=True)
         return f"ERR {e}"
