@@ -62,8 +62,8 @@ def _signed_post(path, params):
         return json.loads(r.read().decode())
 
 def get_coin_balance(coin):
-    r = _signed_get("/v5/account/wallet-balance", {"accountType": "UNIFIED", "coin": coin})
-    print(f"BAL UNIFIED {coin} -> {r}", flush=True)
+    r = _signed_get("/v5/account/wallet-balance", {"accountType": "SPOT", "coin": coin})
+    print(f"BAL SPOT {coin} -> {r}", flush=True)
     if r.get("retCode") == 0:
         for w in r.get("result", {}).get("list", []):
             for c in w.get("coin", []):
@@ -100,7 +100,7 @@ state = {"running": False, "last": "gestart", "balance": "?"}
 
 def bot_loop():
     time.sleep(5)
-    send_tg("🤖 Pepebot-3 gestart - origineel + UTBOT 4 / 14")
+    send_tg("🤖 Pepebot-3 gestart - SPOT + UTBOT 4 / 14")
     in_position = False
     while True:
         try:
@@ -140,12 +140,12 @@ def bot_loop():
 
 @app.route("/")
 def home():
-    return jsonify({"status": "Pepebot-3 live", "state": state, "key_start": API_KEY[:4] if API_KEY else "LEEG"})
+    return jsonify({"status": "Pepebot-3 live SPOT", "state": state, "key_start": API_KEY[:4] if API_KEY else "LEEG"})
 
 @app.route("/test-key")
 def test_key():
     try:
-        r = _signed_get("/v5/account/wallet-balance", {"accountType": "UNIFIED", "coin": "USDT"})
+        r = _signed_get("/v5/account/wallet-balance", {"accountType": "SPOT", "coin": "USDT"})
         return jsonify({"key_start": API_KEY[:4] if API_KEY else "LEEG", "bybit_raw": r})
     except Exception as e:
         return jsonify({"key_start": API_KEY[:4] if API_KEY else "LEEG", "error": str(e)})
