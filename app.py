@@ -3,7 +3,7 @@ from flask import Flask
 
 app = Flask(__name__)
 
-API_KEY = os.environ.get("BYBIT_API_KEY", "").strip()
+API_KEY = os.environ.get("【entity-BYBIT_API_KEY¦canonical_name=Bybit】", "").strip()
 API_SECRET = os.environ.get("BYBIT_API_SECRET", "").strip()
 PRIVATE = "https://api.bybit.eu"
 PUBLIC = "https://api.bybit.com"
@@ -16,13 +16,7 @@ def headers(query_or_body=""):
     recv = "5000"
     msg = ts + API_KEY + recv + query_or_body
     sig = hmac.new(API_SECRET.encode(), msg.encode(), hashlib.sha256).hexdigest()
-    return {
-        "X-BAPI-API-KEY": API_KEY,
-        "X-BAPI-TIMESTAMP": ts,
-        "X-BAPI-RECV-WINDOW": recv,
-        "X-BAPI-SIGN": sig,
-        "Content-Type": "application/json",
-    }
+    return {"X-BAPI-API-KEY": API_KEY, "X-BAPI-TIMESTAMP": ts, "X-BAPI-RECV-WINDOW": recv, "X-BAPI-SIGN": sig, "Content-Type": "application/json"}
 
 def p_get(path, params):
     qs = "&".join(f"{k}={params[k]}" for k in sorted(params))
@@ -35,20 +29,23 @@ def p_post(path, body):
     return r.json()
 
 def get_balance(coin):
-    d = p_get("/v5/account/wallet-balance", {"accountType": "SPOT", "coin": coin})
-    print(f"BAL {coin} ->", d, flush=True)
-    try:
-        return float(d["result"]["list"][0]["coin"][0]["walletBalance"])
-    except Exception:
-        return 0.0
+    # Eerst UNIFIED = Spot & Margin waar je geld staat, daarna SPOT als backup
+    for acct in ["UNIFIED", "SPOT"]:
+        d = p_get("/v5/account/wallet-balance", {"accountType": acct, "coin": coin})
+        print(f"BAL {acct} {coin} ->", d, flush=True)
+        try:
+            v = float(d["result"]["list"][0]["coin"][0]["walletBalance"])
+            if v > 0:
+                return v
+        except Exception:
+            pass
+    return 0.0
 
 def get_klines():
-    # Public data: hier staat PEPE wel, op EU kline is hij leeg
     try:
         r = requests.get(PUBLIC + "/v5/market/kline", params={"category": "spot", "symbol": SYMBOL, "interval": "15", "limit": "100"}, timeout=15).json()
         lst = r.get("result", {}).get("list", []) or []
         if not lst:
-            print("KLINE LEEG PUBLIC ->", r, flush=True)
             return []
         return [float(x[4]) for x in lst][::-1]
     except Exception as e:
@@ -60,7 +57,6 @@ def utbot(closes):
         return "HOLD"
     trs = [abs(closes[i] - closes[i-1]) for i in range(1, len(closes))]
     atr = sum(trs[-UTBOT_ATR:]) / UTBOT_ATR
-    # UTBOT 4 / 14
     if closes[-1] > closes[-2] + UTBOT_FACTOR * atr * 0.1:
         return "BUY"
     if closes[-1] < closes[-2] - UTBOT_FACTOR * atr * 0.1:
