@@ -5,8 +5,8 @@ from flask import Flask, request, jsonify
 
 app = Flask(__name__)
 
-【entity-BYBIT_API_KEY¦canonical_name=Bybit】 = os.environ.get("【entity-BYBIT_API_KEY¦canonical_name=Bybit】", "").strip()
-【entity-BYBIT_API_SECRET¦canonical_name=Bybit】 = os.environ.get("【entity-BYBIT_API_SECRET¦canonical_name=Bybit】", "").strip()
+BYBIT_API_KEY = os.environ.get("BYBIT_API_KEY", "").strip()
+BYBIT_API_SECRET = os.environ.get("BYBIT_API_SECRET", "").strip()
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 
@@ -25,7 +25,7 @@ _CHECK_RUNNING = False
 def log(msg):
     print(msg, flush=True)
 
-log(f"KEY LOADED: {len(【entity-BYBIT_API_KEY¦canonical_name=Bybit】)} chars, start={【entity-BYBIT_API_KEY¦canonical_name=Bybit】[:4] if 【entity-BYBIT_API_KEY¦canonical_name=Bybit】 else 'LEEG'}****")
+log(f"KEY LOADED: {len(BYBIT_API_KEY)} chars, start={BYBIT_API_KEY[:4] if BYBIT_API_KEY else 'LEEG'}****")
 
 def send_telegram(msg):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
@@ -56,12 +56,12 @@ def save_state():
 
 def _sign(params_str, timestamp):
     recv_window = "5000"
-    payload = timestamp + 【entity-BYBIT_API_KEY¦canonical_name=Bybit】 + recv_window + params_str
-    sign = hmac.new(【entity-BYBIT_API_SECRET¦canonical_name=Bybit】.encode("utf-8"), payload.encode("utf-8"), hashlib.sha256).hexdigest()
+    payload = timestamp + BYBIT_API_KEY + recv_window + params_str
+    sign = hmac.new(BYBIT_API_SECRET.encode("utf-8"), payload.encode("utf-8"), hashlib.sha256).hexdigest()
     return sign, recv_window
 
 def _headers(sign, recv_window, timestamp):
-    return {"X-BAPI-API-KEY": 【entity-BYBIT_API_KEY¦canonical_name=Bybit】, "X-BAPI-SIGN": sign, "X-BAPI-SIGN-TYPE": "2", "X-BAPI-TIMESTAMP": timestamp, "X-BAPI-RECV-WINDOW": recv_window, "Content-Type": "application/json"}
+    return {"X-BAPI-API-KEY": BYBIT_API_KEY, "X-BAPI-SIGN": sign, "X-BAPI-SIGN-TYPE": "2", "X-BAPI-TIMESTAMP": timestamp, "X-BAPI-RECV-WINDOW": recv_window, "Content-Type": "application/json"}
 
 def bybit_get(path, params):
     timestamp = str(int(time.time() * 1000))
