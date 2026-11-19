@@ -1,11 +1,11 @@
-import os, json, time, threading, hmac, hashlib, urllib.parse
-from decimal import Decimal, ROUND_DOWN
+import os, json, time, threading, hmac, hashlib
 import requests
+from decimal import Decimal, ROUND_DOWN
 from flask import Flask, request, jsonify
 
 app = Flask(__name__)
 
-BYBIT_API_KEY = os.environ.get("BYBIT_API_KEY", "").strip()
+【entity-BYBIT_API_KEY¦canonical_name=Bybit】 = os.environ.get("【entity-BYBIT_API_KEY¦canonical_name=Bybit】", "").strip()
 BYBIT_API_SECRET = os.environ.get("BYBIT_API_SECRET", "").strip()
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
@@ -17,7 +17,7 @@ ATR_PERIOD = 14
 BASE_URL = "https://api.bybit.eu"
 STATE_FILE = "state.json"
 
-STATE = {"in_position": False, "entry_price": 0.0, "qty": 0.0, "balance": 100.0, "last_check": 0, "last_start_msg": 0, "last_error_msg": 0}
+STATE = {"in_position": False, "entry_price": 0.0, "qty": 0.0, "balance": 100.0, "last_check": 0, "last_start_msg": 0}
 STATE_LOCK = threading.Lock()
 _LOOP_STARTED = False
 _CHECK_RUNNING = False
@@ -25,7 +25,7 @@ _CHECK_RUNNING = False
 def log(msg):
     print(msg, flush=True)
 
-log("KEY LOADED: " + str(len(BYBIT_API_KEY)) + " chars, start=" + (BYBIT_API_KEY[:4] if BYBIT_API_KEY else "LEEG") + "****")
+log("KEY LOADED: " + str(len(【entity-BYBIT_API_KEY¦canonical_name=Bybit】)) + " chars, start=" + (【entity-BYBIT_API_KEY¦canonical_name=Bybit】[:4] if 【entity-BYBIT_API_KEY¦canonical_name=Bybit】 else "LEEG") + "****")
 
 def send_telegram(msg):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
@@ -42,7 +42,7 @@ def load_state():
                 data = json.load(f)
                 with STATE_LOCK:
                     STATE.update(data)
-                    if "balance" not in STATE or not STATE["balance"]:
+                    if not STATE.get("balance"):
                         STATE["balance"] = 100.0
     except Exception:
         pass
@@ -58,57 +58,59 @@ def save_state():
 
 def _sign(params_str, timestamp):
     recv_window = "5000"
-    payload = timestamp + BYBIT_API_KEY + recv_window + params_str
+    payload = timestamp + 【entity-BYBIT_API_KEY¦canonical_name=Bybit】 + recv_window + params_str
     sign = hmac.new(BYBIT_API_SECRET.encode("utf-8"), payload.encode("utf-8"), hashlib.sha256).hexdigest()
     return sign, recv_window
 
-def _headers(sign, recv_window, timestamp):
-    return {"X-BAPI-API-KEY": BYBIT_API_KEY, "X-BAPI-SIGN": sign, "X-BAPI-SIGN-TYPE": "2", "X-BAPI-TIMESTAMP": timestamp, "X-BAPI-RECV-WINDOW": recv_window, "Content-Type": "application/json"}
-
-def bybit_post(path, body):
+def 【entity-bybit_post¦canonical_name=Bybit】(path, body):
     timestamp = str(int(time.time() * 1000))
     body_str = json.dumps(body, separators=(",", ":"))
     sign, recv_window = _sign(body_str, timestamp)
-    headers = _headers(sign, recv_window, timestamp)
-    url = BASE_URL + path
+    headers = {"X-BAPI-API-KEY": 【entity-BYBIT_API_KEY¦canonical_name=Bybit】, "X-BAPI-SIGN": sign, "X-BAPI-SIGN-TYPE": "2", "X-BAPI-TIMESTAMP": timestamp, "X-BAPI-RECV-WINDOW": recv_window, "Content-Type": "application/json"}
     try:
-        r = requests.post(url, headers=headers, data=body_str, timeout=15)
+        r = requests.post(BASE_URL + path, headers=headers, data=body_str, timeout=15)
         try:
             return r.json()
         except:
             return {"retCode": -1, "retMsg": "empty"}
     except Exception as e:
-        log("bybit_post exception: " + str(e))
+        log("【entity-bybit_post¦canonical_name=Bybit】 exception: " + str(e))
         return {"retCode": -1, "retMsg": str(e)}
 
 def get_klines():
-    try:
-        r = requests.get(BASE_URL + "/v5/market/kline", params={"category": CATEGORY, "symbol": SYMBOL, "interval": INTERVAL, "limit": 100}, timeout=15)
-        lst = r.json().get("result", {}).get("list", [])
-        return list(reversed(lst))
-    except Exception as e:
-        log("Klines error: " + str(e))
-        return []
+    for base in ["https://api.bybit.eu", "https://api.bybit.com"]:
+        try:
+            r = requests.get(base + "/v5/market/kline", params={"category": CATEGORY, "symbol": SYMBOL, "interval": INTERVAL, "limit": 100}, timeout=15)
+            lst = r.json().get("result", {}).get("list", [])
+            if lst:
+                log("Klines OK via " + base + " aantal: " + str(len(lst)))
+                return list(reversed(lst))
+            log("Klines leeg via " + base + " resp: " + str(r.text)[:200])
+        except Exception as e:
+            log("Klines error via " + base + ": " + str(e))
+    return []
 
 def get_price():
-    try:
-        r = requests.get(BASE_URL + "/v5/market/tickers", params={"category": CATEGORY, "symbol": SYMBOL}, timeout=10)
-        lst = r.json().get("result", {}).get("list", [])
-        if lst:
-            return float(lst[0].get("lastPrice", 0))
-    except Exception as e:
-        log("Price error: " + str(e))
+    for base in ["https://api.bybit.eu", "https://api.bybit.com"]:
+        try:
+            r = requests.get(base + "/v5/market/tickers", params={"category": CATEGORY, "symbol": SYMBOL}, timeout=10)
+            lst = r.json().get("result", {}).get("list", [])
+            if lst:
+                return float(lst[0].get("lastPrice", 0))
+        except Exception:
+            pass
     return 0
 
 def get_qty_step():
-    try:
-        r = requests.get(BASE_URL + "/v5/market/instruments-info", params={"category": CATEGORY, "symbol": SYMBOL}, timeout=10)
-        lst = r.json().get("result", {}).get("list", [])
-        if lst:
-            f = lst[0].get("lotSizeFilter", {})
-            return float(f.get("qtyStep", 1)), float(f.get("minOrderQty", 1))
-    except Exception as e:
-        log("Instrument error: " + str(e))
+    for base in ["https://api.bybit.eu", "https://api.bybit.com"]:
+        try:
+            r = requests.get(base + "/v5/market/instruments-info", params={"category": CATEGORY, "symbol": SYMBOL}, timeout=10)
+            lst = r.json().get("result", {}).get("list", [])
+            if lst:
+                f = lst[0].get("lotSizeFilter", {})
+                return float(f.get("qtyStep", 1)), float(f.get("minOrderQty", 1))
+        except Exception:
+            pass
     return 1.0, 1.0
 
 def calc_atr(klines):
@@ -195,11 +197,7 @@ def check_bot():
                 return
             res = place_market_order("Sell", qty_to_sell)
             if res:
-                new_balance = 0.0
-                if entry and entry > 0:
-                    new_balance = usdt * (price / entry)
-                else:
-                    new_balance = usdt
+                new_balance = usdt * (price / entry) if entry and entry > 0 else usdt
                 with STATE_LOCK:
                     STATE["in_position"] = False; STATE["qty"] = 0; STATE["entry_price"] = 0; STATE["balance"] = new_balance
                 save_state()
@@ -208,7 +206,7 @@ def check_bot():
             return
         log("Geen signaal. In positie: " + str(in_pos))
         with STATE_LOCK:
-            if time.time() - STATE["last_start_msg"] > 3600:
+            if time.time() - STATE.get("last_start_msg", 0) > 3600:
                 STATE["last_start_msg"] = time.time(); need_start = True
             else:
                 need_start = False
