@@ -5,8 +5,8 @@ from flask import Flask, request, jsonify
 
 app = Flask(__name__)
 
-BYBIT_API_KEY = os.environ.get("BYBIT_API_KEY", "").strip()
-BYBIT_API_SECRET = os.environ.get("BYBIT_API_SECRET", "").strip()
+【entity-BYBIT_API_KEY¦canonical_name=Bybit】 = os.environ.get("【entity-BYBIT_API_KEY¦canonical_name=Bybit】", "").strip()
+【entity-BYBIT_API_SECRET¦canonical_name=Bybit】 = os.environ.get("【entity-BYBIT_API_SECRET¦canonical_name=Bybit】", "").strip()
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 
@@ -17,7 +17,7 @@ ATR_PERIOD = 14
 BASE_URL = "https://api.bybit.eu"
 STATE_FILE = "state.json"
 
-STATE = {"in_position": False, "entry_price": 0.0, "qty": 0.0, "last_check": 0, "last_start_msg": 0, "last_error_msg": 0}
+STATE = {"in_position": False, "entry_price": 0.0, "qty": 0.0, "last_check": 0, "last_start_msg": 0, "last_error_msg": 0, "last_bybit_error": ""}
 STATE_LOCK = threading.Lock()
 _LOOP_STARTED = False
 _CHECK_RUNNING = False
@@ -25,7 +25,7 @@ _CHECK_RUNNING = False
 def log(msg):
     print(msg, flush=True)
 
-log(f"KEY LOADED: {len(BYBIT_API_KEY)} chars, start={BYBIT_API_KEY[:4] if BYBIT_API_KEY else 'LEEG'}****")
+log(f"KEY LOADED: {len(【entity-BYBIT_API_KEY¦canonical_name=Bybit】)} chars, start={【entity-BYBIT_API_KEY¦canonical_name=Bybit】[:4] if 【entity-BYBIT_API_KEY¦canonical_name=Bybit】 else 'LEEG'}****")
 
 def send_telegram(msg):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
@@ -56,12 +56,12 @@ def save_state():
 
 def _sign(params_str, timestamp):
     recv_window = "5000"
-    payload = timestamp + BYBIT_API_KEY + recv_window + params_str
-    sign = hmac.new(BYBIT_API_SECRET.encode("utf-8"), payload.encode("utf-8"), hashlib.sha256).hexdigest()
+    payload = timestamp + 【entity-BYBIT_API_KEY¦canonical_name=Bybit】 + recv_window + params_str
+    sign = hmac.new(【entity-BYBIT_API_SECRET¦canonical_name=Bybit】.encode("utf-8"), payload.encode("utf-8"), hashlib.sha256).hexdigest()
     return sign, recv_window
 
 def _headers(sign, recv_window, timestamp):
-    return {"X-BAPI-API-KEY": BYBIT_API_KEY, "X-BAPI-SIGN": sign, "X-BAPI-SIGN-TYPE": "2", "X-BAPI-TIMESTAMP": timestamp, "X-BAPI-RECV-WINDOW": recv_window, "Content-Type": "application/json"}
+    return {"X-BAPI-API-KEY": 【entity-BYBIT_API_KEY¦canonical_name=Bybit】, "X-BAPI-SIGN": sign, "X-BAPI-SIGN-TYPE": "2", "X-BAPI-TIMESTAMP": timestamp, "X-BAPI-RECV-WINDOW": recv_window, "Content-Type": "application/json"}
 
 def bybit_get(path, params):
     timestamp = str(int(time.time() * 1000))
@@ -102,17 +102,16 @@ def get_balances():
     total_pepe = 0.0
     seen_ok = False
     last_error = "ERROR"
-    for account_type in ["SPOT", "UNIFIED"]:
+    last_detail = ""
+    for account_type in ["UNIFIED", "SPOT"]:
         try:
             data = bybit_get("/v5/account/wallet-balance", {"accountType": account_type})
             log(f"Saldo check {account_type}: retCode={data.get('retCode')} retMsg={data.get('retMsg')}")
-            if data.get("retCode") == 10003:
-                log(f"FOUT 10003 in {account_type}: Key geen toestemming. API Read + Spot Trade + Wallet AAN, IP UIT")
-                last_error = "10003"
-                continue
             if data.get("retCode") != 0:
-                log(f"Saldo error {account_type}: {data}")
-                last_error = "ERROR"
+                last_error = str(data.get("retCode"))
+                last_detail = str(data.get("retMsg"))
+                with STATE_LOCK:
+                    STATE["last_bybit_error"] = f"{last_error} {last_detail}"
                 continue
             lst = data.get("result", {}).get("list", [])
             if not lst:
@@ -126,10 +125,11 @@ def get_balances():
         except Exception as e:
             log(f"Saldo exception {account_type}: {e}")
             last_error = "ERROR"
+            last_detail = str(e)
             continue
     if not seen_ok:
-        return None, None, last_error
-    return total_usdt, total_pepe, "SPOT+UNIFIED"
+        return None, None, last_error + " " + last_detail
+    return total_usdt, total_pepe, "OK"
 
 def get_klines():
     try:
@@ -210,12 +210,7 @@ def check_bot():
         if usdt is None:
             with STATE_LOCK:
                 STATE["last_check"] = 0
-            if acc_type == "10003":
-                with STATE_LOCK:
-                    if time.time() - STATE["last_error_msg"] > 600:
-                        STATE["last_error_msg"] = time.time()
-                        send_telegram("Pepebot: Kan saldo niet lezen (10003). Fix: API Read + Spot Trade + Wallet AAN, IP UIT.")
-            log("Bot stopt: geen saldo")
+            log(f"Bot stopt: geen saldo - {acc_type}")
             return
         log(f"Saldo USDT {acc_type}: {usdt} | PEPE: {pepe_qty}")
         klines = get_klines()
