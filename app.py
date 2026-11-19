@@ -102,12 +102,13 @@ def get_balances():
     total_pepe = 0.0
     seen_ok = False
     last_error = "ERROR"
-    for account_type in ["SPOT", "UNIFIED"]:
+    # FIX: alleen UNIFIED, 【entity-Bybit¦canonical_name=Bybit】.eu gebruikt geen SPOT meer
+    for account_type in ["UNIFIED"]:
         try:
             data = bybit_get("/v5/account/wallet-balance", {"accountType": account_type})
             log(f"Saldo check {account_type}: retCode={data.get('retCode')} retMsg={data.get('retMsg')}")
             if data.get("retCode") == 10003:
-                log(f"FOUT 10003 in {account_type}: Key geen toestemming. bybit.eu API Read + Spot Trade + Wallet AAN, IP UIT")
+                log(f"FOUT 10003 in {account_type}: Key geen toestemming. 【entity-bybit¦canonical_name=Bybit】.eu API Read + Spot Trade + Wallet AAN, IP UIT")
                 last_error = "10003"
                 continue
             if data.get("retCode") != 0:
@@ -129,7 +130,7 @@ def get_balances():
             continue
     if not seen_ok:
         return None, None, last_error
-    return total_usdt, total_pepe, "SPOT+UNIFIED"
+    return total_usdt, total_pepe, "UNIFIED"
 
 def get_klines():
     try:
