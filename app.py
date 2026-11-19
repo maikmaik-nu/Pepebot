@@ -17,7 +17,7 @@ ATR_PERIOD = 14
 BASE_URL = "https://api.bybit.eu"
 STATE_FILE = "state.json"
 
-STATE = {"in_position": False, "entry_price": 0.0, "qty": 0.0, "last_check": 0, "last_start_msg": 0, "last_error_msg": 0, "last_bybit_error": ""}
+STATE = {"in_position": False, "entry_price": 0.0, "qty": 0.0, "last_check": 0, "last_start_msg": 0, "last_error_msg": 0}
 STATE_LOCK = threading.Lock()
 _LOOP_STARTED = False
 _CHECK_RUNNING = False
@@ -102,16 +102,17 @@ def get_balances():
     total_pepe = 0.0
     seen_ok = False
     last_error = "ERROR"
-    last_detail = ""
-    for account_type in ["UNIFIED", "SPOT"]:
+    for account_type in ["SPOT", "UNIFIED"]:
         try:
             data = bybit_get("/v5/account/wallet-balance", {"accountType": account_type})
             log(f"Saldo check {account_type}: retCode={data.get('retCode')} retMsg={data.get('retMsg')}")
+            if data.get("retCode") == 10003:
+                log(f"FOUT 10003 in {account_type}: Key geen toestemming. bybit.eu API Read + Spot Trade + Wallet AAN, IP UIT")
+                last_error = "10003"
+                continue
             if data.get("retCode") != 0:
-                last_error = str(data.get("retCode"))
-                last_detail = str(data.get("retMsg"))
-                with STATE_LOCK:
-                    STATE["last_bybit_error"] = f"{last_error} {last_detail}"
+                log(f"Saldo error {account_type}: {data}")
+                last_error = "ERROR"
                 continue
             lst = data.get("result", {}).get("list", [])
             if not lst:
@@ -125,11 +126,10 @@ def get_balances():
         except Exception as e:
             log(f"Saldo exception {account_type}: {e}")
             last_error = "ERROR"
-            last_detail = str(e)
             continue
     if not seen_ok:
-        return None, None, last_error + " " + last_detail
-    return total_usdt, total_pepe, "OK"
+        return None, None, last_error
+    return total_usdt, total_pepe, "SPOT+UNIFIED"
 
 def get_klines():
     try:
@@ -210,7 +210,12 @@ def check_bot():
         if usdt is None:
             with STATE_LOCK:
                 STATE["last_check"] = 0
-            log(f"Bot stopt: geen saldo - {acc_type}")
+            if acc_type == "10003":
+                with STATE_LOCK:
+                    if time.time() - STATE["last_error_msg"] > 600:
+                        STATE["last_error_msg"] = time.time()
+                        send_telegram("Pepebot: Kan saldo niet lezen (10003). Fix: bybit.eu API Read + Spot Trade + Wallet AAN, IP UIT.")
+            log("Bot stopt: geen saldo")
             return
         log(f"Saldo USDT {acc_type}: {usdt} | PEPE: {pepe_qty}")
         klines = get_klines()
@@ -262,7 +267,7 @@ def check_bot():
             else:
                 need_start = False
         if need_start:
-            send_telegram(f"Bot gestart: GEEN stop-loss - Start met 100 - Rente-op-rente AAN - SPOT Saldo: {usdt} USDT")
+            send_telegram(f"Bot gestart: GEEN stop-loss - Start met 100 - Rente-op-rente AAN - SPOT via bybit.eu Saldo: {usdt} USDT")
         save_state()
         log("=== Bot check klaar ===")
     finally:
