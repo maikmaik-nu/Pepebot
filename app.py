@@ -1,144 +1,207 @@
-import os
-import math
-import threading
-import time
+import os, json, time, threading, hmac, hashlib
 import requests
 from flask import Flask, request, jsonify
-from pybit.unified_trading import HTTP
 
 app = Flask(__name__)
 
-# --- Instellingen ---
+BYBIT_API_KEY = os.environ.get("BYBIT_API_KEY", "").strip()
+BYBIT_API_SECRET = os.environ.get("BYBIT_API_SECRET", "").strip()
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
+
 SYMBOL = "PEPEUSDT"
 CATEGORY = "spot"
+INTERVAL = "15"
+ATR_PERIOD = 14
 BASE_URL = "https://api.bybit.eu"
-TRADE_USDT = 20  # vast bedrag per Buy, zet op 0 als je rente-op-rente / alles-in wil
+STATE_FILE = "state.json"
 
-BYBIT_API_KEY = os.environ.get("BYBIT_API_KEY")
-BYBIT_API_SECRET = os.environ.get("BYBIT_API_SECRET")
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
+STATE = {"in_position": False, "entry_price": 0.0, "qty": 0.0, "balance": 100.0, "last_check": 0, "last_start_msg": 0, "last_error_msg": 0}
+STATE_LOCK = threading.Lock()
+_LOOP_STARTED = False
+_CHECK_RUNNING = False
 
-session = HTTP(
-    testnet=False,
-    api_key=BYBIT_API_KEY,
-    api_secret=BYBIT_API_SECRET,
-    base_url=BASE_URL
-)
+def log(msg):
+    print(msg, flush=True)
 
-bot_state = {"in_positie": False}
+log("KEY LOADED: " + str(len(BYBIT_API_KEY)) + " chars, start=" + (BYBIT_API_KEY[:4] if BYBIT_API_KEY else "LEEG") + "****")
 
 def send_telegram(msg):
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return
     try:
-        if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-            print("Telegram niet ingesteld")
+        requests.post("https://api.telegram.org/bot" + TELEGRAM_BOT_TOKEN + "/sendMessage", json={"chat_id": TELEGRAM_CHAT_ID, "text": msg}, timeout=10)
+    except Exception as e:
+        log("Telegram error: " + str(e))
+
+def load_state():
+    try:
+        if os.path.exists(STATE_FILE):
+            with open(STATE_FILE, "r") as f:
+                data = json.load(f)
+                with STATE_LOCK:
+                    STATE.update(data)
+                    if "balance" not in STATE or not STATE["balance"]:
+                        STATE["balance"] = 100.0
+    except Exception:
+        pass
+
+def save_state():
+    try:
+        with STATE_LOCK:
+            data = dict(STATE)
+        with open(STATE_FILE, "w") as f:
+            json.dump(data, f)
+    except Exception as e:
+        log("save_state error: " + str(e))
+
+def _sign(params_str, timestamp):
+    recv_window = "5000"
+    payload = timestamp + BYBIT_API_KEY + recv_window + params_str
+    sign = hmac.new(BYBIT_API_SECRET.encode("utf-8"), payload.encode("utf-8"), hashlib.sha256).hexdigest()
+    return sign, recv_window
+
+def _headers(sign, recv_window, timestamp):
+    return {"X-BAPI-API-KEY": BYBIT_API_KEY, "X-BAPI-SIGN": sign, "X-BAPI-SIGN-TYPE": "2", "X-BAPI-TIMESTAMP": timestamp, "X-BAPI-RECV-WINDOW": recv_window, "Content-Type": "application/json"}
+
+def bybit_post(path, body):
+    timestamp = str(int(time.time() * 1000))
+    body_str = json.dumps(body, separators=(",", ":"))
+    sign, recv_window = _sign(body_str, timestamp)
+    headers = _headers(sign, recv_window, timestamp)
+    url = BASE_URL + path
+    try:
+        r = requests.post(url, headers=headers, data=body_str, timeout=15)
+        try:
+            return r.json()
+        except:
+            log("bybit_post geen JSON, status=" + str(r.status_code) + " body=" + str(r.text)[:200])
+            return {"retCode": -1, "retMsg": "empty", "http_status": r.status_code}
+    except Exception as e:
+        log("bybit_post exception: " + str(e))
+        return {"retCode": -1, "retMsg": str(e)}
+
+def get_klines():
+    for base in ["https://api.bybit.eu", "https://api.bybit.com"]:
+        try:
+            r = requests.get(base + "/v5/market/kline", params={"category": CATEGORY, "symbol": SYMBOL, "interval": INTERVAL, "limit": 100}, timeout=15)
+            lst = r.json().get("result", {}).get("list", [])
+            if lst:
+                log("Klines OK via " + base + " aantal: " + str(len(lst)))
+                return list(reversed(lst))
+            log("Klines leeg via " + base + " resp: " + str(r.text)[:200])
+        except Exception as e:
+            log("Klines error via " + base + ": " + str(e))
+    return []
+
+def get_price():
+    for base in ["https://api.bybit.eu", "https://api.bybit.com"]:
+        try:
+            r = requests.get(base + "/v5/market/tickers", params={"category": CATEGORY, "symbol": SYMBOL}, timeout=10)
+            lst = r.json().get("result", {}).get("list", [])
+            if lst:
+                return float(lst[0].get("lastPrice", 0))
+        except Exception:
+            pass
+    return 0
+
+def get_qty_step():
+    for base in ["https://api.bybit.eu", "https://api.bybit.com"]:
+        try:
+            r = requests.get(base + "/v5/market/instruments-info", params={"category": CATEGORY, "symbol": SYMBOL}, timeout=10)
+            lst = r.json().get("result", {}).get("list", [])
+            if lst:
+                f = lst[0].get("lotSizeFilter", {})
+                return float(f.get("qtyStep", 1)), float(f.get("minOrderQty", 1))
+        except Exception:
+            pass
+    return 1.0, 1.0
+
+def calc_atr(klines):
+    if len(klines) < ATR_PERIOD + 1:
+        return 0
+    trs = []
+    for i in range(1, len(klines)):
+        high = float(klines[i][2]); low = float(klines[i][3]); prev_close = float(klines[i-1][4])
+        trs.append(max(high - low, abs(high - prev_close), abs(low - prev_close)))
+    return sum(trs[-ATR_PERIOD:]) / ATR_PERIOD
+
+def round_qty(qty, qty_step):
+    from decimal import Decimal, ROUND_DOWN
+    step = Decimal(str(qty_step))
+    q = Decimal(str(qty))
+    rounded = (q / step).to_integral_value(rounding=ROUND_DOWN) * step
+    return float(rounded)
+
+def place_market_order(side, qty):
+    try:
+        qty_step, min_qty = get_qty_step()
+        qty = round_qty(qty, qty_step)
+        if qty < min_qty:
+            log("Order te klein: " + str(qty))
+            return None
+        body = {"category": CATEGORY, "symbol": SYMBOL, "side": side, "orderType": "Market", "qty": str(qty)}
+        log("Plaats order: " + str(body))
+        data = bybit_post("/v5/order/create", body)
+        log("Order result: " + str(data))
+        if data.get("retCode") != 0:
+            return None
+        return data
+    except Exception as e:
+        log("Order exception: " + str(e))
+        return None
+
+def check_bot():
+    global _CHECK_RUNNING
+    if _CHECK_RUNNING:
+        log("Check al bezig, skip")
+        return
+    _CHECK_RUNNING = True
+    try:
+        with STATE_LOCK:
+            if time.time() - STATE["last_check"] < 60:
+                log("Te snel opnieuw, wacht 60s")
+                return
+            STATE["last_check"] = time.time()
+        log("=== Bot check gestart ===")
+        with STATE_LOCK:
+            in_pos = STATE["in_position"]
+            saved_qty = STATE["qty"]
+            entry = STATE["entry_price"]
+            balance = STATE.get("balance", 100.0) or 100.0
+        usdt = balance
+        pepe_qty = saved_qty if in_pos else 0.0
+        log("Inleg: " + str(usdt) + " | PEPE in state: " + str(pepe_qty) + " | In positie: " + str(in_pos))
+        klines = get_klines()
+        if len(klines) < 5:
+            log("Te weinig klines, skip")
             return
-        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-        requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": msg}, timeout=10)
-    except Exception as e:
-        print(f"Telegram error: {e}")
-
-def get_free_balance(coin):
-    try:
-        resp = session.get_wallet_balance(accountType="SPOT")
-        print(f"Saldo check SPOT: {resp}")
-        coins = resp["result"]["list"][0]["coin"]
-        for c in coins:
-            if c["coin"] == coin:
-                val = c.get("walletBalance") or c.get("availableToWithdraw") or 0
-                return float(val)
-        return 0.0
-    except Exception as e:
-        print(f"Balance error {coin}: {e}")
-        return 0.0
-
-def do_buy():
-    try:
-        usdt_free = get_free_balance("USDT")
-        print(f"BUY signaal - USDT free: {usdt_free}")
-        if usdt_free < TRADE_USDT:
-            msg = f"BUY genegeerd: te weinig USDT ({usdt_free})"
-            send_telegram(msg)
-            return msg
-        resp = session.place_order(
-            category=CATEGORY,
-            symbol=SYMBOL,
-            side="Buy",
-            orderType="Market",
-            qty=str(TRADE_USDT)
-        )
-        print(f"BUY resp: {resp}")
-        msg = f"BUY uitgevoerd: {TRADE_USDT} USDT -> PEPE"
-        send_telegram(msg)
-        bot_state["in_positie"] = True
-        return msg
-    except Exception as e:
-        msg = f"Error bij buy: {e}"
-        print(msg)
-        send_telegram(msg)
-        return msg
-
-def do_sell():
-    try:
-        pepe_free = get_free_balance("PEPE")
-        print(f"SELL signaal - PEPE free: {pepe_free}")
-        if pepe_free <= 0:
-            msg = f"SELL genegeerd: geen PEPE ({pepe_free})"
-            send_telegram(msg)
-            return msg
-        qty = int(math.floor(float(pepe_free) / 1000) * 1000)
-        if qty <= 0:
-            msg = "SELL genegeerd: Qty te klein na afronding"
-            send_telegram(msg)
-            return msg
-        resp = session.place_order(
-            category=CATEGORY,
-            symbol=SYMBOL,
-            side="Sell",
-            orderType="Market",
-            qty=str(qty)
-        )
-        print(f"SELL resp: {resp}")
-        msg = f"SELL uitgevoerd: {qty} PEPE verkocht"
-        send_telegram(msg)
-        bot_state["in_positie"] = False
-        return msg
-    except Exception as e:
-        msg = f"Error bij sell: {e}"
-        print(msg)
-        send_telegram(msg)
-        return msg
-
-@app.route("/webhook", methods=["POST"])
-def webhook():
-    data = request.get_json(force=True, silent=True) or {}
-    action = str(data.get("action", "")).lower()
-    print(f"Webhook ontvangen: {data}")
-    if action == "buy":
-        msg = do_buy()
-    elif action == "sell":
-        msg = do_sell()
-    else:
-        msg = f"Onbekende action: {action}"
-    return jsonify({"status": msg}), 200
-
-@app.route("/test-key", methods=["GET"])
-def test_key():
-    try:
-        usdt = get_free_balance("USDT")
-        pepe = get_free_balance("PEPE")
-        return jsonify({"USDT": usdt, "PEPE": pepe, "status": "key werkt"}), 200
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-@app.route("/ping", methods=["GET"])
-def ping():
-    return "ok", 200
-
-@app.route("/", methods=["GET"])
-def home():
-    return "Bot draait", 200
-
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host="0.0.0.0", port=port)
+        price = get_price()
+        if price == 0:
+            price = float(klines[-1][4])
+        atr = calc_atr(klines)
+        last = klines[-1]; prev = klines[-2]
+        last_open = float(last[1]); last_close = float(last[4]); prev_close = float(prev[4])
+        log("Prijs: " + str(price) + " | ATR: " + str(atr))
+        if not in_pos and last_close > last_open and last_close > prev_close:
+            if usdt < 5:
+                log("Te weinig USDT"); return
+            qty = usdt / price
+            res = place_market_order("Buy", qty)
+            if res:
+                with STATE_LOCK:
+                    STATE["in_position"] = True; STATE["entry_price"] = price; STATE["qty"] = qty
+                save_state()
+                send_telegram("GEKOCHT PEPEUSDT Prijs: " + str(price) + " Inleg: " + str(usdt) + " USDT GEEN stop-loss Rente-op-rente AAN")
+                log("KOOP uitgevoerd")
+            return
+        if in_pos and last_close < last_open and last_close < prev_close:
+            qty_to_sell = pepe_qty if pepe_qty > 0 else 0
+            if qty_to_sell <= 0:
+                log("Niks te verkopen, qty is 0")
+                return
+            res = place_market_order("Sell", qty_to_sell)
+            if res:
+                new_balance = 0.0
+                if entry and entry > 0:
+                    new_balance =
