@@ -29,7 +29,7 @@ def send_telegram(msg):
     except Exception as e:
         print(f"Telegram error: {e}")
 
-def bybit_request(method, endpoint, params=None, signed=True):
+def api_request(method, endpoint, params=None, signed=True):
     if params is None:
         params = {}
     url = BASE_URL + endpoint
@@ -53,14 +53,14 @@ def bybit_request(method, endpoint, params=None, signed=True):
             r = requests.get(url, params=params, headers=headers, timeout=15)
         else:
             r = requests.post(url, json=params, headers=headers, timeout=15)
-        print(f"【entity-Bybit¦canonical_name=Bybit】 {endpoint}: {r.text[:400]}")
+        print(f"API {endpoint}: {r.text[:400]}")
         return r.json()
     except Exception as e:
-        print(f"【entity-Bybit¦canonical_name=Bybit】 error: {e}")
+        print(f"API error: {e}")
         return {"retCode": -1, "retMsg": str(e)}
 
 def get_balances():
-    res = bybit_request("GET", "/v5/account/wallet-balance", {"accountType": "SPOT"})
+    res = api_request("GET", "/v5/account/wallet-balance", {"accountType": "SPOT"})
     print(f"Saldo check SPOT: retCode={res.get('retCode')} retMsg={res.get('retMsg')}")
     balances = {}
     try:
@@ -72,7 +72,7 @@ def get_balances():
     return balances
 
 def get_price():
-    res = bybit_request("GET", "/v5/market/tickers", {"category": CATEGORY, "symbol": SYMBOL}, signed=False)
+    res = api_request("GET", "/v5/market/tickers", {"category": CATEGORY, "symbol": SYMBOL}, signed=False)
     try:
         return float(res["result"]["list"][0]["lastPrice"])
     except Exception:
@@ -90,7 +90,7 @@ def do_check():
         return "Geen prijs"
     qty = round(10.0 / price, 0)
     print(f"Koop {qty} PEPE voor 10 USDT")
-    order = bybit_request("POST", "/v5/order/create", {
+    order = api_request("POST", "/v5/order/create", {
         "category": CATEGORY,
         "symbol": SYMBOL,
         "side": "Buy",
