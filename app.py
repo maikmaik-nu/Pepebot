@@ -25,7 +25,7 @@ _CHECK_RUNNING = False
 def log(msg):
     print(msg, flush=True)
 
-log(f"KEY LOADED: {len(BYBIT_API_KEY)} chars, start={BYBIT_API_KEY[:4] if BYBIT_API_KEY else 'LEEG'}****")
+log("KEY LOADED: " + str(len(BYBIT_API_KEY)) + " chars, start=" + (BYBIT_API_KEY[:4] if BYBIT_API_KEY else "LEEG") + "****")
 
 def send_telegram(msg):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
@@ -103,9 +103,9 @@ def get_balances():
     for account_type in ["SPOT", "UNIFIED"]:
         try:
             data = bybit_get("/v5/account/wallet-balance", {"accountType": account_type})
-            log(f"Saldo check {account_type}: retCode={data.get('retCode')} retMsg={data.get('retMsg')}")
+            log("Saldo check " + account_type + ": retCode=" + str(data.get("retCode")) + " retMsg=" + str(data.get("retMsg")))
             if data.get("retCode") == 10003:
-                log(f"FOUT 10003 in {account_type}: Key geen toestemming")
+                log("FOUT 10003 in " + account_type)
                 last_error = "10003"
                 continue
             if data.get("retCode") != 0:
@@ -120,7 +120,7 @@ def get_balances():
                 if c.get("coin") == "PEPE":
                     total_pepe += float(c.get("walletBalance", 0) or 0)
         except Exception as e:
-            log(f"Saldo exception {account_type}: {e}")
+            log("Saldo exception " + account_type + ": " + str(e))
             continue
     if not seen_ok:
         return None, None, last_error
@@ -209,10 +209,10 @@ def check_bot():
                 with STATE_LOCK:
                     if time.time() - STATE["last_error_msg"] > 600:
                         STATE["last_error_msg"] = time.time()
-                        send_telegram("Pepebot: Kan saldo niet lezen (10003). Fix: 【entity-bybit¦canonical_name=Bybit】.eu API Read + Spot Trade + Wallet AAN, IP UIT.")
+                        send_telegram("Pepebot: Kan saldo niet lezen (10003). Fix: bybit.eu API Read + Spot Trade + Wallet AAN, IP UIT.")
             log("Bot stopt: geen saldo")
             return
-        log(f"Saldo USDT {acc_type}: {usdt} | PEPE: {pepe_qty}")
+        log("Saldo USDT " + str(acc_type) + ": " + str(usdt) + " | PEPE: " + str(pepe_qty))
         klines = get_klines()
         if len(klines) < 5:
             log("Te weinig klines, skip")
@@ -223,7 +223,7 @@ def check_bot():
         atr = calc_atr(klines)
         last = klines[-1]; prev = klines[-2]
         last_open = float(last[1]); last_close = float(last[4]); prev_close = float(prev[4])
-        log(f"Prijs: {price} | ATR: {atr}")
+        log("Prijs: " + str(price) + " | ATR: " + str(atr))
 
         with STATE_LOCK:
             in_pos = STATE["in_position"]
@@ -241,7 +241,7 @@ def check_bot():
                 with STATE_LOCK:
                     STATE["in_position"] = True; STATE["entry_price"] = price; STATE["qty"] = qty
                 save_state()
-                send_telegram(f"GEKOCHT PEPEUSDT Prijs: {price} Inleg: {usdt} USDT GEEN stop-loss Rente-op-rente AAN")
+                send_telegram("GEKOCHT PEPEUSDT Prijs: " + str(price) + " Inleg: " + str(usdt) + " USDT GEEN stop-loss Rente-op-rente AAN")
                 log("KOOP uitgevoerd")
             return
 
@@ -255,4 +255,65 @@ def check_bot():
                 with STATE_LOCK:
                     STATE["in_position"] = False; STATE["qty"] = 0; STATE["entry_price"] = 0
                 save_state()
-                send_telegram(f"VERKOCH
+                send_telegram("VERKOCHT PEPEUSDT Prijs: " + str(price) + " Saldo: " + str(usdt) + " USDT")
+                log("VERKOOP uitgevoerd")
+            return
+
+        log("Geen signaal. In positie: " + str(in_pos))
+        with STATE_LOCK:
+            if time.time() - STATE["last_start_msg"] > 3600:
+                STATE["last_start_msg"] = time.time(); need_start = True
+            else:
+                need_start = False
+        if need_start:
+            send_telegram("Bot gestart: GEEN stop-loss - Start met 100 - Rente-op-rente AAN - SPOT via bybit.eu Saldo: " + str(usdt) + " USDT")
+        save_state()
+        log("=== Bot check klaar ===")
+    finally:
+        _CHECK_RUNNING = False
+
+def loop():
+    check_bot()
+    while True:
+        time.sleep(900)
+        try:
+            check_bot()
+        except Exception as e:
+            log("Loop error: " + str(e))
+
+def start_loop_once():
+    global _LOOP_STARTED
+    if _LOOP_STARTED:
+        return
+    _LOOP_STARTED = True
+    load_state()
+    threading.Thread(target=loop, daemon=True).start()
+
+@app.route("/")
+def home():
+    with STATE_LOCK:
+        st = dict(STATE)
+    return jsonify({"status": "running", "symbol": SYMBOL, "in_position": st["in_position"], "key_start": BYBIT_API_KEY[:4] + "****" if BYBIT_API_KEY else "LEEG"})
+
+@app.route("/check")
+def manual_check():
+    threading.Thread(target=check_bot, daemon=True).start()
+    return jsonify({"ok": True})
+
+@app.route("/test-key")
+def test_key():
+    usdt, pepe, acc = get_balances()
+    return jsonify({"key_start": BYBIT_API_KEY[:4] + "****" if BYBIT_API_KEY else "LEEG", "usdt": usdt, "pepe": pepe, "status": acc})
+
+@app.route("/webhook", methods=["POST"])
+def webhook():
+    data = request.get_json(force=True, silent=True) or {}
+    log("Webhook: " + str(data))
+    threading.Thread(target=check_bot, daemon=True).start()
+    return jsonify({"ok": True})
+
+start_loop_once()
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host="0.0.0.0", port=port)
