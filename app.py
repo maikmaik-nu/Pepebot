@@ -16,9 +16,8 @@ INTERVAL = "15"
 ATR_PERIOD = 14
 BASE_URL = "https://api.bybit.eu"
 STATE_FILE = "state.json"
-FIXED_USDT = 100.0
 
-STATE = {"in_position": False, "entry_price": 0.0, "qty": 0.0, "last_check": 0, "last_start_msg": 0, "last_error_msg": 0}
+STATE = {"in_position": False, "entry_price": 0.0, "qty": 0.0, "balance": 100.0, "last_check": 0, "last_start_msg": 0, "last_error_msg": 0}
 STATE_LOCK = threading.Lock()
 _LOOP_STARTED = False
 _CHECK_RUNNING = False
@@ -43,6 +42,8 @@ def load_state():
                 data = json.load(f)
                 with STATE_LOCK:
                     STATE.update(data)
+                    if "balance" not in STATE or not STATE["balance"]:
+                        STATE["balance"] = 100.0
     except Exception:
         pass
 
@@ -152,17 +153,18 @@ def check_bot():
     try:
         with STATE_LOCK:
             if time.time() - STATE["last_check"] < 60:
+                log("Te snel opnieuw, wacht 60s")
                 return
             STATE["last_check"] = time.time()
         log("=== Bot check gestart ===")
-        # GEEN wallet-balance meer - vaste inleg, geen Wallet permissie nodig
         with STATE_LOCK:
             in_pos = STATE["in_position"]
             saved_qty = STATE["qty"]
             entry = STATE["entry_price"]
-        usdt = FIXED_USDT
+            balance = STATE.get("balance", 100.0) or 100.0
+        usdt = balance
         pepe_qty = saved_qty if in_pos else 0.0
-        log("Vaste inleg: " + str(usdt) + " | PEPE in state: " + str(pepe_qty))
+        log("Inleg: " + str(usdt) + " | PEPE in state: " + str(pepe_qty) + " | In positie: " + str(in_pos))
         klines = get_klines()
         if len(klines) < 5:
             log("Te weinig klines, skip")
@@ -175,6 +177,8 @@ def check_bot():
         last_open = float(last[1]); last_close = float(last[4]); prev_close = float(prev[4])
         log("Prijs: " + str(price) + " | ATR: " + str(atr))
         if not in_pos and last_close > last_open and last_close > prev_close:
+            if usdt < 5:
+                log("Te weinig USDT"); return
             qty = usdt / price
             res = place_market_order("Buy", qty)
             if res:
@@ -191,11 +195,16 @@ def check_bot():
                 return
             res = place_market_order("Sell", qty_to_sell)
             if res:
+                new_balance = 0.0
+                if entry and entry > 0:
+                    new_balance = usdt * (price / entry)
+                else:
+                    new_balance = usdt
                 with STATE_LOCK:
-                    STATE["in_position"] = False; STATE["qty"] = 0; STATE["entry_price"] = 0
+                    STATE["in_position"] = False; STATE["qty"] = 0; STATE["entry_price"] = 0; STATE["balance"] = new_balance
                 save_state()
-                send_telegram("VERKOCHT PEPEUSDT Prijs: " + str(price) + " Saldo: " + str(usdt) + " USDT")
-                log("VERKOOP uitgevoerd")
+                send_telegram("VERKOCHT PEPEUSDT Prijs: " + str(price) + " Nieuwe inleg: " + str(new_balance) + " USDT")
+                log("VERKOOP uitgevoerd, nieuwe inleg: " + str(new_balance))
             return
         log("Geen signaal. In positie: " + str(in_pos))
         with STATE_LOCK:
@@ -204,13 +213,14 @@ def check_bot():
             else:
                 need_start = False
         if need_start:
-            send_telegram("Bot gestart: GEEN stop-loss - Start met 100 - Rente-op-rente AAN - SPOT via bybit.eu")
+            send_telegram("Bot gestart: GEEN stop-loss - Rente-op-rente AAN - SPOT via bybit.eu Inleg: " + str(usdt) + " USDT")
         save_state()
         log("=== Bot check klaar ===")
     finally:
         _CHECK_RUNNING = False
 
 def loop():
+    time.sleep(5)
     check_bot()
     while True:
         time.sleep(900)
@@ -231,18 +241,22 @@ def start_loop_once():
 def home():
     with STATE_LOCK:
         st = dict(STATE)
-    return jsonify({"status": "running", "symbol": SYMBOL, "in_position": st["in_position"], "key_start": BYBIT_API_KEY[:4] + "****" if BYBIT_API_KEY else "LEEG"})
+    return jsonify({"status": "running", "symbol": SYMBOL, "in_position": st["in_position"], "balance": st.get("balance", 100.0), "key_start": BYBIT_API_KEY[:4] + "****" if BYBIT_API_KEY else "LEEG"})
 
 @app.route("/check")
 def manual_check():
-    threading.Thread(target=check_bot, daemon=True).start()
-    return jsonify({"ok": True})
+    global _CHECK_RUNNING
+    _CHECK_RUNNING = False
+    with STATE_LOCK:
+        STATE["last_check"] = 0
+    check_bot()
+    with STATE_LOCK:
+        st = dict(STATE)
+    return jsonify({"ok": True, "in_position": st["in_position"], "balance": st.get("balance", 100.0)})
 
 @app.route("/test-key")
 def test_key():
-    # Test nu alleen of de key een order zou mogen plaatsen - geen saldo meer
-    # We testen met een echte Bybit call die geen Wallet nodig heeft: instruments-info via public, en sign check via order history is te zwaar, dus we geven gewoon OK als key geladen is
-    return jsonify({"key_start": BYBIT_API_KEY[:4] + "****" if BYBIT_API_KEY else "LEEG", "usdt": FIXED_USDT, "pepe": 0, "status": "OK - geen wallet check meer", "mode": "fixed-100"})
+    return jsonify({"key_start": BYBIT_API_KEY[:4] + "****" if BYBIT_API_KEY else "LEEG", "usdt": STATE.get("balance", 100.0), "pepe": STATE.get("qty", 0), "status": "OK - geen wallet check meer", "mode": "fixed-100-rente-op-rente"})
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
