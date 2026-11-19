@@ -4,6 +4,7 @@ import hmac
 import hashlib
 import requests
 import threading
+import json as js
 from flask import Flask, jsonify
 
 app = Flask(__name__)
@@ -28,20 +29,18 @@ def send_telegram(msg):
     except Exception as e:
         print(f"Telegram error: {e}")
 
-def 【entity-bybit_request¦canonical_name=Bybit】(method, endpoint, params=None, signed=True):
+def bybit_request(method, endpoint, params=None, signed=True):
     if params is None:
         params = {}
     url = BASE_URL + endpoint
     headers = {"Content-Type": "application/json"}
     timestamp = str(int(time.time() * 1000))
     if signed:
-        # V5 signing: timestamp + key + recv_window + query/body
         recv_window = "5000"
         if method == "GET":
             query = "&".join(f"{k}={v}" for k, v in sorted(params.items()))
             sign_str = timestamp + API_KEY + recv_window + query
         else:
-            import json as js
             body = js.dumps(params, separators=(",", ":"))
             sign_str = timestamp + API_KEY + recv_window + body
         sign = hmac.new(API_SECRET.encode(), sign_str.encode(), hashlib.sha256).hexdigest()
@@ -61,7 +60,7 @@ def 【entity-bybit_request¦canonical_name=Bybit】(method, endpoint, params=No
         return {"retCode": -1, "retMsg": str(e)}
 
 def get_balances():
-    res = 【entity-bybit_request¦canonical_name=Bybit】("GET", "/v5/account/wallet-balance", {"accountType": "SPOT"})
+    res = bybit_request("GET", "/v5/account/wallet-balance", {"accountType": "SPOT"})
     print(f"Saldo check SPOT: retCode={res.get('retCode')} retMsg={res.get('retMsg')}")
     balances = {}
     try:
@@ -73,7 +72,7 @@ def get_balances():
     return balances
 
 def get_price():
-    res = 【entity-bybit_request¦canonical_name=Bybit】("GET", "/v5/market/tickers", {"category": CATEGORY, "symbol": SYMBOL}, signed=False)
+    res = bybit_request("GET", "/v5/market/tickers", {"category": CATEGORY, "symbol": SYMBOL}, signed=False)
     try:
         return float(res["result"]["list"][0]["lastPrice"])
     except Exception:
