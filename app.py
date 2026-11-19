@@ -63,9 +63,10 @@ def bybit_post(path, body):
 
 def get_balances():
     usdt=0.0; pepe=0.0; ok=False; last="ERROR"
-    for at in ["SPOT","UNIFIED"]:
+    for at in ["UNIFIED"]:
         d=bybit_get("/v5/account/wallet-balance", {"accountType": at})
         log(f"Saldo {at}: retCode={d.get('retCode')} retMsg={d.get('retMsg')}")
+        if d.get("retCode")==10005: last="10005"; continue
         if d.get("retCode")==10003: last="10003"; continue
         if d.get("retCode")!=0: last="ERROR"; continue
         lst=d.get("result",{}).get("list",[])
@@ -75,7 +76,7 @@ def get_balances():
             if c.get("coin")=="USDT": usdt+=float(c.get("walletBalance",0) or 0)
             if c.get("coin")=="PEPE": pepe+=float(c.get("walletBalance",0) or 0)
     if not ok: return None,None,last
-    return usdt,pepe,"SPOT+UNIFIED"
+    return usdt,pepe,"UNIFIED"
 
 def get_klines():
     try:
@@ -109,7 +110,6 @@ def calc_atr(klines, period):
     return sum(trs[-period:])/period
 
 def ut_bot_signal(klines):
-    # UT Bot Alerts: trailing stop op ATR. Buy = close kruist boven trailing, Sell = eronder.
     if len(klines)<50: return None
     atr=calc_atr(klines, UT_ATR_PERIOD)
     if atr==0: return None
@@ -166,6 +166,10 @@ def check_bot():
                 with STATE_LOCK:
                     if time.time()-STATE["last_error_msg"]>600:
                         STATE["last_error_msg"]=time.time(); send_telegram("Pepebot: saldo niet leesbaar (10003). Bybit.eu: Read + Spot Trade + Wallet AAN, IP UIT.")
+            if acc=="10005":
+                with STATE_LOCK:
+                    if time.time()-STATE["last_error_msg"]>600:
+                        STATE["last_error_msg"]=time.time(); send_telegram("Pepebot: saldo niet leesbaar (10005). Key heeft geen toestemming voor UNIFIED wallet-balance.")
             return
         log(f"Saldo: {usdt} USDT | PEPE: {pepe}")
         klines=get_klines()
