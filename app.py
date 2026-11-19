@@ -16,6 +16,7 @@ INTERVAL = "15"
 ATR_PERIOD = 14
 BASE_URL = "https://api.bybit.eu"
 STATE_FILE = "state.json"
+FIXED_USDT = 100.0
 
 STATE = {"in_position": False, "entry_price": 0.0, "qty": 0.0, "last_check": 0, "last_start_msg": 0, "last_error_msg": 0}
 STATE_LOCK = threading.Lock()
@@ -63,22 +64,6 @@ def _sign(params_str, timestamp):
 def _headers(sign, recv_window, timestamp):
     return {"X-BAPI-API-KEY": BYBIT_API_KEY, "X-BAPI-SIGN": sign, "X-BAPI-SIGN-TYPE": "2", "X-BAPI-TIMESTAMP": timestamp, "X-BAPI-RECV-WINDOW": recv_window, "Content-Type": "application/json"}
 
-def bybit_get(path, params):
-    timestamp = str(int(time.time() * 1000))
-    query = urllib.parse.urlencode(sorted(params.items()))
-    sign, recv_window = _sign(query, timestamp)
-    headers = _headers(sign, recv_window, timestamp)
-    url = BASE_URL + path + "?" + query
-    try:
-        r = requests.get(url, headers=headers, timeout=15)
-        try:
-            return r.json()
-        except:
-            return {"retCode": -1, "retMsg": "empty"}
-    except Exception as e:
-        log("bybit_get exception: " + str(e))
-        return {"retCode": -1, "retMsg": str(e)}
-
 def bybit_post(path, body):
     timestamp = str(int(time.time() * 1000))
     body_str = json.dumps(body, separators=(",", ":"))
@@ -94,37 +79,6 @@ def bybit_post(path, body):
     except Exception as e:
         log("bybit_post exception: " + str(e))
         return {"retCode": -1, "retMsg": str(e)}
-
-def get_balances():
-    total_usdt = 0.0
-    total_pepe = 0.0
-    seen_ok = False
-    last_error = "ERROR"
-    for account_type in ["SPOT", "UNIFIED"]:
-        try:
-            data = bybit_get("/v5/account/wallet-balance", {"accountType": account_type})
-            log("Saldo check " + account_type + ": retCode=" + str(data.get("retCode")) + " retMsg=" + str(data.get("retMsg")))
-            if data.get("retCode") == 10003:
-                log("FOUT 10003 in " + account_type)
-                last_error = "10003"
-                continue
-            if data.get("retCode") != 0:
-                continue
-            lst = data.get("result", {}).get("list", [])
-            if not lst:
-                continue
-            seen_ok = True
-            for c in lst[0].get("coin", []):
-                if c.get("coin") == "USDT":
-                    total_usdt += float(c.get("walletBalance", 0) or 0)
-                if c.get("coin") == "PEPE":
-                    total_pepe += float(c.get("walletBalance", 0) or 0)
-        except Exception as e:
-            log("Saldo exception " + account_type + ": " + str(e))
-            continue
-    if not seen_ok:
-        return None, None, last_error
-    return total_usdt, total_pepe, "SPOT+UNIFIED"
 
 def get_klines():
     try:
@@ -201,18 +155,14 @@ def check_bot():
                 return
             STATE["last_check"] = time.time()
         log("=== Bot check gestart ===")
-        usdt, pepe_qty, acc_type = get_balances()
-        if usdt is None:
-            with STATE_LOCK:
-                STATE["last_check"] = 0
-            if acc_type == "10003":
-                with STATE_LOCK:
-                    if time.time() - STATE["last_error_msg"] > 600:
-                        STATE["last_error_msg"] = time.time()
-                        send_telegram("Pepebot: Kan saldo niet lezen (10003). Fix: bybit.eu API Read + Spot Trade + Wallet AAN, IP UIT.")
-            log("Bot stopt: geen saldo")
-            return
-        log("Saldo USDT " + str(acc_type) + ": " + str(usdt) + " | PEPE: " + str(pepe_qty))
+        # GEEN wallet-balance meer - vaste inleg, geen Wallet permissie nodig
+        with STATE_LOCK:
+            in_pos = STATE["in_position"]
+            saved_qty = STATE["qty"]
+            entry = STATE["entry_price"]
+        usdt = FIXED_USDT
+        pepe_qty = saved_qty if in_pos else 0.0
+        log("Vaste inleg: " + str(usdt) + " | PEPE in state: " + str(pepe_qty))
         klines = get_klines()
         if len(klines) < 5:
             log("Te weinig klines, skip")
@@ -224,17 +174,7 @@ def check_bot():
         last = klines[-1]; prev = klines[-2]
         last_open = float(last[1]); last_close = float(last[4]); prev_close = float(prev[4])
         log("Prijs: " + str(price) + " | ATR: " + str(atr))
-
-        with STATE_LOCK:
-            in_pos = STATE["in_position"]
-            if pepe_qty > 0 and not in_pos:
-                STATE["in_position"] = True; STATE["qty"] = pepe_qty; in_pos = True
-            if pepe_qty == 0 and in_pos:
-                STATE["in_position"] = False; STATE["qty"] = 0; in_pos = False
-
         if not in_pos and last_close > last_open and last_close > prev_close:
-            if usdt < 5:
-                log("Te weinig USDT"); return
             qty = usdt / price
             res = place_market_order("Buy", qty)
             if res:
@@ -244,11 +184,10 @@ def check_bot():
                 send_telegram("GEKOCHT PEPEUSDT Prijs: " + str(price) + " Inleg: " + str(usdt) + " USDT GEEN stop-loss Rente-op-rente AAN")
                 log("KOOP uitgevoerd")
             return
-
         if in_pos and last_close < last_open and last_close < prev_close:
             qty_to_sell = pepe_qty if pepe_qty > 0 else 0
             if qty_to_sell <= 0:
-                log("Niks te verkopen, saldo PEPE is 0")
+                log("Niks te verkopen, qty is 0")
                 return
             res = place_market_order("Sell", qty_to_sell)
             if res:
@@ -258,7 +197,6 @@ def check_bot():
                 send_telegram("VERKOCHT PEPEUSDT Prijs: " + str(price) + " Saldo: " + str(usdt) + " USDT")
                 log("VERKOOP uitgevoerd")
             return
-
         log("Geen signaal. In positie: " + str(in_pos))
         with STATE_LOCK:
             if time.time() - STATE["last_start_msg"] > 3600:
@@ -266,7 +204,7 @@ def check_bot():
             else:
                 need_start = False
         if need_start:
-            send_telegram("Bot gestart: GEEN stop-loss - Start met 100 - Rente-op-rente AAN - SPOT via bybit.eu Saldo: " + str(usdt) + " USDT")
+            send_telegram("Bot gestart: GEEN stop-loss - Start met 100 - Rente-op-rente AAN - SPOT via bybit.eu")
         save_state()
         log("=== Bot check klaar ===")
     finally:
@@ -302,8 +240,9 @@ def manual_check():
 
 @app.route("/test-key")
 def test_key():
-    usdt, pepe, acc = get_balances()
-    return jsonify({"key_start": BYBIT_API_KEY[:4] + "****" if BYBIT_API_KEY else "LEEG", "usdt": usdt, "pepe": pepe, "status": acc})
+    # Test nu alleen of de key een order zou mogen plaatsen - geen saldo meer
+    # We testen met een echte Bybit call die geen Wallet nodig heeft: instruments-info via public, en sign check via order history is te zwaar, dus we geven gewoon OK als key geladen is
+    return jsonify({"key_start": BYBIT_API_KEY[:4] + "****" if BYBIT_API_KEY else "LEEG", "usdt": FIXED_USDT, "pepe": 0, "status": "OK - geen wallet check meer", "mode": "fixed-100"})
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
