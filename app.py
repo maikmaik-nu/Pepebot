@@ -1,6 +1,7 @@
-import os, time, hmac, hashlib, threading, json
+import os, time, hmac, hashlib, threading, json, math
 import requests
 from flask import Flask, jsonify, request
+from urllib.parse import urlencode
 
 app = Flask(__name__)
 
@@ -26,36 +27,35 @@ def send_telegram(msg):
     except Exception as e:
         print(f"TELEGRAM FAIL: {e}", flush=True)
 
-def sign_get(params, ts, recv):
-    query = "&".join(f"{k}={params[k]}" for k in sorted(params))
+# --- 【entity-BYBIT¦canonical_name=BYBIT】 ---
+
+def bybit_get(path, params):
+    ts = str(int(time.time() * 1000))
+    recv = "20000"
+    query = urlencode(sorted(params.items()))
     to_sign = ts + API_KEY + recv + query
     sig = hmac.new(API_SECRET.encode(), to_sign.encode(), hashlib.sha256).hexdigest()
-    return {
+    headers = {
         "X-BAPI-API-KEY": API_KEY,
         "X-BAPI-SIGN": sig,
         "X-BAPI-TIMESTAMP": ts,
         "X-BAPI-RECV-WINDOW": recv,
+        "X-BAPI-SIGN-TYPE": "2",
         "Content-Type": "application/json"
     }
-
-def bybit_get(path, params):
-    ts = str(int(time.time() * 1000))
-    recv = "5000"
-    headers = sign_get(params, ts, recv)
     try:
-        r = requests.get(BASE_URL + path, params=params, headers=headers, timeout=15)
+        r = requests.get(f"{BASE_URL}{path}?{query}", headers=headers, timeout=15)
         print(f"【entity-BYBIT¦canonical_name=BYBIT】 GET {path} -> {r.status_code} {r.text[:300]}", flush=True)
         if r.status_code != 200:
             return {"retCode": r.status_code, "retMsg": r.text[:200], "result": {"list": []}}
         return r.json()
     except Exception as e:
-        print(f"【entity-BYBIT¦canonical_name=BYBIT】 GET FAIL: {e}", flush=True)
+        print(f"BYBIT GET FAIL: {e}", flush=True)
         return {"retCode": -1, "result": {"list": []}}
 
 def bybit_post(path, params):
     ts = str(int(time.time() * 1000))
-    recv = "5000"
-    # FIX: Bij POST moet je de JSON-body tekenen, niet de query-string
+    recv = "20000"
     body_str = json.dumps(params, separators=(',', ':'))
     to_sign = ts + API_KEY + recv + body_str
     sig = hmac.new(API_SECRET.encode(), to_sign.encode(), hashlib.sha256).hexdigest()
@@ -64,6 +64,7 @@ def bybit_post(path, params):
         "X-BAPI-SIGN": sig,
         "X-BAPI-TIMESTAMP": ts,
         "X-BAPI-RECV-WINDOW": recv,
+        "X-BAPI-SIGN-TYPE": "2",
         "Content-Type": "application/json"
     }
     try:
@@ -77,7 +78,6 @@ def bybit_post(path, params):
         return {"retCode": -1, "retMsg": str(e)}
 
 def get_balances():
-    # FIX: Alleen UNIFIED, geen SPOT meer. SPOT gaf 10003 op Bybit EU.
     out = {}
     try:
         d = bybit_get("/v5/account/wallet-balance", {"accountType": "UNIFIED"})
@@ -122,7 +122,7 @@ def calc_atr(highs, lows, closes, period):
 def get_signals():
     closes, highs, lows = get_klines()
     if len(closes) < 30:
-        return "wait", closes[-1], "te weinig candles"
+        return "wait", closes[-1] if closes else 0, "te weinig candles"
 
     atr10 = calc_atr(highs, lows, closes, 10)
     price = closes[-1]
@@ -150,12 +150,16 @@ def do_check():
     pepe = bal.get("PEPE", 0)
     print(f"CHECK: USDT={usdt} PEPE={pepe} in_position={in_position}", flush=True)
 
-    signal, price, reason = get_signals()
+    try:
+        signal, price, reason = get_signals()
+    except Exception as e:
+        print(f"SIGNAL FAIL: {e}", flush=True)
+        return {"status": "signal fail", "error": str(e)}
 
     # SELL
     if signal == "sell" and (in_position or pepe > 0):
         qty_step, min_qty = get_qty_step()
-        qty = int(pepe / qty_step) * qty_step
+        qty = math.floor(pepe / qty_step) * qty_step
         if qty < min_qty:
             print("SELL skip: te weinig PEPE", flush=True)
             return {"status": "sell skip", "pepe": pepe}
@@ -163,52 +167,66 @@ def do_check():
         if res.get("retCode") == 0:
             in_position = False
             send_telegram(f"VERKOCHT PEPE @ {price} - {reason}")
-        return {"status": "sell", "price": price, "qty": qty, "bybit": res}
+        return {"status": "sell", "price": price, "qty": qty, "res": res}
 
     # BUY
     if signal == "buy" and not in_position:
         if usdt < 10:
-            return {"status": "te weinig USDT", "usdt": usdt}
+            print("BUY skip: te weinig USDT", flush=True)
+            return {"status": "buy skip", "usdt": usdt}
         qty_step, min_qty = get_qty_step()
-        use = min(usdt, USE_USDT)
-        qty = int((use / price) / qty_step) * qty_step
+        amount = min(usdt, USE_USDT)
+        qty = math.floor((amount / price) / qty_step) * qty_step
         if qty < min_qty:
-            return {"status": "qty te klein", "qty": qty}
+            print("BUY skip: qty te klein", flush=True)
+            return {"status": "buy skip qty", "qty": qty}
         res = bybit_post("/v5/order/create", {"category": CATEGORY, "symbol": SYMBOL, "side": "Buy", "orderType": "Market", "qty": str(qty)})
         if res.get("retCode") == 0:
             in_position = True
-            new_balance = usdt - use
-            send_telegram(f"GEKOCHT PEPE @ {price} voor {use} USDT - {reason} | nieuw saldo ca. {new_balance:.2f}")
-        return {"status": "buy", "price": price, "qty": qty, "【entity-bybit¦canonical_name=BYBIT】": res}
+            send_telegram(f"GEKOCHT PEPE @ {price} - {reason} - qty {qty}")
+        return {"status": "buy", "price": price, "qty": qty, "res": res}
 
     return {"status": "hold", "signal": signal, "price": price, "usdt": usdt, "pepe": pepe, "reason": reason}
 
-def bot_loop():
-    time.sleep(10)
+def auto_loop():
     while True:
         try:
-            print("AUTO CHECK gestart", flush=True)
-            res = do_check()
-            print(f"AUTO CHECK klaar: {res}", flush=True)
+            do_check()
         except Exception as e:
             print(f"AUTO CHECK FAIL: {e}", flush=True)
-        time.sleep(300)
+        time.sleep(60)
 
-threading.Thread(target=bot_loop, daemon=True).start()
+# --- ROUTES ---
 
-@app.route("/")
+@app.route("/", methods=["GET"])
 def home():
-    return "Pepebot-3 live"
+    return "Bot draait", 200
 
-@app.route("/check")
+@app.route("/test-key", methods=["GET"])
+def test_key():
+    bal = get_balances()
+    return jsonify({"balances": bal, "api_key_set": bool(API_KEY)}), 200
+
+@app.route("/check", methods=["GET"])
 def check():
-    return jsonify(do_check())
+    return jsonify(do_check()), 200
 
-# FIX: Telegram 404 weg - route bestond niet
 @app.route("/telegram", methods=["POST"])
 def telegram():
-    return jsonify({"ok": True})
+    data = request.get_json(force=True, silent=True) or {}
+    text = str(data.get("message", {}).get("text", "")).lower()
+    if "check" in text:
+        res = do_check()
+        send_telegram(f"Check: {res}")
+    elif "saldo" in text or "balance" in text:
+        send_telegram(f"Saldo: {get_balances()}")
+    return jsonify({"ok": True}), 200
+
+@app.route("/webhook", methods=["POST"])
+def webhook():
+    return jsonify(do_check()), 200
 
 if __name__ == "__main__":
+    threading.Thread(target=auto_loop, daemon=True).start()
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
