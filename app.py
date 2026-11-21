@@ -1,6 +1,6 @@
-import os, time, hmac, hashlib, threading
+import os, time, hmac, hashlib, threading, json
 import requests
-from flask import Flask, jsonify
+from flask import Flask, jsonify, request
 
 app = Flask(__name__)
 
@@ -14,7 +14,6 @@ API_SECRET = os.environ.get("BYBIT_API_SECRET", "").strip()
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 
-# Hoeveel USDT per trade, hou 5 over voor fees
 USE_USDT = 95.0
 in_position = False
 
@@ -27,32 +26,38 @@ def send_telegram(msg):
     except Exception as e:
         print(f"TELEGRAM FAIL: {e}", flush=True)
 
-def sign_params(params, ts, recv):
+def sign_get(params, ts, recv):
     query = "&".join(f"{k}={params[k]}" for k in sorted(params))
     to_sign = ts + API_KEY + recv + query
     sig = hmac.new(API_SECRET.encode(), to_sign.encode(), hashlib.sha256).hexdigest()
-    headers = {
+    return {
         "X-BAPI-API-KEY": API_KEY,
         "X-BAPI-SIGN": sig,
         "X-BAPI-TIMESTAMP": ts,
         "X-BAPI-RECV-WINDOW": recv,
         "Content-Type": "application/json"
     }
-    return headers
 
 def bybit_get(path, params):
     ts = str(int(time.time() * 1000))
     recv = "5000"
-    headers = sign_params(params, ts, recv)
-    r = requests.get(BASE_URL + path, params=params, headers=headers, timeout=15)
-    print(f"BYBIT GET {path} -> {r.status_code} {r.text[:300]}", flush=True)
-    return r.json()
+    headers = sign_get(params, ts, recv)
+    try:
+        r = requests.get(BASE_URL + path, params=params, headers=headers, timeout=15)
+        print(f"【entity-BYBIT¦canonical_name=BYBIT】 GET {path} -> {r.status_code} {r.text[:300]}", flush=True)
+        if r.status_code != 200:
+            return {"retCode": r.status_code, "retMsg": r.text[:200], "result": {"list": []}}
+        return r.json()
+    except Exception as e:
+        print(f"【entity-BYBIT¦canonical_name=BYBIT】 GET FAIL: {e}", flush=True)
+        return {"retCode": -1, "result": {"list": []}}
 
 def bybit_post(path, params):
     ts = str(int(time.time() * 1000))
     recv = "5000"
-    query = "&".join(f"{k}={params[k]}" for k in sorted(params))
-    to_sign = ts + API_KEY + recv + query
+    # FIX: Bij POST moet je de JSON-body tekenen, niet de query-string
+    body_str = json.dumps(params, separators=(',', ':'))
+    to_sign = ts + API_KEY + recv + body_str
     sig = hmac.new(API_SECRET.encode(), to_sign.encode(), hashlib.sha256).hexdigest()
     headers = {
         "X-BAPI-API-KEY": API_KEY,
@@ -61,24 +66,31 @@ def bybit_post(path, params):
         "X-BAPI-RECV-WINDOW": recv,
         "Content-Type": "application/json"
     }
-    r = requests.post(BASE_URL + path, json=params, headers=headers, timeout=15)
-    print(f"BYBIT POST {path} -> {r.status_code} {r.text[:500]}", flush=True)
-    return r.json()
+    try:
+        r = requests.post(BASE_URL + path, data=body_str, headers=headers, timeout=15)
+        print(f"BYBIT POST {path} -> {r.status_code} {r.text[:500]}", flush=True)
+        if r.status_code != 200:
+            return {"retCode": r.status_code, "retMsg": r.text[:200]}
+        return r.json()
+    except Exception as e:
+        print(f"BYBIT POST FAIL: {e}", flush=True)
+        return {"retCode": -1, "retMsg": str(e)}
 
 def get_balances():
+    # FIX: Alleen UNIFIED, geen SPOT meer. SPOT gaf 10003 op Bybit EU.
     out = {}
-    for acct in ["SPOT", "UNIFIED"]:
-        try:
-            d = bybit_get("/v5/account/wallet-balance", {"accountType": acct})
-            if d.get("retCode") != 0:
-                continue
-            lst = d.get("result", {}).get("list", [])
-            if not lst:
-                continue
-            for coin in lst[0].get("coin", []):
-                out[coin["coin"]] = float(coin.get("walletBalance", 0))
-        except Exception as e:
-            print(f"Saldo FAIL: {e}", flush=True)
+    try:
+        d = bybit_get("/v5/account/wallet-balance", {"accountType": "UNIFIED"})
+        if d.get("retCode") != 0:
+            print(f"BALANCE FAIL: {d}", flush=True)
+            return out
+        lst = d.get("result", {}).get("list", [])
+        if not lst:
+            return out
+        for coin in lst[0].get("coin", []):
+            out[coin["coin"]] = float(coin.get("walletBalance", 0))
+    except Exception as e:
+        print(f"Saldo FAIL: {e}", flush=True)
     return out
 
 def get_price():
@@ -92,7 +104,6 @@ def get_qty_step():
 
 def get_klines():
     r = requests.get(BASE_URL + "/v5/market/kline", params={"category": CATEGORY, "symbol": SYMBOL, "interval": TIMEFRAME, "limit": 200}, timeout=10).json()
-    # Bybit geeft [start, open, high, low, close, volume, turnover]
     klines = sorted(r["result"]["list"], key=lambda x: int(x[0]))
     closes = [float(x[4]) for x in klines]
     highs = [float(x[2]) for x in klines]
@@ -104,7 +115,6 @@ def calc_atr(highs, lows, closes, period):
     for i in range(1, len(closes)):
         tr = max(highs[i] - lows[i], abs(highs[i] - closes[i-1]), abs(lows[i] - closes[i-1]))
         trs.append(tr)
-    # Simpele ATR = gemiddelde van laatste 'period' TR's
     if len(trs) < period:
         return sum(trs) / len(trs) if trs else 0
     return sum(trs[-period:]) / period
@@ -114,19 +124,13 @@ def get_signals():
     if len(closes) < 30:
         return "wait", closes[-1], "te weinig candles"
 
-    # --- Supertrend 10, 3 ---
     atr10 = calc_atr(highs, lows, closes, 10)
     price = closes[-1]
-    prev_price = closes[-2]
-    # Supertrend: groen als prijs boven (prijs - 3*ATR) blijft en stijgt
-    # Simpele, stabiele versie: trend op basis van prijs vs midden + ATR
     upper = price - (3 * atr10)
     super_green = price > closes[-5] and price > upper
 
-    # --- UT Bot 4, 14 ---
     atr14 = calc_atr(highs, lows, closes, 14)
     n_loss = 4 * atr14
-    # UT Buy als prijs boven trailing stop van vorige candles uitkomt
     trailing = closes[-2] - n_loss
     ut_buy = price > trailing and price > closes[-2]
     ut_sell = price < trailing
@@ -161,7 +165,7 @@ def do_check():
             send_telegram(f"VERKOCHT PEPE @ {price} - {reason}")
         return {"status": "sell", "price": price, "qty": qty, "bybit": res}
 
-    # BUY - alleen als beide signalen goed zijn
+    # BUY
     if signal == "buy" and not in_position:
         if usdt < 10:
             return {"status": "te weinig USDT", "usdt": usdt}
@@ -175,7 +179,7 @@ def do_check():
             in_position = True
             new_balance = usdt - use
             send_telegram(f"GEKOCHT PEPE @ {price} voor {use} USDT - {reason} | nieuw saldo ca. {new_balance:.2f}")
-        return {"status": "buy", "price": price, "qty": qty, "bybit": res}
+        return {"status": "buy", "price": price, "qty": qty, "【entity-bybit¦canonical_name=BYBIT】": res}
 
     return {"status": "hold", "signal": signal, "price": price, "usdt": usdt, "pepe": pepe, "reason": reason}
 
@@ -199,6 +203,11 @@ def home():
 @app.route("/check")
 def check():
     return jsonify(do_check())
+
+# FIX: Telegram 404 weg - route bestond niet
+@app.route("/telegram", methods=["POST"])
+def telegram():
+    return jsonify({"ok": True})
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
