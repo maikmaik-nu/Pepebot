@@ -50,7 +50,7 @@ def bybit_get(path, params):
             return {"retCode": r.status_code, "retMsg": r.text[:200], "result": {"list": []}}
         return r.json()
     except Exception as e:
-        print(f"BYBIT GET FAIL: {e}", flush=True)
+        print(f"【entity-BYBIT¦canonical_name=BYBIT】 GET FAIL: {e}", flush=True)
         return {"retCode": -1, "result": {"list": []}}
 
 def bybit_post(path, params):
@@ -79,18 +79,26 @@ def bybit_post(path, params):
 
 def get_balances():
     out = {}
-    try:
-        d = bybit_get("/v5/account/wallet-balance", {"accountType": "UNIFIED"})
-        if d.get("retCode") != 0:
-            print(f"BALANCE FAIL: {d}", flush=True)
-            return out
-        lst = d.get("result", {}).get("list", [])
-        if not lst:
-            return out
-        for coin in lst[0].get("coin", []):
-            out[coin["coin"]] = float(coin.get("walletBalance", 0))
-    except Exception as e:
-        print(f"Saldo FAIL: {e}", flush=True)
+    # FIX 1: Eerst SPOT, daar staat je geld. Daarna UNIFIED als backup
+    for acc_type in ["SPOT", "UNIFIED"]:
+        try:
+            d = bybit_get("/v5/account/wallet-balance", {"accountType": acc_type})
+            if d.get("retCode") != 0:
+                print(f"BALANCE FAIL {acc_type}: {d}", flush=True)
+                continue
+            lst = d.get("result", {}).get("list", [])
+            if not lst:
+                continue
+            for coin in lst[0].get("coin", []):
+                val = float(coin.get("walletBalance", 0) or coin.get("totalEquity", 0) or 0)
+                if val > 0:
+                    # Neem de grootste waarde als hij in beide accounts staat
+                    out[coin["coin"]] = max(out.get(coin["coin"], 0), val)
+            if out:
+                print(f"BALANCE OK via {acc_type}: {out}", flush=True)
+                return out
+        except Exception as e:
+            print(f"Saldo FAIL {acc_type}: {e}", flush=True)
     return out
 
 def get_price():
@@ -124,10 +132,15 @@ def get_signals():
     if len(closes) < 30:
         return "wait", closes[-1] if closes else 0, "te weinig candles"
 
-    atr10 = calc_atr(highs, lows, closes, 10)
     price = closes[-1]
-    upper = price - (3 * atr10)
-    super_green = price > closes[-5] and price > upper
+    # FIX 3: Echte Supertrend - niet price - 3*ATR
+    # Supertrend = (High+Low)/2 +/- 3*ATR, richting wisselt als price er doorheen breekt
+    atr10 = calc_atr(highs, lows, closes, 10)
+    mid = (highs[-1] + lows[-1]) / 2
+    upper = mid + (3 * atr10)
+    lower = mid - (3 * atr10)
+    # Simpele maar eerlijke versie: groen als price boven vorige upper, rood als eronder
+    super_green = price > upper or (price > closes[-5] and price > lower)
 
     atr14 = calc_atr(highs, lows, closes, 14)
     n_loss = 4 * atr14
@@ -135,7 +148,7 @@ def get_signals():
     ut_buy = price > trailing and price > closes[-2]
     ut_sell = price < trailing
 
-    print(f"SIGNAL: price={price} super_green={super_green} ut_buy={ut_buy} ut_sell={ut_sell} atr10={atr10} atr14={atr14}", flush=True)
+    print(f"SIGNAL: price={price} super_green={super_green} ut_buy={ut_buy} ut_sell={ut_sell} atr10={atr10} atr14={atr14} upper={upper}", flush=True)
 
     if super_green and ut_buy:
         return "buy", price, "Supertrend groen + UT Buy"
@@ -155,6 +168,13 @@ def do_check():
     except Exception as e:
         print(f"SIGNAL FAIL: {e}", flush=True)
         return {"status": "signal fail", "error": str(e)}
+
+    # FIX: positie bepalen uit echt saldo, niet alleen uit geheugen
+    # Als je meer dan ~5 USD aan PEPE hebt, zit je in positie
+    if pepe > 0 and price > 0 and (pepe * price) > 5:
+        in_position = True
+    elif pepe == 0:
+        in_position = False
 
     # SELL
     if signal == "sell" and (in_position or pepe > 0):
@@ -226,7 +246,17 @@ def telegram():
 def webhook():
     return jsonify(do_check()), 200
 
+# FIX 2: Loop ook starten als gunicorn de app importeert, niet alleen bij python app.py
+# Anders draait hij op Render nooit automatisch
+_loop_started = False
+def _start_loop_once():
+    global _loop_started
+    if not _loop_started:
+        _loop_started = True
+        threading.Thread(target=auto_loop, daemon=True).start()
+
+_start_loop_once()
+
 if __name__ == "__main__":
-    threading.Thread(target=auto_loop, daemon=True).start()
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
