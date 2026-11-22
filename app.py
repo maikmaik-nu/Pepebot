@@ -3,6 +3,7 @@ import time
 import hmac
 import hashlib
 import requests
+import json as json_lib
 from flask import Flask, jsonify
 
 app = Flask(__name__)
@@ -11,8 +12,7 @@ BASE_URL = "https://api.bybit.eu"
 API_KEY = os.environ.get("BYBIT_API_KEY", "")
 API_SECRET = os.environ.get("BYBIT_API_SECRET", "")
 
-# HIER MOET HIJ ZOEKEN - uit je screenshot
-ACCOUNT_TYPE = "SPOT"
+ACCOUNT_TYPE = "UNIFIED"
 COIN = "USDC"
 SYMBOL = "PEPEUSDC"  # want je geld is USDC, niet USDT
 CATEGORY = "spot"
@@ -49,7 +49,6 @@ def bybit_get(path, params):
 def bybit_post(path, body):
     timestamp = str(int(time.time() * 1000))
     recv_window = "5000"
-    import json as json_lib
     body_str = json_lib.dumps(body)
     sign_str = timestamp + API_KEY + recv_window + body_str
     signature = hmac.new(
@@ -73,10 +72,9 @@ def bybit_post(path, body):
         return {"retCode": -1, "retMsg": f"Geen JSON: {r.text[:200]}"}
 
 def get_balance():
-    # Alleen SPOT opvragen, niet UNIFIED / FUND
+    # UNIFIED opvragen, geen coin meegeven - Bybit.eu heeft geen los SPOT-account meer
     status, data = bybit_get("/v5/account/wallet-balance", {
-        "accountType": ACCOUNT_TYPE,
-        "coin": COIN
+        "accountType": ACCOUNT_TYPE
     })
     print(f"Saldo check {ACCOUNT_TYPE}: {data}")
 
@@ -98,11 +96,13 @@ def get_balance():
         return 0.0, 0.0, -1, str(e)
 
 def get_price():
+    # tickers is publiek, GEEN signature meesturen
     try:
-        status, data = bybit_get("/v5/market/tickers", {
+        r = requests.get(BASE_URL + "/v5/market/tickers", params={
             "category": CATEGORY,
             "symbol": SYMBOL
-        })
+        }, timeout=10)
+        data = r.json()
         return float(data["result"]["list"][0]["lastPrice"])
     except Exception as e:
         print("Price error:", e)
