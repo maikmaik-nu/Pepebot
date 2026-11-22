@@ -2,6 +2,7 @@ import os
 import time
 import hmac
 import hashlib
+import json
 import requests
 from flask import Flask, jsonify
 
@@ -12,11 +13,11 @@ API_KEY = os.environ.get("BYBIT_API_KEY", "").strip()
 API_SECRET = os.environ.get("BYBIT_API_SECRET", "").strip()
 
 SYMBOL = "PEPEUSDC"
-QUOTE = "USDC"   # heb je USDT? Verander dit dan naar USDT en SYMBOL naar PEPEUSDT
+QUOTE = "USDC"
 BASE = "PEPE"
-MIN_BUY = 10.0  # koop alleen als je minimaal 10 USDC hebt
+MIN_BUY = 10.0
 
-# ---------- 【entity-Bybit¦canonical_name=Bybit】 helpers ----------
+# ---------- Bybit helpers ----------
 
 def sign(timestamp, recv_window, payload):
     msg = timestamp + API_KEY + recv_window + payload
@@ -44,7 +45,6 @@ def bybit_get(path, params):
         return r.status_code, {"retCode": -1, "retMsg": f"Geen JSON: {r.text[:200]}"}
 
 def bybit_post(path, body):
-    import json
     timestamp = str(int(time.time() * 1000))
     recv_window = "5000"
     payload = json.dumps(body, separators=(",", ":"))
@@ -67,34 +67,29 @@ def bybit_post(path, body):
         return r.status_code, {"retCode": -1, "retMsg": f"Geen JSON: {r.text[:200]}"}
 
 def get_price():
-    status, data = bybit_get("/v5/market/tickers", {"category": "spot", "symbol": SYMBOL})
+    # Public endpoint, geen signature nodig
     try:
+        r = requests.get(BASE_URL + "/v5/market/tickers", params={"category": "spot", "symbol": SYMBOL}, timeout=10)
+        data = r.json()
         return float(data["result"]["list"][0]["lastPrice"])
     except Exception:
         return 0.0
 
 def get_balance():
-    # Probeer SPOT eerst, daarna UNIFIED. Eentje geeft altijd je echte saldo.
-    for account_type in ["SPOT", "UNIFIED"]:
-        status, data = bybit_get("/v5/account/wallet-balance", {"accountType": account_type})
-        print(f"Saldo check {account_type}: status={status} data={data}", flush=True)
-        if status == 200 and data.get("retCode") == 0:
-            try:
-                coins = data["result"]["list"][0]["coin"]
-                balances = {c["coin"]: float(c.get("walletBalance", 0) or 0) for c in coins}
-                quote = balances.get(QUOTE, 0.0)
-                base = balances.get(BASE, 0.0)
-                if quote > 0 or base > 0:
-                    return quote, base, 0, account_type
-                # 0 in SPOT, probeer UNIFIED nog
-                if account_type == "SPOT":
-                    continue
-                return quote, base, 0, account_type
-            except Exception as e:
-                print(f"Balance parse fout {account_type}: {e}", flush=True)
-                continue
-        else:
-            print(f"BALANCE FAIL {account_type}: status={status} retCode={data.get('retCode')} msg={data.get('retMsg')}", flush=True)
+    # ALLEEN UNIFIED - SPOT mag niet bij wallet-balance op Bybit EU
+    status, data = bybit_get("/v5/account/wallet-balance", {"accountType": "UNIFIED"})
+    print(f"Saldo check UNIFIED: status={status} data={data}", flush=True)
+    if status == 200 and data.get("retCode") == 0:
+        try:
+            coins = data["result"]["list"][0]["coin"]
+            balances = {c["coin"]: float(c.get("walletBalance", 0) or 0) for c in coins}
+            quote = balances.get(QUOTE, 0.0)
+            base = balances.get(BASE, 0.0)
+            return quote, base, 0, "UNIFIED"
+        except Exception as e:
+            print(f"Balance parse fout: {e}", flush=True)
+    else:
+        print(f"BALANCE FAIL UNIFIED: status={status} retCode={data.get('retCode')} msg={data.get('retMsg')}", flush=True)
     return 0.0, 0.0, -1, "NONE"
 
 def place_order(side, qty):
@@ -121,11 +116,9 @@ def home():
     if retcode != 0:
         return jsonify({"status": "geen saldo / geen rechten", "retCode": retcode, "account": account, "price": price})
 
-    # Simpele logica: koop als je cash hebt en geen positie, verkoop als je positie hebt
-    # Pas dit aan naar je eigen strategie als je wil
     action = "niks"
     if not in_position and quote >= MIN_BUY:
-        qty = int((quote / price) * 0.99)  # 99% van je saldo, 1% over voor fees
+        qty = int((quote / price) * 0.99)
         if qty > 0:
             status, data = place_order("Buy", qty)
             action = f"Buy {qty} -> {data.get('retMsg')}"
