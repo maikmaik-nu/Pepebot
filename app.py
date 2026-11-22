@@ -14,7 +14,7 @@ BASE_URL = "https://api.bybit.eu"
 SYMBOL = "PEPEUSDT"
 CATEGORY = "spot"
 
-# --- 【entity-BYBIT¦canonical_name=BYBIT】 HELPER ---
+# --- BYBIT HELPER ---
 def bybit_get(path, params=""):
     ts = str(int(time.time() * 1000))
     recv = "5000"
@@ -37,25 +37,45 @@ def bybit_get(path, params=""):
         return r.status_code, {"raw": r.text}
 
 def get_balances():
-    # Probeer SPOT eerst, daarna UNIFIED
-    for account_type in ["SPOT", "UNIFIED"]:
-        status, data = bybit_get("/v5/account/wallet-balance", f"accountType={account_type}")
-        if data.get("retCode") == 0:
-            coins = {}
-            try:
-                lst = data["result"]["list"][0]["coin"]
-                for c in lst:
-                    coins[c["coin"]] = {
-                        "wallet": c.get("walletBalance"),
-                        "available": c.get("availableToWithdraw")
-                    }
-            except Exception as e:
-                coins = {"parse_error": str(e)}
-            return account_type, status, data, coins
-        else:
-            # Onthoud de fout, probeer de volgende
-            last_error = (account_type, status, data)
-    return last_error[0], last_error[1], last_error[2], {}
+    # 1. SPOT moet via ASSET endpoint, NIET via wallet-balance
+    status, data = bybit_get("/v5/asset/transfer/query-account-coins-balance", "accountType=SPOT&coin=USDT")
+    if data.get("retCode") == 0:
+        coins = {}
+        try:
+            for c in data["result"]["balance"]:
+                coins[c["coin"]] = {
+                    "wallet": c.get("walletBalance"),
+                    "available": c.get("availableToWithdraw")
+                }
+        except Exception as e:
+            coins = {"parse_error": str(e)}
+        # PEPE ook ophalen
+        _, data2 = bybit_get("/v5/asset/transfer/query-account-coins-balance", "accountType=SPOT&coin=PEPE")
+        if data2.get("retCode") == 0:
+            for c in data2["result"]["balance"]:
+                coins[c["coin"]] = {
+                    "wallet": c.get("walletBalance"),
+                    "available": c.get("availableToWithdraw")
+                }
+        return "SPOT", status, data, coins
+
+    # 2. Alleen als SPOT echt faalt, probeer UNIFIED via wallet-balance
+    status2, data2 = bybit_get("/v5/account/wallet-balance", "accountType=UNIFIED")
+    if data2.get("retCode") == 0:
+        coins = {}
+        try:
+            lst = data2["result"]["list"][0]["coin"]
+            for c in lst:
+                coins[c["coin"]] = {
+                    "wallet": c.get("walletBalance"),
+                    "available": c.get("availableToWithdraw")
+                }
+        except Exception as e:
+            coins = {"parse_error": str(e)}
+        return "UNIFIED", status2, data2, coins
+
+    # Beide faalden - geef SPOT fout terug, niet UNIFIED
+    return "SPOT", status, data, {}
 
 # --- ROUTES ---
 @app.route("/")
@@ -64,7 +84,6 @@ def home():
 
 @app.route("/test-key")
 def test_key():
-    # Dit is de echte test - verbergt niks meer
     account_type, status, data, coins = get_balances()
     return jsonify({
         "api_key_set": bool(API_KEY),
