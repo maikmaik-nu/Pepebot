@@ -9,7 +9,7 @@ from flask import Flask, jsonify
 
 app = Flask(__name__)
 
-# ================= CONFIG =================
+# ===== CONFIG UIT RENDER - NIET MEER AANPASSEN =====
 API_KEY = os.getenv("BYBIT_API_KEY", "").strip()
 API_SECRET = os.getenv("BYBIT_API_SECRET", "").strip()
 BASE_URL = os.getenv("BASE_URL", "https://api.bybit.eu").strip().rstrip("/")
@@ -19,10 +19,10 @@ TRADE_USDT = float(os.getenv("TRADE_USDT", "10"))
 CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "60"))
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
-TAKE_PROFIT_PCT = float(os.getenv("TAKE_PROFIT_PCT", "10"))
-STOP_LOSS_PCT = float(os.getenv("STOP_LOSS_PCT", "5"))
+TAKE_PROFIT_PCT = 10.0
+STOP_LOSS_PCT = 5.0
 
-# ================= STATE =================
+# ===== STATE =====
 in_position = False
 buy_price = 0.0
 last_retcode = None
@@ -32,6 +32,7 @@ last_pepe = 0.0
 last_price = 0.0
 last_error = ""
 last_check = ""
+working_account = "UNIFIED"  # wordt automatisch gevonden
 total_trades = 0
 
 def log(msg):
@@ -49,17 +50,13 @@ def telegram(msg):
     except Exception as e:
         log(f"telegram error {e}")
 
-# ================= 【entity-BYBIT¦canonical_name=Bybit】 SIGN =================
-def sign_get(params):
+# ===== 【entity-BYBIT¦canonical_name=BYBIT】 V5 SIGN - DEZE IS GOED =====
+def api_get(path, params):
+    global last_retcode, last_retmsg
     ts = str(int(time.time() * 1000))
     query = "&".join(f"{k}={params[k]}" for k in sorted(params))
     to_sign = ts + API_KEY + "5000" + query
     sig = hmac.new(API_SECRET.encode(), to_sign.encode(), hashlib.sha256).hexdigest()
-    return ts, sig
-
-def api_get(path, params):
-    global last_retcode, last_retmsg
-    ts, sig = sign_get(params)
     headers = {
         "X-BAPI-API-KEY": API_KEY,
         "X-BAPI-TIMESTAMP": ts,
@@ -78,7 +75,7 @@ def api_get(path, params):
         last_retmsg = j.get("retMsg", "")
         return j
     except Exception as e:
-        log(f"api error {path} {e}")
+        log(f"api error {e}")
         return {"retCode": -1, "retMsg": str(e)}
 
 def api_post(path, body):
@@ -108,36 +105,43 @@ def api_post(path, body):
         log(f"api post error {e}")
         return {"retCode": -1, "retMsg": str(e)}
 
-# ================= BALANCE / PRICE =================
+# ===== BALANCE - PROBEERT AUTOMATISCH UNIFIED EN SPOT =====
 def get_balances():
-    global last_usdt, last_pepe
-    d = api_get("/v5/account/wallet-balance", {"accountType": "SPOT"})
-    usdt = 0.0
-    pepe = 0.0
-    acc = "NONE"
-    try:
-        lst = d.get("result", {}).get("list", [])
-        if lst:
-            acc = lst[0].get("accountType", "NONE")
-            for c in lst[0].get("coin", []):
-                if c["coin"] == "USDT":
-                    usdt = float(c.get("walletBalance", 0))
-                if c["coin"] == "PEPE":
-                    pepe = float(c.get("walletBalance", 0))
-    except Exception as e:
-        log(f"balance parse error {e}")
-    last_usdt = usdt
-    last_pepe = pepe
-    return usdt, pepe, acc
+    global last_usdt, last_pepe, working_account
+    # 1. Probeer eerst de werkende accountType
+    for acc_try in [working_account, "UNIFIED", "SPOT", "CONTRACT"]:
+        if acc_try == working_account and acc_try != "UNIFIED":
+            pass
+        d = api_get("/v5/account/wallet-balance", {"accountType": acc_try})
+        if d.get("retCode") == 0:
+            working_account = acc_try
+            usdt = 0.0
+            pepe = 0.0
+            try:
+                lst = d.get("result", {}).get("list", [])
+                if lst:
+                    for c in lst[0].get("coin", []):
+                        if c["coin"] == "USDT":
+                            usdt = float(c.get("walletBalance", 0))
+                        if c["coin"] == "PEPE":
+                            pepe = float(c.get("walletBalance", 0))
+            except Exception as e:
+                log(f"balance parse {e}")
+            last_usdt = usdt
+            last_pepe = pepe
+            return usdt, pepe, acc_try
+        # Als 10003 bij deze acc, probeer volgende - niet stoppen
+        if d.get("retCode") != 10003:
+            break
+    # Geen enkele werkte
+    last_usdt = 0.0
+    last_pepe = 0.0
+    return 0.0, 0.0, "NONE"
 
 def get_price():
     global last_price
     try:
-        r = requests.get(
-            BASE_URL + "/v5/market/tickers",
-            params={"category": CATEGORY, "symbol": SYMBOL},
-            timeout=10
-        ).json()
+        r = requests.get(BASE_URL + "/v5/market/tickers", params={"category": CATEGORY, "symbol": SYMBOL}, timeout=10).json()
         price = float(r["result"]["list"][0]["lastPrice"])
         last_price = price
         return price
@@ -145,42 +149,25 @@ def get_price():
         log(f"price error {e}")
         return 0.0
 
-def get_open_orders():
-    d = api_get("/v5/order/realtime", {"category": CATEGORY, "symbol": SYMBOL, "limit": 5})
-    try:
-        return d.get("result", {}).get("list", [])
-    except:
-        return []
-
-# ================= TRADING =================
+# ===== TRADING =====
 def buy_pepe(usdt_amount, price):
     global in_position, buy_price, total_trades
     if price <= 0:
-        log("buy skipped: price 0")
         return False
     qty = int(usdt_amount / price)
     if qty <= 0:
-        log(f"buy skipped qty 0 usdt={usdt_amount} price={price}")
         return False
     log(f"BUY {qty} {SYMBOL} voor {usdt_amount} USDT @ {price}")
-    res = api_post("/v5/order/create", {
-        "category": CATEGORY,
-        "symbol": SYMBOL,
-        "side": "Buy",
-        "orderType": "Market",
-        "qty": str(qty)
-    })
+    res = api_post("/v5/order/create", {"category": CATEGORY, "symbol": SYMBOL, "side": "Buy", "orderType": "Market", "qty": str(qty)})
     if res.get("retCode") == 0:
         in_position = True
         buy_price = price
         total_trades += 1
         telegram(f"✅ GEKOCHT: {qty} PEPE @ {price} ({usdt_amount} USDT)")
-        log(f"BUY OK orderId={res.get('result', {}).get('orderId')}")
         return True
-    else:
-        log(f"BUY FAIL {res}")
-        telegram(f"❌ BUY mislukt: {res.get('retMsg')}")
-        return False
+    log(f"BUY FAIL {res}")
+    telegram(f"❌ BUY mislukt: {res.get('retMsg')}")
+    return False
 
 def sell_pepe(pepe_amount, price, reden=""):
     global in_position
@@ -188,71 +175,52 @@ def sell_pepe(pepe_amount, price, reden=""):
     if qty <= 0:
         return False
     log(f"SELL {qty} {SYMBOL} @ {price} reden={reden}")
-    res = api_post("/v5/order/create", {
-        "category": CATEGORY,
-        "symbol": SYMBOL,
-        "side": "Sell",
-        "orderType": "Market",
-        "qty": str(qty)
-    })
+    res = api_post("/v5/order/create", {"category": CATEGORY, "symbol": SYMBOL, "side": "Sell", "orderType": "Market", "qty": str(qty)})
     if res.get("retCode") == 0:
         in_position = False
         telegram(f"💰 VERKOCHT: {qty} PEPE @ {price} - {reden}")
-        log("SELL OK")
         return True
-    else:
-        log(f"SELL FAIL {res}")
-        telegram(f"❌ SELL mislukt: {res.get('retMsg')}")
-        return False
+    log(f"SELL FAIL {res}")
+    return False
 
-# ================= MAIN LOOP =================
+# ===== LOOP =====
 def check_loop():
     global in_position, buy_price, last_error, last_check
-    log(f"bot gestart BASE={BASE_URL} SYMBOL={SYMBOL} CATEGORY={CATEGORY} TRADE={TRADE_USDT} TP={TAKE_PROFIT_PCT}% SL={STOP_LOSS_PCT}%")
-    # Bij start: kijk of we al PEPE hebben
+    log(f"bot gestart BASE={BASE_URL} SYMBOL={SYMBOL} CATEGORY={CATEGORY} TRADE={TRADE_USDT}")
     try:
         usdt, pepe, acc = get_balances()
         if pepe > 0:
             in_position = True
             buy_price = get_price()
-            log(f"start: al in positie PEPE={pepe} buy_price={buy_price}")
     except Exception as e:
         last_error = str(e)
-
     while True:
         try:
             usdt, pepe, acc = get_balances()
             price = get_price()
-
             if pepe > 0:
                 in_position = True
             elif pepe == 0:
                 in_position = False
-
             last_check = f"USDT={usdt} PEPE={pepe} price={price} in_position={in_position} retCode={last_retcode} acc={acc}"
             log(f"CHECK: {last_check}")
-
-            # Als 【entity-Bybit¦canonical_name=Bybit】 10003 geeft, niet blijven proberen te kopen
             if last_retcode == 10003:
-                log("SKIP trading: retCode 10003 = key niet geautoriseerd, check FINAL key in Render")
+                log("SKIP: key niet geautoriseerd - check FINAL key in Render, geen code probleem")
                 time.sleep(CHECK_INTERVAL)
                 continue
-
-            # Auto-verkoop: take profit / stop loss
             if in_position and buy_price > 0 and price > 0 and pepe > 0:
                 winst = (price - buy_price) / buy_price * 100
-                log(f"positie winst={winst:.2f}% buy={buy_price} now={price}")
+                log(f"winst={winst:.2f}% buy={buy_price} now={price}")
                 if winst >= TAKE_PROFIT_PCT:
                     sell_pepe(pepe, price, f"Take Profit +{winst:.1f}%")
                 elif winst <= -STOP_LOSS_PCT:
                     sell_pepe(pepe, price, f"Stop Loss {winst:.1f}%")
-
         except Exception as e:
             last_error = str(e)
             log(f"CHECK error {e}")
         time.sleep(CHECK_INTERVAL)
 
-# ================= ROUTES =================
+# ===== ROUTES =====
 @app.route("/")
 def home():
     return "Pepebot-3 live - /test-key /status /buy /sell"
@@ -273,6 +241,7 @@ def test_key():
         "retCode": last_retcode,
         "retMsg": last_retmsg,
         "acc": acc,
+        "working_account": working_account,
         "key_ok": bool(API_KEY and API_SECRET),
         "key_len": len(API_KEY),
         "secret_len": len(API_SECRET),
@@ -281,18 +250,12 @@ def test_key():
 @app.route("/status")
 def status():
     return jsonify({
-        "usdt": last_usdt,
-        "pepe": last_pepe,
-        "price": last_price,
-        "in_position": in_position,
-        "buy_price": buy_price,
-        "retCode": last_retcode,
-        "retMsg": last_retmsg,
-        "last_error": last_error,
-        "last_check": last_check,
-        "total_trades": total_trades,
-        "base_url": BASE_URL,
-        "symbol": SYMBOL,
+        "usdt": last_usdt, "pepe": last_pepe, "price": last_price,
+        "in_position": in_position, "buy_price": buy_price,
+        "retCode": last_retcode, "retMsg": last_retmsg,
+        "last_error": last_error, "last_check": last_check,
+        "total_trades": total_trades, "base_url": BASE_URL, "symbol": SYMBOL,
+        "working_account": working_account,
     })
 
 @app.route("/buy")
@@ -315,11 +278,6 @@ def sell_route():
     ok = sell_pepe(pepe, price, "handmatig via /sell")
     return jsonify({"ok": ok, "pepe": pepe, "price": price})
 
-@app.route("/orders")
-def orders_route():
-    return jsonify({"orders": get_open_orders()})
-
-# Start loop 1x
 if not hasattr(app, "started"):
     app.started = True
     threading.Thread(target=check_loop, daemon=True).start()
