@@ -13,7 +13,7 @@ API_KEY = os.getenv("BYBIT_API_KEY", "").strip()
 API_SECRET = os.getenv("BYBIT_API_SECRET", "").strip()
 BASE_URL = os.getenv("BASE_URL", "https://api.bybit.eu").strip().rstrip("/")
 CATEGORY = os.getenv("CATEGORY", "spot").strip()
-SYMBOL = os.getenv("SYMBOL", "PEPEUSDT").strip()
+SYMBOL = os.getenv("SYMBOL", "PEPEUSDC").strip()
 TRADE_USDT = float(os.getenv("TRADE_USDT", "10"))
 CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "60"))
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
@@ -125,7 +125,7 @@ def get_balances():
                 lst = d.get("result", {}).get("list", [])
                 if lst:
                     for c in lst[0].get("coin", []):
-                        if c["coin"] == "USDT":
+                        if c["coin"] in ("USDC", "USDT"):
                             usdt = float(c.get("walletBalance", 0))
                         if c["coin"] == "PEPE":
                             pepe = float(c.get("walletBalance", 0))
@@ -172,13 +172,13 @@ def buy_pepe(usdt_amount, price):
     qty = int(usdt_amount / price)
     if qty <= 0:
         return False
-    log(f"BUY {qty} {SYMBOL} voor {usdt_amount} USDT @ {price}")
+    log(f"BUY {qty} {SYMBOL} voor {usdt_amount} USDC @ {price}")
     res = api_post("/v5/order/create", {"category": CATEGORY, "symbol": SYMBOL, "side": "Buy", "orderType": "Market", "qty": str(qty)})
     if res.get("retCode") == 0:
         in_position = True
         buy_price = price
         total_trades += 1
-        telegram(f"✅ GEKOCHT: {qty} PEPE @ {price} ({usdt_amount} USDT)")
+        telegram(f"✅ GEKOCHT: {qty} PEPE @ {price} ({usdt_amount} USDC)")
         return True
     log(f"BUY FAIL {res}")
     telegram(f"❌ BUY mislukt: {res.get('retMsg')}")
@@ -216,7 +216,7 @@ def check_loop():
                 in_position = True
             elif pepe == 0:
                 in_position = False
-            last_check = f"USDT={usdt} PEPE={pepe} price={price} in_position={in_position} retCode={last_retcode} acc={acc}"
+            last_check = f"USDC={usdt} PEPE={pepe} price={price} in_position={in_position} retCode={last_retcode} acc={acc}"
             log(f"CHECK: {last_check}")
             if last_retcode == 10003:
                 log("SKIP: key niet geautoriseerd")
@@ -280,7 +280,7 @@ def buy_route():
     if last_retcode == 10003:
         return jsonify({"ok": False, "msg": "key niet geautoriseerd 10003", "retMsg": last_retmsg})
     if usdt < TRADE_USDT:
-        return jsonify({"ok": False, "msg": f"te weinig USDT {usdt}", "usdt": usdt})
+        return jsonify({"ok": False, "msg": f"te weinig USDC {usdt}", "usdt": usdt})
     ok = buy_pepe(TRADE_USDT, price)
     return jsonify({"ok": ok, "usdt": usdt, "price": price})
 
