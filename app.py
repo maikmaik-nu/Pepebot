@@ -9,7 +9,6 @@ from flask import Flask, jsonify
 
 app = Flask(__name__)
 
-# ===== CONFIG UIT RENDER =====
 API_KEY = os.getenv("BYBIT_API_KEY", "").strip()
 API_SECRET = os.getenv("BYBIT_API_SECRET", "").strip()
 BASE_URL = os.getenv("BASE_URL", "https://api.bybit.eu").strip().rstrip("/")
@@ -22,7 +21,6 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 TAKE_PROFIT_PCT = 10.0
 STOP_LOSS_PCT = 5.0
 
-# ===== STATE =====
 in_position = False
 buy_price = 0.0
 last_retcode = None
@@ -152,7 +150,15 @@ def get_price():
             timeout=10,
             headers={"User-Agent": "Mozilla/5.0"}
         ).json()
-        price = float(r["result"]["list"][0]["lastPrice"])
+        res = r.get("result", {})
+        if isinstance(res, list):
+            lst = res
+        else:
+            lst = res.get("list", [])
+        if not lst:
+            log(f"price leeg {r}")
+            return 0.0
+        price = float(lst[0].get("lastPrice", 0))
         last_price = price
         return price
     except Exception as e:
