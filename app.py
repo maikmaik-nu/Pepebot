@@ -44,7 +44,7 @@ def api_post(path, params):
         return {"retCode": -1, "retMsg": f"no-json {e} raw:{r.text[:200]}"}
 
 def get_balance():
-    res = api_get("/v5/account/wallet-balance", {"accountType": "UNIFIED"})
+    res = api_get("/v5/account/wallet-balance", {"accountType": "SPOT"})
     if res.get("retCode") == 0:
         usdt = 0.0
         pepe = 0.0
@@ -54,7 +54,7 @@ def get_balance():
                     usdt = float(c.get("walletBalance", 0) or 0)
                 if c.get("coin") == "PEPE":
                     pepe = float(c.get("walletBalance", 0) or 0)
-        return {"account": "UNIFIED", "usdt": usdt, "pepe": pepe, "retCode": 0}
+        return {"account": "SPOT", "usdt": usdt, "pepe": pepe, "retCode": 0}
     return {"account": "NONE", "usdt": 0.0, "pepe": 0.0, "retCode": res.get("retCode", -1), "retMsg": res.get("retMsg", "")}
 
 def get_price():
