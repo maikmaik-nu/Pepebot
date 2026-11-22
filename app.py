@@ -9,7 +9,7 @@ from flask import Flask, jsonify
 
 app = Flask(__name__)
 
-# ===== CONFIG UIT RENDER - NIET MEER AANPASSEN =====
+# ===== CONFIG UIT RENDER =====
 API_KEY = os.getenv("BYBIT_API_KEY", "").strip()
 API_SECRET = os.getenv("BYBIT_API_SECRET", "").strip()
 BASE_URL = os.getenv("BASE_URL", "https://api.bybit.eu").strip().rstrip("/")
@@ -32,8 +32,10 @@ last_pepe = 0.0
 last_price = 0.0
 last_error = ""
 last_check = ""
-working_account = "UNIFIED"  # wordt automatisch gevonden
+working_account = "UNIFIED"
 total_trades = 0
+
+HEADERS_BASE = {"User-Agent": "Mozilla/5.0"}
 
 def log(msg):
     print(f"INFO:pepebot:{msg}", flush=True)
@@ -45,12 +47,12 @@ def telegram(msg):
         requests.post(
             f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
             json={"chat_id": TELEGRAM_CHAT_ID, "text": msg},
-            timeout=10
+            timeout=10,
+            headers=HEADERS_BASE
         )
     except Exception as e:
         log(f"telegram error {e}")
 
-# ===== 【entity-BYBIT¦canonical_name=BYBIT】 V5 SIGN - DEZE IS GOED =====
 def api_get(path, params):
     global last_retcode, last_retmsg
     ts = str(int(time.time() * 1000))
@@ -62,6 +64,8 @@ def api_get(path, params):
         "X-BAPI-TIMESTAMP": ts,
         "X-BAPI-RECV-WINDOW": "5000",
         "X-BAPI-SIGN": sig,
+        "X-BAPI-SIGN-TYPE": "2",
+        "User-Agent": "Mozilla/5.0",
         "Content-Type": "application/json"
     }
     try:
@@ -70,7 +74,9 @@ def api_get(path, params):
         try:
             j = r.json()
         except:
-            return {}
+            last_retcode = r.status_code
+            last_retmsg = f"http {r.status_code} leeg"
+            return {"retCode": r.status_code, "retMsg": "http leeg"}
         last_retcode = j.get("retCode")
         last_retmsg = j.get("retMsg", "")
         return j
@@ -89,6 +95,8 @@ def api_post(path, body):
         "X-BAPI-TIMESTAMP": ts,
         "X-BAPI-RECV-WINDOW": "5000",
         "X-BAPI-SIGN": sig,
+        "X-BAPI-SIGN-TYPE": "2",
+        "User-Agent": "Mozilla/5.0",
         "Content-Type": "application/json"
     }
     try:
@@ -97,7 +105,9 @@ def api_post(path, body):
         try:
             j = r.json()
         except:
-            return {}
+            last_retcode = r.status_code
+            last_retmsg = f"http {r.status_code} leeg"
+            return {"retCode": r.status_code, "retMsg": "http leeg"}
         last_retcode = j.get("retCode")
         last_retmsg = j.get("retMsg", "")
         return j
@@ -105,13 +115,9 @@ def api_post(path, body):
         log(f"api post error {e}")
         return {"retCode": -1, "retMsg": str(e)}
 
-# ===== BALANCE - PROBEERT AUTOMATISCH UNIFIED EN SPOT =====
 def get_balances():
     global last_usdt, last_pepe, working_account
-    # 1. Probeer eerst de werkende accountType
-    for acc_try in [working_account, "UNIFIED", "SPOT", "CONTRACT"]:
-        if acc_try == working_account and acc_try != "UNIFIED":
-            pass
+    for acc_try in ["UNIFIED", "SPOT"]:
         d = api_get("/v5/account/wallet-balance", {"accountType": acc_try})
         if d.get("retCode") == 0:
             working_account = acc_try
@@ -130,10 +136,9 @@ def get_balances():
             last_usdt = usdt
             last_pepe = pepe
             return usdt, pepe, acc_try
-        # Als 10003 bij deze acc, probeer volgende - niet stoppen
-        if d.get("retCode") != 10003:
-            break
-    # Geen enkele werkte
+        if d.get("retCode") == 10003:
+            continue
+        break
     last_usdt = 0.0
     last_pepe = 0.0
     return 0.0, 0.0, "NONE"
@@ -141,7 +146,12 @@ def get_balances():
 def get_price():
     global last_price
     try:
-        r = requests.get(BASE_URL + "/v5/market/tickers", params={"category": CATEGORY, "symbol": SYMBOL}, timeout=10).json()
+        r = requests.get(
+            BASE_URL + "/v5/market/tickers",
+            params={"category": CATEGORY, "symbol": SYMBOL},
+            timeout=10,
+            headers={"User-Agent": "Mozilla/5.0"}
+        ).json()
         price = float(r["result"]["list"][0]["lastPrice"])
         last_price = price
         return price
@@ -149,7 +159,6 @@ def get_price():
         log(f"price error {e}")
         return 0.0
 
-# ===== TRADING =====
 def buy_pepe(usdt_amount, price):
     global in_position, buy_price, total_trades
     if price <= 0:
@@ -183,7 +192,6 @@ def sell_pepe(pepe_amount, price, reden=""):
     log(f"SELL FAIL {res}")
     return False
 
-# ===== LOOP =====
 def check_loop():
     global in_position, buy_price, last_error, last_check
     log(f"bot gestart BASE={BASE_URL} SYMBOL={SYMBOL} CATEGORY={CATEGORY} TRADE={TRADE_USDT}")
@@ -205,7 +213,7 @@ def check_loop():
             last_check = f"USDT={usdt} PEPE={pepe} price={price} in_position={in_position} retCode={last_retcode} acc={acc}"
             log(f"CHECK: {last_check}")
             if last_retcode == 10003:
-                log("SKIP: key niet geautoriseerd - check FINAL key in Render, geen code probleem")
+                log("SKIP: key niet geautoriseerd")
                 time.sleep(CHECK_INTERVAL)
                 continue
             if in_position and buy_price > 0 and price > 0 and pepe > 0:
@@ -220,7 +228,6 @@ def check_loop():
             log(f"CHECK error {e}")
         time.sleep(CHECK_INTERVAL)
 
-# ===== ROUTES =====
 @app.route("/")
 def home():
     return "Pepebot-3 live - /test-key /status /buy /sell"
