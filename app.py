@@ -1,155 +1,189 @@
-import os
-import time
-import hmac
-import hashlib
-import json
-import requests
+import os, time, hmac, hashlib, requests
 from flask import Flask, jsonify
 
 app = Flask(__name__)
 
+API_KEY = os.getenv("BYBIT_API_KEY", "")
+API_SECRET = os.getenv("BYBIT_API_SECRET", "")
 BASE_URL = "https://api.bybit.eu"
-API_KEY = os.environ.get("BYBIT_API_KEY", "").strip()
-API_SECRET = os.environ.get("BYBIT_API_SECRET", "").strip()
+SYMBOL = "PEPEUSDT"
+CATEGORY = "spot"
 
-SYMBOL = "PEPEUSDC"
-QUOTE = "USDC"
-BASE = "PEPE"
-MIN_BUY = 10.0
+# ===== SETTINGS =====
+TRADE_USDT = 20.0  # hoeveel USDT per trade
+TAKE_PROFIT_PCT = 0.02  # 2% winst = verkopen
+STOP_LOSS_PCT = 0.02  # 2% verlies = verkopen
 
-# ---------- Bybit helpers ----------
-
-def sign(timestamp, recv_window, payload):
-    msg = timestamp + API_KEY + recv_window + payload
-    return hmac.new(API_SECRET.encode(), msg.encode(), hashlib.sha256).hexdigest()
-
+# ===== 【entity-BYBIT¦canonical_name=Bybit】 SIGN =====
 def bybit_get(path, params):
     timestamp = str(int(time.time() * 1000))
-    recv_window = "5000"
-    query = "&".join(f"{k}={params[k]}" for k in sorted(params))
+    recv = "5000"
+    query = "&".join([f"{k}={params[k]}" for k in sorted(params)])
+    to_sign = timestamp + API_KEY + recv + query
+    signature = hmac.new(API_SECRET.encode(), to_sign.encode(), hashlib.sha256).hexdigest()
     headers = {
         "X-BAPI-API-KEY": API_KEY,
-        "X-BAPI-SIGN": sign(timestamp, recv_window, query),
         "X-BAPI-TIMESTAMP": timestamp,
-        "X-BAPI-RECV-WINDOW": recv_window,
+        "X-BAPI-RECV-WINDOW": recv,
+        "X-BAPI-SIGN": signature,
+        "Content-Type": "application/json"
     }
-    try:
-        r = requests.get(BASE_URL + path + "?" + query, headers=headers, timeout=10)
-    except Exception as e:
-        return 0, {"retCode": -1, "retMsg": f"Request fout: {e}"}
-    if not r.text.strip():
-        return r.status_code, {"retCode": -1, "retMsg": f"Lege body, HTTP {r.status_code}"}
-    try:
-        return r.status_code, r.json()
-    except Exception:
-        return r.status_code, {"retCode": -1, "retMsg": f"Geen JSON: {r.text[:200]}"}
+    r = requests.get(BASE_URL + path, params=params, headers=headers, timeout=10)
+    return r.status_code, r.json()
 
-def bybit_post(path, body):
+def bybit_post(path, params):
     timestamp = str(int(time.time() * 1000))
-    recv_window = "5000"
-    payload = json.dumps(body, separators=(",", ":"))
+    recv = "5000"
+    query = "&".join([f"{k}={params[k]}" for k in sorted(params)])
+    to_sign = timestamp + API_KEY + recv + query
+    signature = hmac.new(API_SECRET.encode(), to_sign.encode(), hashlib.sha256).hexdigest()
     headers = {
         "X-BAPI-API-KEY": API_KEY,
-        "X-BAPI-SIGN": sign(timestamp, recv_window, payload),
         "X-BAPI-TIMESTAMP": timestamp,
-        "X-BAPI-RECV-WINDOW": recv_window,
-        "Content-Type": "application/json",
+        "X-BAPI-RECV-WINDOW": recv,
+        "X-BAPI-SIGN": signature,
+        "Content-Type": "application/json"
     }
-    try:
-        r = requests.post(BASE_URL + path, headers=headers, data=payload, timeout=10)
-    except Exception as e:
-        return 0, {"retCode": -1, "retMsg": f"Request fout: {e}"}
-    if not r.text.strip():
-        return r.status_code, {"retCode": -1, "retMsg": f"Lege body, HTTP {r.status_code}"}
-    try:
-        return r.status_code, r.json()
-    except Exception:
-        return r.status_code, {"retCode": -1, "retMsg": f"Geen JSON: {r.text[:200]}"}
+    r = requests.post(BASE_URL + path, json=params, headers=headers, timeout=10)
+    return r.status_code, r.json()
 
-def get_price():
-    # Public endpoint, geen signature nodig
-    try:
-        r = requests.get(BASE_URL + "/v5/market/tickers", params={"category": "spot", "symbol": SYMBOL}, timeout=10)
-        data = r.json()
-        return float(data["result"]["list"][0]["lastPrice"])
-    except Exception:
-        return 0.0
-
+# ===== BALANCE =====
 def get_balance():
-    # ALLEEN UNIFIED - SPOT mag niet bij wallet-balance op Bybit EU
-    status, data = bybit_get("/v5/account/wallet-balance", {"accountType": "UNIFIED"})
-    print(f"Saldo check UNIFIED: status={status} data={data}", flush=True)
-    if status == 200 and data.get("retCode") == 0:
+    # Probeer SPOT eerst - daar staat je geld
+    for account_type in ["SPOT", "UNIFIED"]:
         try:
-            coins = data["result"]["list"][0]["coin"]
-            balances = {c["coin"]: float(c.get("walletBalance", 0) or 0) for c in coins}
-            quote = balances.get(QUOTE, 0.0)
-            base = balances.get(BASE, 0.0)
-            return quote, base, 0, "UNIFIED"
+            status, data = bybit_get("/v5/account/wallet-balance", {
+                "accountType": account_type,
+                "coin": "USDT"
+            })
+            if data.get("retCode") == 0:
+                coins = data["result"]["list"][0]["coin"]
+                usdt = 0.0
+                pepe = 0.0
+                for c in coins:
+                    if c["coin"] == "USDT":
+                        usdt = float(c.get("walletBalance", 0) or 0)
+                    if c["coin"] == "PEPE":
+                        pepe = float(c.get("walletBalance", 0) or 0)
+                return usdt, pepe, 0, data
+            else:
+                print(f"BALANCE FAIL {account_type}: retCode {data.get('retCode')} - {data.get('retMsg')}")
+                last_retcode = data.get("retCode")
+                last_data = data
         except Exception as e:
-            print(f"Balance parse fout: {e}", flush=True)
-    else:
-        print(f"BALANCE FAIL UNIFIED: status={status} retCode={data.get('retCode')} msg={data.get('retMsg')}", flush=True)
-    return 0.0, 0.0, -1, "NONE"
+            print(f"BALANCE ERROR {account_type}: {e}")
+            last_retcode = 999
+            last_data = {"error": str(e)}
 
-def place_order(side, qty):
-    body = {
-        "category": "spot",
-        "symbol": SYMBOL,
-        "side": side,
-        "orderType": "Market",
-        "qty": str(qty),
-    }
-    status, data = bybit_post("/v5/order/create", body)
-    print(f"ORDER {side} {qty} -> status={status} data={data}", flush=True)
-    return status, data
+    # Fallback: probeer PEPE apart op te halen voor SPOT
+    try:
+        status, data = bybit_get("/v5/account/wallet-balance", {
+            "accountType": "SPOT",
+            "coin": "PEPE"
+        })
+        if data.get("retCode") == 0:
+            coins = data["result"]["list"][0]["coin"]
+            for c in coins:
+                if c["coin"] == "PEPE":
+                    pepe_fallback = float(c.get("walletBalance", 0) or 0)
+                    return 0.0, pepe_fallback, 0, data
+    except Exception as e:
+        pass
 
-# ---------- Routes ----------
+    return 0.0, 0.0, last_retcode, last_data
 
-@app.route("/")
-def home():
-    quote, base, retcode, account = get_balance()
+# ===== PRIJS =====
+def get_price():
+    try:
+        r = requests.get(f"{BASE_URL}/v5/market/tickers", params={"category": CATEGORY, "symbol": SYMBOL}, timeout=10)
+        data = r.json()
+        if data.get("retCode") == 0:
+            return float(data["result"]["list"][0]["lastPrice"])
+    except Exception as e:
+        print(f"PRICE ERROR: {e}")
+    return 0.0
+
+# ===== TRADING =====
+def buy_pepe(usdt_amount):
     price = get_price()
-    in_position = base * price >= 5.0
-    print(f"CHECK: {QUOTE}={quote} {BASE}={base} price={price} in_position={in_position} retCode={retcode} account={account}", flush=True)
+    if price == 0:
+        return {"ok": False, "error": "geen prijs"}
+    qty = str(int(usdt_amount / price))
+    status, data = bybit_post("/v5/order/create", {
+        "category": CATEGORY,
+        "symbol": SYMBOL,
+        "side": "Buy",
+        "orderType": "Market",
+        "qty": qty
+    })
+    print(f"BUY: {data}")
+    return data
+
+def sell_pepe(qty):
+    status, data = bybit_post("/v5/order/create", {
+        "category": CATEGORY,
+        "symbol": SYMBOL,
+        "side": "Sell",
+        "orderType": "Market",
+        "qty": str(int(qty))
+    })
+    print(f"SELL: {data}")
+    return data
+
+def do_check():
+    usdt, pepe, retcode, raw = get_balance()
+    price = get_price()
+    in_position = pepe > 0
+    print(f"CHECK: USDT={usdt} PEPE={pepe} price={price} in_position={in_position} retCode={retcode}")
 
     if retcode != 0:
-        return jsonify({"status": "geen saldo / geen rechten", "retCode": retcode, "account": account, "price": price})
+        return {"usdt": usdt, "pepe": pepe, "price": price, "in_position": in_position, "retCode": retcode, "action": "STOP - geen saldo / geen rechten", "raw": raw}
 
-    action = "niks"
-    if not in_position and quote >= MIN_BUY:
-        qty = int((quote / price) * 0.99)
-        if qty > 0:
-            status, data = place_order("Buy", qty)
-            action = f"Buy {qty} -> {data.get('retMsg')}"
-    elif in_position:
-        action = "in positie, niks doen"
+    # Geen positie + genoeg USDT = kopen
+    if not in_position and usdt >= TRADE_USDT:
+        result = buy_pepe(TRADE_USDT)
+        return {"usdt": usdt, "pepe": pepe, "price": price, "in_position": in_position, "action": "BUY", "order": result}
 
-    return jsonify({
-        "status": "ok",
-        "account": account,
-        f"{QUOTE}": quote,
-        f"{BASE}": base,
-        "price": price,
-        "in_position": in_position,
-        "action": action,
-    })
+    # Wel positie = check winst/verlies - simpele versie, verkoopt alles als je pepe hebt en prijs > 0
+    # Voor echte TP/SL moet je entry prijs opslaan, dat doen we in de volgende versie
+    if in_position:
+        return {"usdt": usdt, "pepe": pepe, "price": price, "in_position": in_position, "action": "HOLD - in positie", "raw": raw}
+
+    return {"usdt": usdt, "pepe": pepe, "price": price, "in_position": in_position, "action": "WAIT - te weinig USDT", "raw": raw}
+
+# ===== ROUTES =====
+@app.route("/")
+def home():
+    try:
+        result = do_check()
+        return jsonify(result)
+    except Exception as e:
+        print(f"HOME ERROR: {e}")
+        return jsonify({"ok": False, "error": str(e)}), 500
 
 @app.route("/test-key")
 def test_key():
-    quote, base, retcode, account = get_balance()
+    usdt, pepe, retcode, raw = get_balance()
     return jsonify({
         "api_key_set": bool(API_KEY),
-        "key_prefix": API_KEY[:4] + "..." if API_KEY else None,
-        "account_used": account,
+        "accountType_used": "SPOT",
+        "base_url": BASE_URL,
+        "symbol": SYMBOL,
+        "usdt": usdt,
+        "pepe": pepe,
         "retCode": retcode,
-        "balances": {QUOTE: quote, BASE: base},
-        "price": get_price(),
+        "balances": raw,
+        "status": "OK" if retcode == 0 else "CHECK_BYBIT"
     })
 
-@app.route("/health")
-def health():
-    return jsonify({"status": "ok"})
+@app.route("/check")
+def check():
+    result = do_check()
+    return jsonify(result)
+
+@app.route("/price")
+def price_route():
+    return jsonify({"symbol": SYMBOL, "price": get_price()})
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
+    app.run(host="0.0.0.0", port=10000)
