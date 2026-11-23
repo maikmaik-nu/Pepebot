@@ -6,15 +6,15 @@ app = Flask(__name__)
 API_KEY = os.getenv("BYBIT_API_KEY", "")
 API_SECRET = os.getenv("BYBIT_API_SECRET", "")
 BASE_URL = "https://api.bybit.eu"
-SYMBOL = "PEPEUSDT"
+SYMBOL = "PEPEUSDC"  # <-- WAS PEPEUSDT
 CATEGORY = "spot"
 
 # ===== SETTINGS =====
-TRADE_USDT = 20.0  # hoeveel USDT per trade
-TAKE_PROFIT_PCT = 0.02  # 2% winst = verkopen
-STOP_LOSS_PCT = 0.02  # 2% verlies = verkopen
+TRADE_USDC = 20.0  # hoeveel USDC per trade
+TAKE_PROFIT_PCT = 0.02
+STOP_LOSS_PCT = 0.02
 
-# ===== 【entity-BYBIT¦canonical_name=Bybit】 SIGN =====
+# ===== 【entity-BYBIT¦canonical_name=BYBIT】 SIGN =====
 def bybit_get(path, params):
     timestamp = str(int(time.time() * 1000))
     recv = "5000"
@@ -31,7 +31,7 @@ def bybit_get(path, params):
     r = requests.get(BASE_URL + path, params=params, headers=headers, timeout=10)
     return r.status_code, r.json()
 
-def bybit_post(path, params):
+def 【entity-bybit_post¦canonical_name=BYBIT】(path, params):
     timestamp = str(int(time.time() * 1000))
     recv = "5000"
     query = "&".join([f"{k}={params[k]}" for k in sorted(params)])
@@ -47,48 +47,33 @@ def bybit_post(path, params):
     r = requests.post(BASE_URL + path, json=params, headers=headers, timeout=10)
     return r.status_code, r.json()
 
-# ===== BALANCE =====
+# ===== BALANCE - NU USDC =====
 def get_balance():
-    # Probeer SPOT eerst - daar staat je geld
-    for account_type in ["SPOT", "UNIFIED"]:
-        try:
-            status, data = bybit_get("/v5/account/wallet-balance", {
-                "accountType": account_type,
-                "coin": "USDT"
-            })
-            if data.get("retCode") == 0:
-                coins = data["result"]["list"][0]["coin"]
-                usdt = 0.0
-                pepe = 0.0
-                for c in coins:
-                    if c["coin"] == "USDT":
-                        usdt = float(c.get("walletBalance", 0) or 0)
-                    if c["coin"] == "PEPE":
-                        pepe = float(c.get("walletBalance", 0) or 0)
-                return usdt, pepe, 0, data
-            else:
-                print(f"BALANCE FAIL {account_type}: retCode {data.get('retCode')} - {data.get('retMsg')}")
-                last_retcode = data.get("retCode")
-                last_data = data
-        except Exception as e:
-            print(f"BALANCE ERROR {account_type}: {e}")
-            last_retcode = 999
-            last_data = {"error": str(e)}
-
-    # Fallback: probeer PEPE apart op te halen voor SPOT
+    last_retcode = 999
+    last_data = {}
     try:
+        # In 1 keer USDC + PEPE opvragen
         status, data = bybit_get("/v5/account/wallet-balance", {
             "accountType": "SPOT",
-            "coin": "PEPE"
+            "coin": "USDC,PEPE"
         })
         if data.get("retCode") == 0:
             coins = data["result"]["list"][0]["coin"]
+            usdc = 0.0
+            pepe = 0.0
             for c in coins:
+                if c["coin"] == "USDC":
+                    usdc = float(c.get("walletBalance", 0) or 0)
                 if c["coin"] == "PEPE":
-                    pepe_fallback = float(c.get("walletBalance", 0) or 0)
-                    return 0.0, pepe_fallback, 0, data
+                    pepe = float(c.get("walletBalance", 0) or 0)
+            return usdc, pepe, 0, data
+        else:
+            print(f"BALANCE FAIL SPOT: retCode {data.get('retCode')} - {data.get('retMsg')}")
+            last_retcode = data.get("retCode")
+            last_data = data
     except Exception as e:
-        pass
+        print(f"BALANCE ERROR: {e}")
+        last_data = {"error": str(e)}
 
     return 0.0, 0.0, last_retcode, last_data
 
@@ -104,12 +89,12 @@ def get_price():
     return 0.0
 
 # ===== TRADING =====
-def buy_pepe(usdt_amount):
+def buy_pepe(usdc_amount):
     price = get_price()
     if price == 0:
         return {"ok": False, "error": "geen prijs"}
-    qty = str(int(usdt_amount / price))
-    status, data = bybit_post("/v5/order/create", {
+    qty = str(int(usdc_amount / price))
+    status, data = 【entity-bybit_post¦canonical_name=BYBIT】("/v5/order/create", {
         "category": CATEGORY,
         "symbol": SYMBOL,
         "side": "Buy",
@@ -120,7 +105,7 @@ def buy_pepe(usdt_amount):
     return data
 
 def sell_pepe(qty):
-    status, data = bybit_post("/v5/order/create", {
+    status, data = 【entity-bybit_post¦canonical_name=BYBIT】("/v5/order/create", {
         "category": CATEGORY,
         "symbol": SYMBOL,
         "side": "Sell",
@@ -131,25 +116,22 @@ def sell_pepe(qty):
     return data
 
 def do_check():
-    usdt, pepe, retcode, raw = get_balance()
+    usdc, pepe, retcode, raw = get_balance()
     price = get_price()
     in_position = pepe > 0
-    print(f"CHECK: USDT={usdt} PEPE={pepe} price={price} in_position={in_position} retCode={retcode}")
+    print(f"CHECK: USDC={usdc} PEPE={pepe} price={price} in_position={in_position} retCode={retcode}")
 
     if retcode != 0:
-        return {"usdt": usdt, "pepe": pepe, "price": price, "in_position": in_position, "retCode": retcode, "action": "STOP - geen saldo / geen rechten", "raw": raw}
+        return {"usdc": usdc, "pepe": pepe, "price": price, "in_position": in_position, "retCode": retcode, "action": "STOP - geen saldo / geen rechten", "raw": raw}
 
-    # Geen positie + genoeg USDT = kopen
-    if not in_position and usdt >= TRADE_USDT:
-        result = buy_pepe(TRADE_USDT)
-        return {"usdt": usdt, "pepe": pepe, "price": price, "in_position": in_position, "action": "BUY", "order": result}
+    if not in_position and usdc >= TRADE_USDC:
+        result = buy_pepe(TRADE_USDC)
+        return {"usdc": usdc, "pepe": pepe, "price": price, "in_position": in_position, "action": "BUY", "order": result}
 
-    # Wel positie = check winst/verlies - simpele versie, verkoopt alles als je pepe hebt en prijs > 0
-    # Voor echte TP/SL moet je entry prijs opslaan, dat doen we in de volgende versie
     if in_position:
-        return {"usdt": usdt, "pepe": pepe, "price": price, "in_position": in_position, "action": "HOLD - in positie", "raw": raw}
+        return {"usdc": usdc, "pepe": pepe, "price": price, "in_position": in_position, "action": "HOLD - in positie", "raw": raw}
 
-    return {"usdt": usdt, "pepe": pepe, "price": price, "in_position": in_position, "action": "WAIT - te weinig USDT", "raw": raw}
+    return {"usdc": usdc, "pepe": pepe, "price": price, "in_position": in_position, "action": "WAIT - te weinig USDC", "raw": raw}
 
 # ===== ROUTES =====
 @app.route("/")
@@ -163,13 +145,13 @@ def home():
 
 @app.route("/test-key")
 def test_key():
-    usdt, pepe, retcode, raw = get_balance()
+    usdc, pepe, retcode, raw = get_balance()
     return jsonify({
         "api_key_set": bool(API_KEY),
         "accountType_used": "SPOT",
         "base_url": BASE_URL,
         "symbol": SYMBOL,
-        "usdt": usdt,
+        "usdc": usdc,
         "pepe": pepe,
         "retCode": retcode,
         "balances": raw,
