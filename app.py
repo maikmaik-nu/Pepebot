@@ -1,5 +1,6 @@
 import os
 import time
+import json
 import hmac
 import hashlib
 import threading
@@ -13,7 +14,6 @@ BASE_URL = "https://api.bybit.eu"
 CATEGORY = "spot"
 SYMBOL = "PEPEUSDC"
 BASE = "USDC"
-QUOTE = "PEPE"
 
 API_KEY = os.environ.get("BYBIT_API_KEY", "")
 API_SECRET = os.environ.get("BYBIT_API_SECRET", "")
@@ -52,33 +52,37 @@ def bybit_get(path, params):
     j = r.json()
     return j.get("retCode"), j.get("result") or {}
 
-def bybit_post(path, params):
+def bybit_post(path, body_dict):
     ts = str(int(time.time() * 1000))
-    body = "&".join(f"{k}={v}" for k, v in params.items())
-    sign_str = ts + API_KEY + "5000" + body
+    payload = json.dumps(body_dict)
+    sign_str = ts + API_KEY + "5000" + payload
     sign = hmac.new(API_SECRET.encode(), sign_str.encode(), hashlib.sha256).hexdigest()
     headers = {
         "X-BAPI-API-KEY": API_KEY,
         "X-BAPI-SIGN": sign,
         "X-BAPI-TIMESTAMP": ts,
         "X-BAPI-RECV-WINDOW": "5000",
-        "Content-Type": "application/x-www-form-urlencoded",
+        "Content-Type": "application/json",
     }
-    r = requests.post(BASE_URL + path, data=params, headers=headers, timeout=10)
+    r = requests.post(BASE_URL + path, data=payload, headers=headers, timeout=10)
     return r.json()
 
 def get_balance():
     usdc = 0.0
     pepe = 0.0
-    for acct in ["UNIFIED", "SPOT", "FUNDING"]:
+    for acct in ["UNIFIED", "SPOT", "FUND"]:
         try:
-            _, data = bybit_get("/v5/account/wallet-balance", {"accountType": acct, "coin": "USDC,PEPE"})
+            ret, data = bybit_get("/v5/account/wallet-balance", {"accountType": acct, "coin": "USDC,PEPE"})
+            if ret != 0:
+                continue
             for acc in (data.get("list") or []):
                 for c in (acc.get("coin") or []):
                     if c.get("coin") == "USDC":
-                        usdc += float(c.get("walletBalance") or 0)
+                        usdc = max(usdc, float(c.get("walletBalance") or 0))
                     if c.get("coin") == "PEPE":
-                        pepe += float(c.get("walletBalance") or 0)
+                        pepe = max(pepe, float(c.get("walletBalance") or 0))
+            if usdc > 0 or pepe > 0:
+                break
         except Exception:
             pass
     return usdc, pepe
@@ -113,39 +117,9 @@ def bot_loop():
             state["prijs"] = prijs
             state["in_position"] = pepe > 0 and prijs > 0
 
-            # Simpele regel: heb je geen PEPE en heb je USDC? Koop voor TRADE_AMOUNT_USDC
-            # Heb je wel PEPE? Dan nu niks doen (verkopen doe je later handmatig / met eigen regel)
             if not state["in_position"] and usdc >= TRADE_AMOUNT_USDC and prijs > 0:
                 qty = int(TRADE_AMOUNT_USDC / prijs)
                 if qty > 0:
                     res = plaats_order("Buy", qty)
                     state["last"] = f"BUY {qty} -> {res}"
-                    send_telegram(f"BUY {qty} PEPE voor {TRADE_AMOUNT_USDC} USDC\n{res}")
-                else:
-                    state["last"] = "te weinig voor 1 order"
-            else:
-                state["last"] = "check ok, niks gedaan"
-        except Exception as e:
-            state["last"] = f"fout: {e}"
-        time.sleep(CHECK_EVERY_SEC)
-
-@app.route("/")
-def home():
-    return jsonify({"status": "live", "symbol": SYMBOL, **state})
-
-@app.route("/test-key")
-def test_key():
-    usdc, pepe = get_balance()
-    prijs = get_prijs()
-    return jsonify({
-        "api_key_set": bool(API_KEY),
-        "base": BASE,
-        "pepe": pepe,
-        "prijs": prijs,
-        "usdc": usdc,
-    })
-
-threading.Thread(target=bot_loop, daemon=True).start()
-
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=10000)
+                    send_telegram(f
