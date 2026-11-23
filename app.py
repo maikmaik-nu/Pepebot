@@ -1,112 +1,120 @@
-import os, time, hmac, hashlib, requests, threading
+import os
+import time
+import hmac
+import hashlib
+import requests
 from flask import Flask, jsonify
 
 app = Flask(__name__)
 
-API_KEY = os.getenv("BYBIT_API_KEY", "")
-API_SECRET = os.getenv("BYBIT_API_SECRET", "")
+API_KEY = os.environ.get("BYBIT_API_KEY", "")
+API_SECRET = os.environ.get("BYBIT_API_SECRET", "")
 BASE_URL = "https://api.bybit.eu"
 SYMBOL = "PEPEUSDT"
 CATEGORY = "spot"
-TIMEFRAME = "15"
-USE_USDT = 95  # hou over voor fees, niet je hele 100.11
-DRY_RUN = True  # zet op False als je echt wil traden
+QTY = "100000"
 
-# ---------- 【entity-Bybit¦canonical_name=Bybit】 sign ----------
-def sign(params):
-    timestamp = str(int(time.time() * 1000))
-    recv = "5000"
-    query = "&".join([f"{k}={params[k]}" for k in sorted(params)])
-    to_sign = timestamp + API_KEY + recv + query
-    signature = hmac.new(API_SECRET.encode(), to_sign.encode(), hashlib.sha256).hexdigest()
+def make_sign(ts, recv, query):
+    msg = ts + API_KEY + recv + query
+    return hmac.new(API_SECRET.encode(), msg.encode(), hashlib.sha256).hexdigest()
+
+def get_headers(ts, recv, sign):
     return {
         "X-BAPI-API-KEY": API_KEY,
-        "X-BAPI-TIMESTAMP": timestamp,
+        "X-BAPI-TIMESTAMP": ts,
         "X-BAPI-RECV-WINDOW": recv,
-        "X-BAPI-SIGN": signature,
+        "X-BAPI-SIGN": sign,
         "Content-Type": "application/json"
     }
 
 def get_balance():
-    params = {"accountType": "SPOT", "coin": "USDT"}
-    r = requests.get(f"{BASE_URL}/v5/account/wallet-balance", params=params, headers=sign(params), timeout=10)
-    data = r.json()
-    if data.get("retCode") != 0:
-        return 0.0, 0.0, data
-    coins = data["result"]["list"][0]["coin"]
-    usdt = pepe = 0.0
-    for c in coins:
-        if c["coin"] == "USDT":
-            usdt = float(c["walletBalance"])
-        if c["coin"] == "PEPE":
-            pepe = float(c["walletBalance"])
-    return usdt, pepe, data
+    try:
+        ts = str(int(time.time() * 1000))
+        recv = "5000"
+        query = "accountType=SPOT&coin=USDT"
+        sign = make_sign(ts, recv, query)
+        headers = get_headers(ts, recv, sign)
+        url = BASE_URL + "/v5/account/wallet-balance?" + query
+        r = requests.get(url, headers=headers, timeout=10)
+        data = r.json()
+        lists = data.get("result", {}).get("list", [])
+        if len(lists) == 0:
+            return 0.0, data
+        coins = lists[0].get("coin", [])
+        for c in coins:
+            if c.get("coin") == "USDT":
+                return float(c.get("walletBalance", 0)), data
+        return 0.0, data
+    except Exception as e:
+        return 0.0, {"error": str(e)}
 
 def get_price():
-    params = {"category": CATEGORY, "symbol": SYMBOL}
-    r = requests.get(f"{BASE_URL}/v5/market/tickers", params=params, timeout=10)
-    data = r.json()
-    return float(data["result"]["list"][0]["lastPrice"])
+    try:
+        url = BASE_URL + "/v5/market/tickers?category=spot&symbol=" + SYMBOL
+        r = requests.get(url, timeout=10)
+        data = r.json()
+        lst = data.get("result", {}).get("list", [])
+        if len(lst) == 0:
+            return 0.0
+        return float(lst[0].get("lastPrice", 0))
+    except Exception:
+        return 0.0
 
-def get_klines():
-    params = {"category": CATEGORY, "symbol": SYMBOL, "interval": TIMEFRAME, "limit": 200}
-    r = requests.get(f"{BASE_URL}/v5/market/kline", params=params, timeout=10)
-    data = r.json()
-    # [start, open, high, low, close, volume, turnover]
-    closes = [float(x[4]) for x in reversed(data["result"]["list"])]
-    highs = [float(x[2]) for x in reversed(data["result"]["list"])]
-    lows = [float(x[3]) for x in reversed(data["result"]["list"])]
-    return closes, highs, lows
+def do_buy():
+    try:
+        ts = str(int(time.time() * 1000))
+        recv = "5000"
+        body = {
+            "category": "spot",
+            "symbol": SYMBOL,
+            "side": "Buy",
+            "orderType": "Market",
+            "qty": QTY
+        }
+        import json
+        body_str = json.dumps(body)
+        sign = make_sign(ts, recv, body_str)
+        headers = get_headers(ts, recv, sign)
+        url = BASE_URL + "/v5/order/create"
+        r = requests.post(url, headers=headers, data=body_str, timeout=10)
+        return r.json()
+    except Exception as e:
+        return {"error": str(e)}
 
-# ---------- Supertrend 10,3 + UT Bot 4,14 ----------
-def supertrend(closes, highs, lows, period=10, mult=3):
-    trs = []
-    for i in range(1, len(closes)):
-        trs.append(max(highs[i]-lows[i], abs(highs[i]-closes[i-1]), abs(lows[i]-closes[i-1])))
-    atr = sum(trs[-period:]) / period
-    hl2 = (highs[-1] + lows[-1]) / 2
-    upper = hl2 + mult * atr
-    lower = hl2 - mult * atr
-    return "green" if closes[-1] > lower else "red"
+@app.route("/")
+def home():
+    return "Pepebot-3 draait"
 
-def ut_bot(closes, period=4, mult=14):
-    trs = []
-    for i in range(1, len(closes)):
-        trs.append(abs(closes[i]-closes[i-1]))
-    atr = sum(trs[-period:]) / period if trs else 0
-    if len(closes) < 2:
-        return "sell"
-    return "buy" if closes[-1] > closes[-2] else "sell"
+@app.route("/test-key")
+def test_key():
+    bal, raw = get_balance()
+    price = get_price()
+    return jsonify({
+        "api_key_set": bool(API_KEY),
+        "base_url": BASE_URL,
+        "category_used": CATEGORY,
+        "symbol": SYMBOL,
+        "usdt_balance": bal,
+        "pepe_price": price,
+        "raw": raw
+    })
 
-def check_signal():
-    closes, highs, lows = get_klines()
-    st = supertrend(closes, highs, lows, 10, 3)
-    ut = ut_bot(closes, 4, 14)
-    buy = (st == "green" and ut == "buy")
-    sell = (st == "red")
-    return buy, sell, st, ut, closes[-1]
+@app.route("/check")
+def check():
+    bal, raw = get_balance()
+    price = get_price()
+    if bal > 5:
+        return jsonify({"status": "WOULD BUY", "balance": bal, "price": price})
+    return jsonify({"status": "NOT ENOUGH", "balance": bal, "price": price})
 
-# ---------- Order ----------
-def place_order(side, qty):
-    if DRY_RUN:
-        print(f"DRY RUN {side} {qty} PEPE")
-        return {"dry_run": True, "side": side, "qty": qty}
-    params = {"category": CATEGORY, "symbol": SYMBOL, "side": side, "orderType": "Market", "qty": str(qty)}
-    r = requests.post(f"{BASE_URL}/v5/order/create", json=params, headers=sign(params), timeout=10)
-    return r.json()
+@app.route("/buy")
+def buy():
+    bal, raw = get_balance()
+    if bal < 5:
+        return jsonify({"status": "NOT ENOUGH", "balance": bal})
+    result = do_buy()
+    return jsonify({"status": "BUY SENT", "balance": bal, "result": result})
 
-# ---------- Auto loop ----------
-in_position = False
-
-def auto_check():
-    global in_position
-    while True:
-        try:
-            usdt, pepe, raw_bal = get_balance()
-            price = get_price()
-            buy, sell, st, ut, close = check_signal()
-            print(f"AUTO CHECK: USDT={usdt} PEPE={pepe} PRICE={price} ST={st} UT={ut} BUY={buy} SELL={sell}")
-
-            if buy and not in_position:
-                qty = USE_USDT / price
-                print(f"WOULD BUY
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host="0.0.0.0", port=port)
