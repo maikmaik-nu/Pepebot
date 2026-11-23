@@ -16,11 +16,13 @@ def sign_get(params):
     return {
         "X-BAPI-API-KEY": API_KEY, "X-BAPI-SIGN": sig,
         "X-BAPI-TIMESTAMP": ts, "X-BAPI-RECV-WINDOW": recv,
+        "X-BAPI-SIGN-TYPE": "2",
         "Content-Type": "application/json"
     }
 
-def bybit_get(path, params):
-    r = requests.get(BASE_URL + path, params=params, headers=sign_get(params), timeout=15)
+def bybit_get(path, params, private=True):
+    headers = sign_get(params) if private else {}
+    r = requests.get(BASE_URL + path, params=params, headers=headers, timeout=15)
     return r.json()
 
 def bybit_post(path, params):
@@ -31,27 +33,26 @@ def bybit_post(path, params):
     headers = {
         "X-BAPI-API-KEY": API_KEY, "X-BAPI-SIGN": sig,
         "X-BAPI-TIMESTAMP": ts, "X-BAPI-RECV-WINDOW": recv,
+        "X-BAPI-SIGN-TYPE": "2",
         "Content-Type": "application/json"
     }
     r = requests.post(BASE_URL + path, data=payload, headers=headers, timeout=15)
     return r.json()
 
 def get_balances():
-    for acct in ["UNIFIED", "SPOT"]:
-        d = bybit_get("/v5/account/wallet-balance", {"accountType": acct})
-        if d.get("retCode") == 0:
-            lst = d.get("result", {}).get("list", [])
-            if lst:
-                out = {c["coin"]: float(c.get("walletBalance", 0)) for c in lst[0].get("coin", [])}
-                return out, acct, d
-        print(f"Saldo {acct}: {d.get('retCode')} {d.get('retMsg')}", flush=True)
+    d = bybit_get("/v5/account/wallet-balance", {"accountType": "UNIFIED"}, private=True)
+    if d.get("retCode") == 0:
+        lst = d.get("result", {}).get("list", [])
+        if lst:
+            out = {c["coin"]: float(c.get("walletBalance", 0)) for c in lst[0].get("coin", [])}
+            return out, "UNIFIED", d
+    print(f"Saldo UNIFIED: {d.get('retCode')} {d.get('retMsg')}", flush=True)
     return {}, "GEEN", {}
 
 def find_symbol():
-    # Check welk PEPE-paar echt bestaat op Bybit EU
     for sym in ["PEPEUSDC", "PEPEUSDT"]:
         try:
-            d = bybit_get("/v5/market/instruments-info", {"category": CATEGORY, "symbol": sym})
+            d = bybit_get("/v5/market/instruments-info", {"category": CATEGORY, "symbol": sym}, private=False)
             if d.get("retCode") == 0 and d.get("result", {}).get("list"):
                 info = d["result"]["list"][0]
                 qty_step = float(info["lotSizeFilter"]["qtyStep"])
@@ -61,7 +62,7 @@ def find_symbol():
     return None, 1
 
 def get_price(sym):
-    d = bybit_get("/v5/market/tickers", {"category": CATEGORY, "symbol": sym})
+    d = bybit_get("/v5/market/tickers", {"category": CATEGORY, "symbol": sym}, private=False)
     return float(d["result"]["list"][0]["lastPrice"])
 
 def bot_loop():
@@ -79,7 +80,6 @@ def bot_loop():
                 continue
             prijs = get_price(sym)
             print(f"ACC:{worked} SYM:{sym} Prijs:{prijs} USDC:{usdc} USDT:{usdt} PEPE:{pepe}", flush=True)
-            # Bepaal waarmee we kunnen kopen
             if sym == "PEPEUSDC" and usdc >= 10 and pepe == 0:
                 qty = int((10 / prijs) / qty_step) * qty_step
                 print(f"LIVE KOOP {qty} PEPE voor 10 USDC op {sym}", flush=True)
