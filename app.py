@@ -20,6 +20,7 @@ INTERVAL = "15"
 
 CHECK_RUNNING = False
 LAST_MSG = 0
+LAST_ACTION = "nog niks gedaan"
 
 # ---------- CHAT MELDING, MAX 1x PER UUR ----------
 def send_msg(text):
@@ -45,7 +46,7 @@ def sign(params, timestamp):
     to_sign = str(timestamp) + API_KEY + "5000" + qs
     return hmac.new(API_SECRET.encode(), to_sign.encode(), hashlib.sha256).hexdigest()
 
-# ---------- SALDO, OUDE WERKENDE MANIER ----------
+# ---------- SALDO ----------
 def get_balance():
     try:
         ts = int(time.time() * 1000)
@@ -92,7 +93,7 @@ def get_klines():
         print("Kline fout:", e)
         return [], [], []
 
-# ---------- UT BOT, EXACT ZOALS OP GRAFIEK ----------
+# ---------- UT BOT ----------
 def ut_bot_exact(closes, highs, lows, factor=4.0, period=14):
     n = len(closes)
     if n < period + 5:
@@ -127,7 +128,7 @@ def ut_bot_exact(closes, highs, lows, factor=4.0, period=14):
     ut_up = pos[-1] == 1
     return ut_up, trailing[-1]
 
-# ---------- SUPERTREND, EXACT 10 / 3 ----------
+# ---------- SUPERTREND 10 / 3 ----------
 def supertrend_exact(closes, highs, lows, period=10, mult=3.0):
     n = len(closes)
     if n < period + 5:
@@ -157,4 +158,58 @@ def supertrend_exact(closes, highs, lows, period=10, mult=3.0):
             final_lower[i] = final_lower[i-1]
         if trend[i-1] == 1 and closes[i] < final_lower[i]:
             trend[i] = -1
-        elif trend[i-1] == -
+        elif trend[i-1] == -1 and closes[i] > final_upper[i]:
+            trend[i] = 1
+        else:
+            trend[i] = trend[i-1]
+    return trend[-1] == 1
+
+# ---------- CHECK ----------
+def do_check():
+    global LAST_ACTION
+    closes, highs, lows = get_klines()
+    if not closes:
+        LAST_ACTION = "geen candles"
+        return {"status": "geen candles"}
+    ut_up, trail = ut_bot_exact(closes, highs, lows)
+    st_up = supertrend_exact(closes, highs, lows)
+    usdt, pepe = get_balance()
+    price = closes[-1]
+    print(f"Check: prijs={price} UT_up={ut_up} ST_up={st_up} USDT={usdt} PEPE={pepe}", flush=True)
+    if ut_up and st_up:
+        LAST_ACTION = f"BEIDE GROEN - prijs {price} - UT {trail}"
+        send_msg(f"UUR UPDATE: BEIDE GROEN\nPEPE: {price}\nUSDT: {usdt} PEPE: {pepe}")
+    else:
+        LAST_ACTION = f"NIET BEIDE GROEN - UT={ut_up} ST={st_up} prijs {price}"
+    return {"price": price, "ut_up": ut_up, "st_up": st_up, "usdt": usdt, "pepe": pepe, "action": LAST_ACTION}
+
+def loop():
+    global CHECK_RUNNING
+    if CHECK_RUNNING:
+        return
+    CHECK_RUNNING = True
+    while True:
+        try:
+            do_check()
+        except Exception as e:
+            print("Loop fout:", e, flush=True)
+        time.sleep(900)
+
+# ---------- ROUTES ----------
+@app.route("/")
+def home():
+    return jsonify({"status": "online", "symbol": SYMBOL, "last_action": LAST_ACTION})
+
+@app.route("/check")
+def check_now():
+    return jsonify(do_check())
+
+@app.route("/status")
+def status():
+    usdt, pepe = get_balance()
+    return jsonify({"usdt": usdt, "pepe": pepe, "last_action": LAST_ACTION})
+
+if __name__ == "__main__":
+    threading.Thread(target=loop, daemon=True).start()
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host="0.0.0.0", port=port)
