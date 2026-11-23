@@ -21,10 +21,10 @@ TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
 # --- TRADE INSTELLINGEN ---
-TRADE_AMOUNT_USDC = 20.0      # hoeveel USDC per trade
-TAKE_PROFIT_PCT = 3.0         # verkoop bij +3%
-STOP_LOSS_PCT = -2.0          # verkoop bij -2%
-CHECK_EVERY_SEC = 60          # elke 60 sec checken
+TRADE_AMOUNT_USDC = 20.0
+TAKE_PROFIT_PCT = 3.0
+STOP_LOSS_PCT = -2.0
+CHECK_EVERY_SEC = 60
 MIN_USDC_TO_TRADE = 10.0
 
 bot_status = {
@@ -49,7 +49,7 @@ def send_telegram(msg):
     except Exception as e:
         print(f"Telegram fout: {e}")
 
-# ================= 【entity-BYBIT¦canonical_name=Bybit】 =================
+# ================= 【entity-BYBIT¦canonical_name=BYBIT】 =================
 def _sign(params):
     timestamp = str(int(time.time() * 1000))
     params["api_key"] = API_KEY
@@ -76,17 +76,26 @@ def bybit_post(path, params=None):
     return r.json()
 
 def get_balance(coin_name):
-    try:
-        data = bybit_get("/v5/account/wallet-balance", {"accountType": "SPOT", "coin": coin_name})
-        if data.get("retCode") != 0:
+    # Probeer SPOT eerst, daarna UNIFIED - anders blijft hij op 0.0 staan
+    # als je geld in een ander account staat
+    for account_type in ["SPOT", "UNIFIED"]:
+        try:
+            data = bybit_get("/v5/account/wallet-balance", {"accountType": account_type, "coin": coin_name})
+            if data.get("retCode") != 0:
+                continue
+            coins = data["result"]["list"][0]["coin"]
+            for c in coins:
+                if c["coin"] == coin_name:
+                    saldo = float(c["walletBalance"])
+                    if saldo > 0:
+                        return saldo, data
+            # Als SPOT 0 is, probeer UNIFIED nog
+            if account_type == "SPOT":
+                continue
             return 0.0, data
-        coins = data["result"]["list"][0]["coin"]
-        for c in coins:
-            if c["coin"] == coin_name:
-                return float(c["walletBalance"]), data
-        return 0.0, data
-    except Exception as e:
-        return 0.0, {"error": str(e)}
+        except Exception as e:
+            continue
+    return 0.0, {"error": "geen saldo gevonden in SPOT of UNIFIED"}
 
 def get_price():
     try:
@@ -155,7 +164,6 @@ def bot_loop():
                     winst = ((prijs - bot_status["koop_prijs"]) / bot_status["koop_prijs"]) * 100
                     bot_status["winst_pct"] = round(winst, 2)
 
-                    # Take profit of stop loss?
                     if winst >= TAKE_PROFIT_PCT or winst <= STOP_LOSS_PCT:
                         res = plaats_order("Sell", int(pepe))
                         if res.get("retCode") == 0:
