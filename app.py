@@ -1,199 +1,357 @@
-from flask import Flask, jsonify
-import hmac, hashlib, time, requests, os, threading, math
+import os
+import time
+import hmac
+import hashlib
+import requests
+import threading
+import json
+from decimal import Decimal, ROUND_DOWN
+from flask import Flask, request, jsonify
 
 app = Flask(__name__)
 
-# --- ENV ---
-BASE = "https://api.bybit.com"
-API_KEY = os.environ.get("BYBIT_API_KEY", "")
-API_SECRET = os.environ.get("BYBIT_API_SECRET", "")
-TG_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-TG_CHAT = os.environ.get("TELEGRAM_CHAT_ID", "")
+API_KEY = os.environ.get("BYBIT_API_KEY", "").strip()
+API_SECRET = os.environ.get("BYBIT_API_SECRET", "").strip()
+TG_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+TG_CHAT = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
+
+BASE = "https://api.bybit.eu"
 SYMBOL = "PEPEUSDT"
-TRADE_USDT = float(os.environ.get("TRADE_USDT", "50"))
 INTERVAL = "15"
-ATR_PERIODE = 14
-SLEUTEL_WAARDE = 1.0
 
-bot_state = {"in_positie": False, "laatste_signaal": "Geen", "laatste_check": "Nog niet", "laatste_fout": ""}
+CHECK_RUNNING = False
+LOOP_STARTED = False
+LAST_HEARTBEAT = 0
+QTY_STEP = None
 
-# --- BYBIT V5 ---
-def bybit_get(path, params):
-    ts = str(int(time.time() * 1000))
-    recv = "5000"
-    query = "&".join([f"{k}={v}" for k, v in sorted(params.items())])
-    to_sign = ts + API_KEY + recv + query
-    sign = hmac.new(API_SECRET.encode(), to_sign.encode(), hashlib.sha256).hexdigest()
-    headers = {
-        "X-BAPI-API-KEY": API_KEY,
-        "X-BAPI-TIMESTAMP": ts,
-        "X-BAPI-SIGN": sign,
-        "X-BAPI-RECV-WINDOW": recv,
-    }
-    r = requests.get(f"{BASE}{path}?{query}", headers=headers, timeout=10)
-    return r.json()
-
-def bybit_post(path, body):
-    ts = str(int(time.time() * 1000))
-    recv = "5000"
-    import json
-    payload = json.dumps(body)
-    to_sign = ts + API_KEY + recv + payload
-    sign = hmac.new(API_SECRET.encode(), to_sign.encode(), hashlib.sha256).hexdigest()
-    headers = {
-        "X-BAPI-API-KEY": API_KEY,
-        "X-BAPI-TIMESTAMP": ts,
-        "X-BAPI-SIGN": sign,
-        "X-BAPI-RECV-WINDOW": recv,
-        "Content-Type": "application/json"
-    }
-    r = requests.post(f"{BASE}{path}", headers=headers, data=payload, timeout=10)
-    return r.json()
-
-# --- TELEGRAM ---
-def telegram(msg):
+# ---------- TELEGRAM ----------
+def _send_telegram(text):
     if not TG_TOKEN or not TG_CHAT:
-        print(f"Telegram niet ingesteld: {msg}")
         return
     try:
-        requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
-                      json={"chat_id": TG_CHAT, "text": msg}, timeout=10)
+        requests.post(
+            f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
+            json={"chat_id": TG_CHAT, "text": text},
+            timeout=10,
+        )
     except Exception as e:
-        print(f"Telegramfout: {e}")
-    print(msg)
+        print("Telegram fout:", e)
 
-# --- DATA ---
-def get_candles():
-    r = requests.get(f"{BASE}/v5/market/kline",
-                     params={"category": "spot", "symbol": SYMBOL, "interval": INTERVAL, "limit": 100},
-                     timeout=10).json()
-    candles = []
-    for c in r.get("result", {}).get("list", []):
-        # [start, open, high, low, close, volume, turnover]
-        candles.append({"high": float(c[2]), "low": float(c[3]), "close": float(c[4])})
-    return list(reversed(candles))
+def send_msg(text):
+    # Koop / verkoop = ALTIJD doorsturen
+    _send_telegram(text)
 
-def atr(candles):
-    trs = []
-    for i in range(1, len(candles)):
-        h, l, pc = candles[i]["high"], candles[i]["low"], candles[i-1]["close"]
-        trs.append(max(h-l, abs(h-pc), abs(l-pc)))
-    if len(trs) < ATR_PERIODE:
-        return 0
-    return sum(trs[-ATR_PERIODE:]) / ATR_PERIODE
+def send_heartbeat(usdt, pepe):
+    global LAST_HEARTBEAT
+    now = time.time()
+    if now - LAST_HEARTBEAT < 3600:
+        return
+    LAST_HEARTBEAT = now
+    _send_telegram(f"UUR - Bot leeft. USDT: {usdt} PEPE: {pepe}")
 
-def ut_signaal(candles):
-    # Simpele UT Bot: close > vorige close + ATR*key = buy, anders sell
-    if len(candles) < ATR_PERIODE + 2:
-        return "Geen"
-    a = atr(candles)
-    if a == 0:
-        return "Geen"
-    if candles[-1]["close"] > candles[-2]["close"] + a * SLEUTEL_WAARDE * 0.1:
-        return "BUY"
-    if candles[-1]["close"] < candles[-2]["close"] - a * SLEUTEL_WAARDE * 0.1:
-        return "SELL"
-    return "Geen"
+# ---------- BYBIT SIGN ----------
+def sign(params, ts):
+    query = "&".join(f"{k}={params[k]}" for k in sorted(params))
+    payload = str(ts) + API_KEY + "5000" + query
+    return hmac.new(
+        API_SECRET.encode(), payload.encode(), hashlib.sha256
+    ).hexdigest()
 
-def get_balances():
-    data = bybit_get("/v5/account/wallet-balance", {"accountType": "UNIFIED", "coin": "USDT,PEPE"})
-    usdt, pepe = 0, 0
+def headers_for(params, ts):
+    return {
+        "X-BAPI-API-KEY": API_KEY,
+        "X-BAPI-TIMESTAMP": str(ts),
+        "X-BAPI-RECV-WINDOW": "5000",
+        "X-BAPI-SIGN": sign(params, ts),
+        "Content-Type": "application/json",
+    }
+
+# ---------- QTY ----------
+def get_qty_step():
+    global QTY_STEP
+    if QTY_STEP:
+        return QTY_STEP
     try:
-        for coin in data["result"]["list"][0]["coin"]:
-            if coin["coin"] == "USDT":
-                usdt = float(coin.get("walletBalance", 0))
-            if coin["coin"] == "PEPE":
-                pepe = float(coin.get("walletBalance", 0))
+        r = requests.get(
+            BASE + "/v5/market/instruments-info",
+            params={"category": "spot", "symbol": SYMBOL},
+            timeout=15,
+        )
+        j = r.json()
+        lot = j["result"]["list"][0]["lotSizeFilter"]
+        QTY_STEP = Decimal(str(lot["qtyStep"]))
+        print("qtyStep:", QTY_STEP, "min:", lot.get("minOrderQty"))
+        return QTY_STEP
     except Exception as e:
-        bot_state["laatste_fout"] = str(e)
+        print("qtyStep fout, fallback 100000:", e)
+        QTY_STEP = Decimal("100000")
+        return QTY_STEP
+
+def round_qty(raw):
+    step = get_qty_step()
+    q = (Decimal(str(raw)) / step).quantize(
+        Decimal("1"), rounding=ROUND_DOWN
+    ) * step
+    return q
+
+# ---------- SALDO ----------
+def get_balance_for(account_type):
+    ts = int(time.time() * 1000)
+    params = {"accountType": account_type}
+    r = requests.get(
+        BASE + "/v5/account/wallet-balance",
+        params=params,
+        headers=headers_for(params, ts),
+        timeout=15,
+    )
+    j = r.json()
+    if j.get("retCode") != 0:
+        print(f"Saldo check {account_type}:", j)
+        return None, None
+    coins = j["result"]["list"][0]["coin"]
+    usdt = 0.0
+    pepe = 0.0
+    for c in coins:
+        if c["coin"] == "USDT":
+            usdt = float(c.get("walletBalance", 0) or 0)
+        if c["coin"] == "PEPE":
+            pepe = float(c.get("walletBalance", 0) or 0)
     return usdt, pepe
 
-def do_buy():
-    usdt, _ = get_balances()
-    if usdt < 10:
-        telegram(f"❌ KOOP afgewezen: te weinig USDT ({usdt})")
-        return
-    bedrag = min(TRADE_USDT, usdt * 0.98)
-    # Prijs ophalen
-    tick = requests.get(f"{BASE}/v5/market/tickers",
-                        params={"category": "spot", "symbol": SYMBOL}, timeout=10).json()
-    prijs = float(tick["result"]["list"][0]["lastPrice"])
-    qty = int(math.floor((bedrag / prijs) / 1000) * 1000)
-    if qty <= 0:
-        telegram("❌ BUY mislukt: qty te klein")
-        return
-    resp = bybit_post("/v5/order/create", {
-        "category": "spot", "symbol": SYMBOL, "side": "Buy",
-        "orderType": "Market", "qty": str(qty)
-    })
-    print(f"BUY resp: {resp}")
-    if resp.get("retCode") == 0:
-        bot_state["in_positie"] = True
-        telegram(f"✅ KOPEN uitgevoerd: {qty} PEPE voor ~{bedrag:.2f} USDT")
-    else:
-        telegram(f"❌ BUY fout: {resp}")
+def get_balance():
+    try:
+        usdt, pepe = get_balance_for("SPOT")
+        if usdt is not None:
+            return usdt, pepe
+        print("SPOT faalde, probeer UNIFIED")
+        usdt, pepe = get_balance_for("UNIFIED")
+        return usdt, pepe
+    except Exception as e:
+        print("Saldo fout:", e)
+        return None, None
 
-def do_sell():
-    _, pepe = get_balances()
-    if pepe <= 0:
-        telegram("❌ VERKOOP afgewezen: geen PEPE")
-        return
-    qty = int(math.floor(pepe / 1000) * 1000)
-    if qty <= 0:
-        telegram("❌ SELL mislukt: qty te klein")
-        return
-    resp = bybit_post("/v5/order/create", {
-        "category": "spot", "symbol": SYMBOL, "side": "Sell",
-        "orderType": "Market", "qty": str(qty)
-    })
-    print(f"SELL resp: {resp}")
-    if resp.get("retCode") == 0:
-        bot_state["in_positie"] = False
-        telegram(f"✅ VERKOPEN uitgevoerd: {qty} PEPE")
-    else:
-        telegram(f"❌ SELL fout: {resp}")
+# ---------- CANDLES ----------
+def get_klines():
+    try:
+        r = requests.get(
+            BASE + "/v5/market/kline",
+            params={
+                "category": "spot",
+                "symbol": SYMBOL,
+                "interval": INTERVAL,
+                "limit": 200,
+            },
+            timeout=15,
+        )
+        j = r.json()
+        data = j.get("result", {}).get("list", [])
+        data = list(reversed(data))
+        closes = [float(x[4]) for x in data]
+        highs = [float(x[2]) for x in data]
+        lows = [float(x[3]) for x in data]
+        return closes, highs, lows
+    except Exception as e:
+        print("Kline fout:", e)
+        return [], [], []
 
-# --- LOOP ---
+# ---------- UT BOT ----------
+def ut_bot_exact(closes, highs, lows, factor=4.0, period=14):
+    n = len(closes)
+    if n < period + 5:
+        return False, 0.0
+    tr = [0.0] * n
+    for i in range(1, n):
+        tr[i] = max(
+            highs[i] - lows[i],
+            abs(highs[i] - closes[i - 1]),
+            abs(lows[i] - closes[i - 1]),
+        )
+    atr = [0.0] * n
+    atr[period] = sum(tr[1:period + 1]) / period
+    for i in range(period + 1, n):
+        atr[i] = (atr[i - 1] * (period - 1) + tr[i]) / period
+    trailing = [0.0] * n
+    pos = [0] * n
+    for i in range(1, n):
+        nloss = factor * atr[i]
+        prev_trail = trailing[i - 1]
+        if closes[i] > prev_trail and closes[i - 1] > prev_trail:
+            trailing[i] = max(prev_trail, closes[i] - nloss)
+        elif closes[i] < prev_trail and closes[i - 1] < prev_trail:
+            trailing[i] = min(prev_trail, closes[i] + nloss)
+        elif closes[i] > prev_trail:
+            trailing[i] = closes[i] - nloss
+        else:
+            trailing[i] = closes[i] + nloss
+        if closes[i - 1] < prev_trail and closes[i] > trailing[i]:
+            pos[i] = 1
+        elif closes[i - 1] > prev_trail and closes[i] < trailing[i]:
+            pos[i] = -1
+        else:
+            pos[i] = pos[i - 1]
+    ut_up = pos[-1] == 1
+    return ut_up, trailing[-1]
+
+# ---------- SUPERTREND ----------
+def supertrend_exact(closes, highs, lows, period=10, mult=3.0):
+    n = len(closes)
+    if n < period + 5:
+        return False
+    tr = [0.0] * n
+    for i in range(1, n):
+        tr[i] = max(
+            highs[i] - lows[i],
+            abs(highs[i] - closes[i - 1]),
+            abs(lows[i] - closes[i - 1]),
+        )
+    atr = [0.0] * n
+    atr[period] = sum(tr[1:period + 1]) / period
+    for i in range(period + 1, n):
+        atr[i] = (atr[i - 1] * (period - 1) + tr[i]) / period
+    final_upper = [0.0] * n
+    final_lower = [0.0] * n
+    trend = [1] * n
+    for i in range(1, n):
+        hl2 = (highs[i] + lows[i]) / 2
+        basic_upper = hl2 + mult * atr[i]
+        basic_lower = hl2 - mult * atr[i]
+        if basic_upper < final_upper[i - 1] or closes[i - 1] > final_upper[i - 1]:
+            final_upper[i] = basic_upper
+        else:
+            final_upper[i] = final_upper[i - 1]
+        if basic_lower > final_lower[i - 1] or closes[i - 1] < final_lower[i - 1]:
+            final_lower[i] = basic_lower
+        else:
+            final_lower[i] = final_lower[i - 1]
+        if trend[i - 1] == 1 and closes[i] < final_lower[i]:
+            trend[i] = -1
+        elif trend[i - 1] == -1 and closes[i] > final_upper[i]:
+            trend[i] = 1
+        else:
+            trend[i] = trend[i - 1]
+    st_up = trend[-1] == 1
+    return st_up
+
+# ---------- COMBINATIE ----------
+def check_signal():
+    closes, highs, lows = get_klines()
+    if len(closes) < 50:
+        return False, False, 0
+    closes = closes[:-1]
+    highs = highs[:-1]
+    lows = lows[:-1]
+    ut_up, _ = ut_bot_exact(closes, highs, lows, 4.0, 14)
+    st_up = supertrend_exact(closes, highs, lows, 10, 3.0)
+    return ut_up, st_up, closes[-1]
+
+# ---------- ORDER ----------
+def place_order(side, qty):
+    try:
+        ts = int(time.time() * 1000)
+        params = {
+            "category": "spot",
+            "symbol": SYMBOL,
+            "side": side,
+            "orderType": "Market",
+            "qty": str(qty),
+        }
+        r = requests.post(
+            BASE + "/v5/order/create",
+            json=params,
+            headers=headers_for(params, ts),
+            timeout=15,
+        )
+        print("Order:", side, qty, r.text)
+        return r.json()
+    except Exception as e:
+        print("Order fout:", e)
+        return None
+
+# ---------- 1 CHECK ----------
+def do_one_check():
+    usdt, pepe = get_balance()
+    if usdt is None:
+        print("Geen saldo, probeer over 60 sec opnieuw - geen stop")
+        return
+    ut_up, st_up, price = check_signal()
+    print(f"Check: USDT {usdt} PEPE {pepe} UT {ut_up} ST {st_up} prijs {price}")
+    if price <= 0:
+        return
+
+    if ut_up and st_up and usdt > 1 and pepe == 0:
+        raw_qty = (usdt * 0.999) / price
+        qty = round_qty(raw_qty)
+        if qty > 0:
+            place_order("Buy", qty)
+            send_msg(f"UUR - GEKOCHT PEPE voor {usdt} USDT")
+
+    if (not ut_up or not st_up) and pepe > 0:
+        qty = round_qty(pepe)
+        if qty > 0:
+            place_order("Sell", qty)
+            send_msg("UUR - VERKOCHT PEPE, alles")
+
+    if int(time.time()) % 3600 < 60:
+        send_heartbeat(usdt, pepe)
+
+# ---------- LOOP ----------
 def bot_loop():
-    time.sleep(5)
-    telegram("🤖 Pepebot gestart op Render")
-    laatste_candle = None
+    global CHECK_RUNNING
+    if CHECK_RUNNING:
+        return
+    CHECK_RUNNING = True
+    print("Bot loop gestart, KEY LOADED:", bool(API_KEY and API_SECRET))
     while True:
         try:
-            candles = get_candles()
-            # Alleen traden op een nieuwe gesloten candle: gebruik 1-na-laatste als gesloten
-            if len(candles) >= 2:
-                # Simpele check: trade max 1x per 15 min via timestamp
-                signaal = ut_signaal(candles[:-1])
-                bot_state["laatste_signaal"] = signaal
-                bot_state["laatste_check"] = time.strftime("%H:%M:%S")
-                print(f"Check {bot_state['laatste_check']} signaal={signaal} in_positie={bot_state['in_positie']}")
-                if signaal == "BUY" and not bot_state["in_positie"]:
-                    do_buy()
-                elif signaal == "SELL" and bot_state["in_positie"]:
-                    do_sell()
+            do_one_check()
         except Exception as e:
-            bot_state["laatste_fout"] = str(e)
-            print(f"Loop fout: {e}")
+            print("Loop fout, gaat door:", e)
         time.sleep(60)
 
-# Start ook onder Gunicorn
-threading.Thread(target=bot_loop, daemon=True).start()
+def start_loop_once():
+    global LOOP_STARTED
+    if LOOP_STARTED:
+        return
+    LOOP_STARTED = True
+    threading.Thread(target=bot_loop, daemon=True).start()
 
-# --- ROUTES ---
+# ---------- ROUTES ----------
 @app.route("/")
 def home():
-    return "Pepebot draait"
+    return "Bot leeft", 200
 
-@app.route("/status")
-def status():
-    usdt, pepe = get_balances()
-    return jsonify({**bot_state, "usdt": usdt, "pepe": pepe, "trade_usdt": TRADE_USDT})
+@app.route("/ping")
+def ping():
+    return "pong", 200
 
 @app.route("/test-key")
 def test_key():
-    data = bybit_get("/v5/account/wallet-balance", {"accountType": "UNIFIED"})
-    return jsonify({"bybit": data})
+    usdt, pepe = get_balance()
+    if usdt is None:
+        return jsonify({
+            "status": "ERROR",
+            "usdt": None,
+            "key_start": API_KEY[:4] + "****" if API_KEY else ""
+        })
+    return jsonify({
+        "status": "OK",
+        "usdt": usdt,
+        "pepe": pepe,
+        "key_start": API_KEY[:4] + "****" if API_KEY else ""
+    })
+
+@app.route("/check")
+def check():
+    # Geen nieuwe loop, gewoon 1 check
+    threading.Thread(target=do_one_check, daemon=True).start()
+    return "Check gestart, kijk in Logs", 200
+
+@app.route("/webhook", methods=["POST"])
+def webhook():
+    threading.Thread(target=do_one_check, daemon=True).start()
+    return jsonify({"ok": True})
+
+start_loop_once()
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=10000)
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
