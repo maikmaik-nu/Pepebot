@@ -1,66 +1,76 @@
-import os, math, time, threading, requests
-from flask import Flask, jsonify, request
-from pybit.unified_trading import HTTP
+import os, time, hmac, hashlib, requests
+from flask import Flask, jsonify
 
 app = Flask(__name__)
 
-# --- ENV VARS ---
-BYBIT_KEY = os.environ.get("BYBIT_API_KEY", "")
-BYBIT_SECRET = os.environ.get("BYBIT_API_SECRET", "")
-TG_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-TG_CHAT = os.environ.get("TELEGRAM_CHAT_ID", "")
-TRADE_USDT = float(os.environ.get("TRADE_USDT", "50"))
-SYMBOL = os.environ.get("SYMBOL", "PEPEUSDT")
-INTERVAL = os.environ.get("INTERVAL", "15")
-KEY_VALUE = float(os.environ.get("KEY_VALUE", "4.0"))
-ATR_PERIOD = int(os.environ.get("ATR_PERIOD", "14"))
-POLL_SECONDS = int(os.environ.get("POLL_SECONDS", "60"))
+API_KEY = os.getenv("BYBIT_API_KEY", "")
+API_SECRET = os.getenv("BYBIT_API_SECRET", "")
+BASE_URL = "https://api.bybit.eu"
+SYMBOL = "PEPEUSDT"
+CATEGORY = "spot"
 
-session = HTTP(testnet=False, api_key=BYBIT_KEY, api_secret=BYBIT_SECRET)
-last_signal = None
-last_candle_time = None
-last_trade_info = "Nog geen trade"
-bot_state = "Wachten op eerste candle..."
-last_error = ""
-telegram_offset = None
+def sign(params):
+    timestamp = str(int(time.time() * 1000))
+    recv = "5000"
+    query = "&".join([f"{k}={params[k]}" for k in sorted(params)])
+    to_sign = timestamp + API_KEY + recv + query
+    signature = hmac.new(API_SECRET.encode(), to_sign.encode(), hashlib.sha256).hexdigest()
+    return {
+        "X-BAPI-API-KEY": API_KEY,
+        "X-BAPI-TIMESTAMP": timestamp,
+        "X-BAPI-RECV-WINDOW": recv,
+        "X-BAPI-SIGN": signature,
+        "Content-Type": "application/json"
+    }
 
-# --- TELEGRAM ---
-def send_telegram(msg):
-    if not TG_TOKEN or not TG_CHAT:
-        print(f"Telegram niet ingesteld: {msg}", flush=True)
-        return
+def get_balance_spot():
+    last_error = {}
     try:
-        requests.post(
-            f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
-            json={"chat_id": TG_CHAT, "text": msg}, timeout=10
-        )
+        params = {"accountType": "SPOT", "coin": "USDT"}
+        r = requests.get(f"{BASE_URL}/v5/account/wallet-balance", params=params, headers=sign(params), timeout=10)
+        data = r.json()
+        if data.get("retCode") == 0:
+            coins = data["result"]["list"][0]["coin"]
+            for c in coins:
+                if c["coin"] == "USDT":
+                    return float(c["walletBalance"]), data
+        last_error = data
     except Exception as e:
-        print(f"Telegram error: {e}", flush=True)
+        last_error = {"error": str(e)}
 
-def get_balances():
     try:
-        r = session.get_wallet_balance(accountType="UNIFIED", coin="USDT")
-        usdt = 0
-        for c in r["result"]["list"][0]["coin"]:
-            if c["coin"] == "USDT":
-                usdt = float(c.get("walletBalance") or 0)
-        r2 = session.get_wallet_balance(accountType="UNIFIED", coin="PEPE")
-        pepe = 0
-        for c in r2["result"]["list"][0]["coin"]:
-            if c["coin"] == "PEPE":
-                pepe = float(c.get("walletBalance") or c.get("availableToWithdraw") or 0)
-        return usdt, pepe
-    except Exception as e:
-        print(f"Balance error: {e}", flush=True)
-        return 0, 0
+        params = {"accountType": "SPOT", "coin": "USDT"}
+        r = requests.get(f"{BASE_URL}/v5/asset/transfer/query-account-coins-balance", params=params, headers=sign(params), timeout=10)
+        data = r.json()
+        if data.get("retCode") == 0:
+            for c in data["result"]["balance"]:
+                if c["coin"] == "USDT":
+                    return float(c["walletBalance"]), data
+    except Exception:
+        pass
 
-def get_price():
-    try:
-        tick = session.get_tickers(category="spot", symbol=SYMBOL)
-        return float(tick["result"]["list"][0]["lastPrice"])
-    except Exception as e:
-        print(f"Price error: {e}", flush=True)
-        return 0
+    return 0.0, last_error
 
-def do_buy(reason="UT Bot Buy"):
-    global last
+@app.route("/")
+def home():
+    return "Pepebot-3 live"
+
+@app.route("/test-key")
+def test_key():
+    usdt, raw = get_balance_spot()
+    return jsonify({
+        "api_key_set": bool(API_KEY),
+        "accountType_used": "SPOT",
+        "base_url": BASE_URL,
+        "usdt": usdt,
+        "balances": raw,
+        "status": "OK" if usdt > 0 else "CHECK_BYBIT"
+    })
+
+@app.route("/check")
+def check():
+    usdt, raw = get_balance_spot()
+    return jsonify({"USDT": usdt, "in_position": False, "raw": raw})
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=10000)
