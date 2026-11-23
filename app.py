@@ -1,143 +1,114 @@
-import os, time, hmac, hashlib, json, threading
+import os
+import time
+import hmac
+import hashlib
 import requests
+import threading
 from flask import Flask, jsonify
 
 app = Flask(__name__)
 
-BYBIT_API_KEY = os.environ.get("BYBIT_API_KEY", "")
-BYBIT_API_SECRET = os.environ.get("BYBIT_API_SECRET", "")
-BASE_URL = "https://api.bybit.eu"
-SYMBOL = "PEPEUSDC"
-COIN_BUY = "USDC"
-COIN_SELL = "PEPE"
-VASTE_INLEG = 100.0
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
+API_KEY = os.environ.get("【entity-BYBIT_API_KEY¦canonical_name=BYBIT】", "")
+API_SECRET = os.environ.get("【entity-BYBIT_API_SECRET¦canonical_name=BYBIT】", "")
+BASE_URL = os.environ.get("【entity-BYBIT_BASE_URL¦canonical_name=BYBIT】", "https://api.bybit.eu")
+SYMBOL = "PEPEUSDT"
+CATEGORY = "spot"
 
-def send_telegram(msg):
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        return
-    try:
-        requests.post(
-            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-            json={"chat_id": TELEGRAM_CHAT_ID, "text": msg},
-            timeout=10
-        )
-    except Exception as e:
-        print("Telegram fail:", e)
-
-def _sign(timestamp, recv_window, body_str):
-    to_sign = timestamp + BYBIT_API_KEY + recv_window + body_str
-    return hmac.new(BYBIT_API_SECRET.encode(), to_sign.encode(), hashlib.sha256).hexdigest()
-
-def bybit_get(path, params):
+def sign_request(params):
     timestamp = str(int(time.time() * 1000))
     recv_window = "5000"
-    query = "&".join([f"{k}={v}" for k, v in params.items()])
-    sign = _sign(timestamp, recv_window, query)
+    param_str = "&".join([f"{k}={v}" for k, v in sorted(params.items())])
+    to_sign = timestamp + API_KEY + recv_window + param_str
+    signature = hmac.new(
+        API_SECRET.encode("utf-8"),
+        to_sign.encode("utf-8"),
+        hashlib.sha256
+    ).hexdigest()
     headers = {
-        "X-BAPI-API-KEY": BYBIT_API_KEY,
-        "X-BAPI-SIGN": sign,
+        "X-BAPI-API-KEY": API_KEY,
         "X-BAPI-TIMESTAMP": timestamp,
         "X-BAPI-RECV-WINDOW": recv_window,
-    }
-    r = requests.get(BASE_URL + path, params=params, headers=headers, timeout=10)
-    return r.json()
-
-def bybit_post(path, payload):
-    timestamp = str(int(time.time() * 1000))
-    recv_window = "5000"
-    body_str = json.dumps(payload)
-    sign = _sign(timestamp, recv_window, body_str)
-    headers = {
-        "X-BAPI-API-KEY": BYBIT_API_KEY,
-        "X-BAPI-SIGN": sign,
-        "X-BAPI-TIMESTAMP": timestamp,
-        "X-BAPI-RECV-WINDOW": recv_window,
+        "X-BAPI-SIGN": signature,
         "Content-Type": "application/json"
     }
-    r = requests.post(BASE_URL + path, json=payload, headers=headers, timeout=10)
-    return r.json()
+    return headers
 
-def get_balance():
+def get_balance(coin):
     try:
-        data = bybit_get("/v5/account/wallet-balance", {"accountType": "SPOT"})
-        print("BALANCE RAW:", data)
+        params = {
+            "accountType": "SPOT",
+            "coin": coin
+        }
+        headers = sign_request(params)
+        url = BASE_URL + "/v5/account/wallet-balance"
+        r = requests.get(url, params=params, headers=headers, timeout=10)
+        data = r.json()
+        print(f"BALANCE RAW {coin}: {data}", flush=True)
         if data.get("retCode") != 0:
-            print(f"Balance fail: retCode={data.get('retCode')} retMsg={data.get('retMsg')}")
-            return 0.0, 0.0, data
-        coins = data["result"]["list"][0]["coin"]
-        usdc = 0.0
-        pepe = 0.0
+            print(f"Balance fail {coin}: retCode={data.get('retCode')} retMsg={data.get('retMsg')}", flush=True)
+            return 0.0, data.get("retCode")
+        lst = data.get("result", {}).get("list", [])
+        if not lst:
+            return 0.0, 0
+        coins = lst[0].get("coin", [])
         for c in coins:
-            if c["coin"] == "USDC":
-                usdc = float(c.get("walletBalance") or 0)
-            if c["coin"] == "PEPE":
-                pepe = float(c.get("walletBalance") or 0)
-        return usdc, pepe, data
+            if c.get("coin") == coin:
+                return float(c.get("walletBalance", 0)), 0
+        return 0.0, 0
     except Exception as e:
-        print("Balance fail exception:", e)
-        return 0.0, 0.0, {"retCode": -1, "retMsg": str(e)}
+        print(f"Balance error {coin}: {e}", flush=True)
+        return 0.0, -1
 
 def get_price():
     try:
-        data = bybit_get("/v5/market/tickers", {"category": "spot", "symbol": SYMBOL})
-        price = float(data["result"]["list"][0]["lastPrice"])
-        return price, data
+        url = BASE_URL + "/v5/market/tickers"
+        params = {"category": CATEGORY, "symbol": SYMBOL}
+        r = requests.get(url, params=params, timeout=10)
+        data = r.json()
+        lst = data.get("result", {}).get("list", [])
+        if lst:
+            return float(lst[0].get("lastPrice", 0))
+        return 0.0
     except Exception as e:
-        print("Prijs fail:", e)
-        return 0.0, {}
+        print(f"Price error: {e}", flush=True)
+        return 0.0
 
-def do_check():
-    usdc, pepe, bal_data = get_balance()
-    prijs, _ = get_price()
-    print(f"CHECK: USDC={usdc} PEPE={pepe} price={prijs} retCode={bal_data.get('retCode')}")
-    if bal_data.get("retCode") != 0:
-        print("Geen saldo, probeer over 60 sec opnieuw - geen stop")
-        return {"usdc": usdc, "pepe": pepe, "prijs": prijs, "actie": "geen saldo - 10003 check key", "bal": bal_data}
-    if prijs <= 0:
-        return {"usdc": usdc, "pepe": pepe, "prijs": prijs, "actie": "geen prijs"}
-    if usdc < VASTE_INLEG:
-        print(f"Te weinig USDC om te kopen: {usdc}")
-        return {"usdc": usdc, "pepe": pepe, "prijs": prijs, "actie": f"te weinig USDC: {usdc}"}
-    # Hier staat nu alleen checken, geen auto-kooptje, zodat je eerst ziet dat saldo werkt
-    print(f"Vaste inleg: {VASTE_INLEG} - Geen signaal - alleen check")
-    return {"usdc": usdc, "pepe": pepe, "prijs": prijs, "actie": "check ok - klaar om te kopen"}
-
-def loop():
+def check_loop():
     while True:
         try:
-            do_check()
+            usdt, code1 = get_balance("USDT")
+            usdc, code2 = get_balance("USDC")
+            pepe, code3 = get_balance("PEPE")
+            price = get_price()
+            print(f"CHECK: USDT={usdt} USDC={usdc} PEPE={pepe} price={price} retCode={code1}", flush=True)
+            if usdt == 0 and usdc == 0 and pepe == 0:
+                print("Geen saldo, probeer over 60 sec opnieuw - geen stop", flush=True)
+            time.sleep(60)
         except Exception as e:
-            print("Loop fail:", e)
-        time.sleep(60)
-
-threading.Thread(target=loop, daemon=True).start()
+            print(f"Loop error: {e}", flush=True)
+            time.sleep(60)
 
 @app.route("/")
 def home():
-    return "Pepebot-3 live"
+    return "Pepebot-3 is live", 200
 
 @app.route("/test-key")
 def test_key():
-    usdc, pepe, bal_data = get_balance()
-    prijs, _ = get_price()
+    usdt, code1 = get_balance("USDT")
+    usdc, code2 = get_balance("USDC")
+    pepe, code3 = get_balance("PEPE")
+    price = get_price()
     return jsonify({
-        "api_key_set": bool(BYBIT_API_KEY),
-        "base": BASE_URL,
-        "retCode": bal_data.get("retCode"),
-        "retMsg": bal_data.get("retMsg"),
-        "full": bal_data,
-        "pepe": pepe,
-        "prijs": prijs,
+        "api_key_set": bool(API_KEY),
+        "base_url": BASE_URL,
+        "usdt": usdt,
         "usdc": usdc,
-        "usdt": 0.0
+        "pepe": pepe,
+        "price": price,
+        "retCode": code1
     })
 
-@app.route("/check")
-def check():
-    result = do_check()
-    return jsonify({"ok": True, **result})
+threading.Thread(target=check_loop, daemon=True).start()
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)
