@@ -1,153 +1,66 @@
-import os, time, hmac, hashlib, requests
-from flask import Flask, jsonify
+import os, math, time, threading, requests
+from flask import Flask, jsonify, request
+from pybit.unified_trading import HTTP
 
 app = Flask(__name__)
 
-API_KEY = os.getenv("BYBIT_API_KEY", "")
-API_SECRET = os.getenv("BYBIT_API_SECRET", "")
-BASE_URL = "https://api.bybit.eu"
-SYMBOL = "PEPEUSDC"
-CATEGORY = "spot"
-COIN = "USDC"
+# --- ENV VARS ---
+BYBIT_KEY = os.environ.get("BYBIT_API_KEY", "")
+BYBIT_SECRET = os.environ.get("BYBIT_API_SECRET", "")
+TG_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+TG_CHAT = os.environ.get("TELEGRAM_CHAT_ID", "")
+TRADE_USDT = float(os.environ.get("TRADE_USDT", "50"))
+SYMBOL = os.environ.get("SYMBOL", "PEPEUSDT")
+INTERVAL = os.environ.get("INTERVAL", "15")
+KEY_VALUE = float(os.environ.get("KEY_VALUE", "4.0"))
+ATR_PERIOD = int(os.environ.get("ATR_PERIOD", "14"))
+POLL_SECONDS = int(os.environ.get("POLL_SECONDS", "60"))
 
-# Hoeveel USDC per trade - pas dit zelf aan
-TRADE_AMOUNT_USDC = 10.0
+session = HTTP(testnet=False, api_key=BYBIT_KEY, api_secret=BYBIT_SECRET)
+last_signal = None
+last_candle_time = None
+last_trade_info = "Nog geen trade"
+bot_state = "Wachten op eerste candle..."
+last_error = ""
+telegram_offset = None
 
-def sign(params):
-    timestamp = str(int(time.time() * 1000))
-    recv = "5000"
-    query = "&".join([f"{k}={params[k]}" for k in sorted(params)])
-    to_sign = timestamp + API_KEY + recv + query
-    signature = hmac.new(API_SECRET.encode(), to_sign.encode(), hashlib.sha256).hexdigest()
-    headers = {
-        "X-BAPI-API-KEY": API_KEY,
-        "X-BAPI-TIMESTAMP": timestamp,
-        "X-BAPI-RECV-WINDOW": recv,
-        "X-BAPI-SIGN": signature,
-        "Content-Type": "application/json"
-    }
-    return headers
-
-def bybit_get(path, params):
-    headers = sign(params)
-    r = requests.get(f"{BASE_URL}{path}", params=params, headers=headers, timeout=10)
+# --- TELEGRAM ---
+def send_telegram(msg):
+    if not TG_TOKEN or not TG_CHAT:
+        print(f"Telegram niet ingesteld: {msg}", flush=True)
+        return
     try:
-        return r.status_code, r.json()
-    except:
-        return r.status_code, {"retCode": -1, "retMsg": "Lege body", "raw": r.text[:200]}
+        requests.post(
+            f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
+            json={"chat_id": TG_CHAT, "text": msg}, timeout=10
+        )
+    except Exception as e:
+        print(f"Telegram error: {e}", flush=True)
 
-def bybit_post(path, params):
-    headers = sign(params)
-    r = requests.post(f"{BASE_URL}{path}", json=params, headers=headers, timeout=10)
+def get_balances():
     try:
-        return r.status_code, r.json()
-    except:
-        return r.status_code, {"retCode": -1, "retMsg": "Lege body", "raw": r.text[:200]}
-
-def get_balance():
-    # Alleen SPOT, alleen USDC - dit is waar je geld staat op 【entity-bybit¦canonical_name=Bybit】.eu
-    status, data = bybit_get("/v5/account/wallet-balance", {
-        "accountType": "SPOT",
-        "coin": COIN
-    })
-    if data.get("retCode") == 0:
-        try:
-            coins = data["result"]["list"][0]["coin"]
-            for c in coins:
-                if c["coin"] == COIN:
-                    usdc = float(c["walletBalance"])
-                if c["coin"] == "PEPE":
-                    pepe = float(c["walletBalance"])
-                else:
-                    pepe = 0.0
-            return usdc, pepe, data
-        except Exception as e:
-            return 0.0, 0.0, {"error": str(e), "raw": data}
-    return 0.0, 0.0, data
+        r = session.get_wallet_balance(accountType="UNIFIED", coin="USDT")
+        usdt = 0
+        for c in r["result"]["list"][0]["coin"]:
+            if c["coin"] == "USDT":
+                usdt = float(c.get("walletBalance") or 0)
+        r2 = session.get_wallet_balance(accountType="UNIFIED", coin="PEPE")
+        pepe = 0
+        for c in r2["result"]["list"][0]["coin"]:
+            if c["coin"] == "PEPE":
+                pepe = float(c.get("walletBalance") or c.get("availableToWithdraw") or 0)
+        return usdt, pepe
+    except Exception as e:
+        print(f"Balance error: {e}", flush=True)
+        return 0, 0
 
 def get_price():
-    # Geen signature nodig voor prijs
     try:
-        r = requests.get(f"{BASE_URL}/v5/market/tickers", params={
-            "category": CATEGORY,
-            "symbol": SYMBOL
-        }, timeout=10)
-        data = r.json()
-        if data.get("retCode") == 0:
-            return float(data["result"]["list"][0]["lastPrice"]), data
+        tick = session.get_tickers(category="spot", symbol=SYMBOL)
+        return float(tick["result"]["list"][0]["lastPrice"])
     except Exception as e:
-        return 0.0, {"error": str(e)}
-    return 0.0, data
+        print(f"Price error: {e}", flush=True)
+        return 0
 
-@app.route("/")
-def home():
-    usdc, pepe, raw = get_balance()
-    price, _ = get_price()
-    return jsonify({
-        "bot": "Pepebot-3 live",
-        "symbol": SYMBOL,
-        "base_url": BASE_URL,
-        "USDC": usdc,
-        "PEPE": pepe,
-        "price": price,
-        "in_position": pepe > 0,
-        "retCode": raw.get("retCode")
-    })
-
-@app.route("/test-key")
-def test_key():
-    usdc, pepe, raw = get_balance()
-    price, price_raw = get_price()
-    return jsonify({
-        "api_key_set": bool(API_KEY),
-        "key_start": API_KEY[:4] + "****" if API_KEY else "",
-        "accountType_used": "SPOT",
-        "base_url": BASE_URL,
-        "symbol": SYMBOL,
-        "coin": COIN,
-        "usdc": usdc,
-        "pepe": pepe,
-        "price": price,
-        "balances": raw,
-        "price_raw": price_raw,
-        "status": "OK" if raw.get("retCode") == 0 else "ERROR"
-    })
-
-@app.route("/check")
-def check():
-    usdc, pepe, raw = get_balance()
-    price, _ = get_price()
-    return jsonify({
-        "USDC": usdc,
-        "PEPE": pepe,
-        "price": price,
-        "in_position": pepe > 0,
-        "retCode": raw.get("retCode"),
-        "raw": raw
-    })
-
-@app.route("/buy")
-def buy():
-    # Handmatig testen: open /buy om 1x te kopen met TRADE_AMOUNT_USDC
-    usdc, pepe, raw = get_balance()
-    if raw.get("retCode") != 0:
-        return jsonify({"error": "Saldo ophalen faalt", "raw": raw}), 400
-    if usdc < TRADE_AMOUNT_USDC:
-        return jsonify({"error": "Te weinig USDC", "USDC": usdc}), 400
-
-    price, _ = get_price()
-    if price <= 0:
-        return jsonify({"error": "Geen prijs"}), 400
-
-    qty = str(int((TRADE_AMOUNT_USDC / price)))
-    status, data = bybit_post("/v5/order/create", {
-        "category": CATEGORY,
-        "symbol": SYMBOL,
-        "side": "Buy",
-        "orderType": "Market",
-        "qty": qty
-    })
-    return jsonify({"qty": qty, "price": price, "result": data})
-
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=10000)
+def do_buy(reason="UT Bot Buy"):
+    global last
