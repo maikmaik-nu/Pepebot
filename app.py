@@ -1,210 +1,82 @@
-import os
-import time
-import hmac
-import hashlib
-import json
-import requests
+import os, math, time, threading, requests
+from flask import Flask, jsonify, request
+from pybit.unified_trading import HTTP
 
-# ================= CONFIG =================
-API_KEY = os.getenv("BYBIT_API_KEY", "")
-API_SECRET = os.getenv("BYBIT_API_SECRET", "")
-BASE = "https://api.bybit.eu"  # 【entity-Bybit¦canonical_name=Bybit】 EU, NIET .com
+app = Flask(__name__)
 
-SYMBOL = "PEPEUSDT"
-BASE_COIN = "PEPE"
-QUOTE_COIN = "USDC"
+# --- ENV VARS (in Render > Environment) ---
+BYBIT_KEY = os.environ.get("BYBIT_API_KEY", "")
+BYBIT_SECRET = os.environ.get("BYBIT_API_SECRET", "")
+TG_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+TG_CHAT = os.environ.get("TELEGRAM_CHAT_ID", "")
+TRADE_USDT = float(os.environ.get("TRADE_USDT", "50"))
+SYMBOL = os.environ.get("SYMBOL", "PEPEUSDT")
+INTERVAL = os.environ.get("INTERVAL", "15")
+KEY_VALUE = float(os.environ.get("KEY_VALUE", "1.0"))
+ATR_PERIOD = int(os.environ.get("ATR_PERIOD", "14"))
+POLL_SECONDS = int(os.environ.get("POLL_SECONDS", "60"))
 
-TRADE_BEDRAG_USDC = 10.0   # hoeveel USDC per koop
-WINST_PROCENT = 3.0        # verkoop bij +3%
-VERLIES_PROCENT = 2.0      # verkoop bij -2%
-WACHT_SECONDEN = 60
-MIN_SALDO_OM_TE_HANDELEN = 11.0  # moet iets meer zijn dan trade bedrag + fee
+session = HTTP(testnet=False, api_key=BYBIT_KEY, api_secret=BYBIT_SECRET)
+last_signal = None
+last_candle_time = None
+last_trade_info = "Nog geen trade"
+bot_state = "Wachten op eerste candle..."
+last_error = ""
+telegram_offset = None
 
-# onthoudt aankoopprijs in geheugen
-aankoop_prijs = None
-# ===========================================
-
-def log(msg):
-    print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
-
-def sign_get(params_str):
-    ts = str(int(time.time() * 1000))
-    recv = "5000"
-    payload = ts + API_KEY + recv + params_str
-    sign = hmac.new(API_SECRET.encode(), payload.encode(), hashlib.sha256).hexdigest()
-    return ts, recv, sign
-
-def sign_post(body_str):
-    ts = str(int(time.time() * 1000))
-    recv = "5000"
-    payload = ts + API_KEY + recv + body_str
-    sign = hmac.new(API_SECRET.encode(), payload.encode(), hashlib.sha256).hexdigest()
-    return ts, recv, sign
-
-def bybit_get(path, params_str=""):
-    ts, recv, sign = sign_get(params_str)
-    headers = {
-        "X-BAPI-API-KEY": API_KEY,
-        "X-BAPI-TIMESTAMP": ts,
-        "X-BAPI-RECV-WINDOW": recv,
-        "X-BAPI-SIGN": sign,
-        "Content-Type": "application/json"
-    }
-    url = f"{BASE}{path}"
-    if params_str:
-        url += f"?{params_str}"
-    r = requests.get(url, headers=headers, timeout=15)
-    return r.json()
-
-def bybit_post(path, body_dict):
-    body_str = json.dumps(body_dict)
-    ts, recv, sign = sign_post(body_str)
-    headers = {
-        "X-BAPI-API-KEY": API_KEY,
-        "X-BAPI-TIMESTAMP": ts,
-        "X-BAPI-RECV-WINDOW": recv,
-        "X-BAPI-SIGN": sign,
-        "Content-Type": "application/json"
-    }
-    r = requests.post(f"{BASE}{path}", headers=headers, data=body_str, timeout=15)
-    return r.json()
-
-# ---------- SALDO ----------
-def get_saldo(coin):
-    data = bybit_get("/v5/account/wallet-balance", f"accountType=UNIFIED&coin={coin}")
-    if data.get("retCode") != 0:
-        log(f"SALDO FOUT {coin}: {data}")
-        return None
+# --- TELEGRAM ---
+def send_telegram(msg):
+    if not TG_TOKEN or not TG_CHAT:
+        print(f"Telegram niet ingesteld: {msg}", flush=True)
+        return
     try:
-        coins = data["result"]["list"][0]["coin"]
-        for c in coins:
-            if c["coin"] == coin:
-                return float(c.get("walletBalance", 0))
-        return 0.0
+        requests.post(
+            f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
+            json={"chat_id": TG_CHAT, "text": msg}, timeout=10
+        )
     except Exception as e:
-        log(f"Saldo parse fout {coin}: {e} | data: {data}")
-        return None
+        print(f"Telegram error: {e}", flush=True)
 
-def get_alle_saldi():
-    saldo_usdc = get_saldo(QUOTE_COIN)
-    saldo_pepe = get_saldo(BASE_COIN)
-    return saldo_usdc, saldo_pepe
-
-# ---------- PRIJS ----------
-def get_prijs():
+def get_balances():
     try:
-        r = requests.get(f"{BASE}/v5/market/tickers?category=spot&symbol={SYMBOL}", timeout=10)
-        data = r.json()
-        prijs = float(data["result"]["list"][0]["lastPrice"])
-        log(f"PRIJS {SYMBOL} = {prijs}")
-        return prijs
+        r = session.get_wallet_balance(accountType="UNIFIED", coin="USDT")
+        usdt = 0
+        for c in r["result"]["list"][0]["coin"]:
+            if c["coin"] == "USDT":
+                usdt = float(c.get("walletBalance") or 0)
+        r2 = session.get_wallet_balance(accountType="UNIFIED", coin="PEPE")
+        pepe = 0
+        for c in r2["result"]["list"][0]["coin"]:
+            if c["coin"] == "PEPE":
+                pepe = float(c.get("walletBalance") or c.get("availableToWithdraw") or 0)
+        return usdt, pepe
     except Exception as e:
-        log(f"Prijs fout: {e}")
-        return None
+        print(f"Balance error: {e}", flush=True)
+        return 0, 0
 
-# ---------- ORDER ----------
-def plaats_order(side, qty):
-    # qty moet een string zijn, geen float met te veel decimalen
-    # PEPE heeft veel decimalen, dus rond af op hele coins
-    qty_str = str(int(qty))
-    log(f"ORDER: {side} {qty_str} {BASE_COIN}")
+def get_price():
+    try:
+        tick = session.get_tickers(category="spot", symbol=SYMBOL)
+        return float(tick["result"]["list"][0]["lastPrice"])
+    except Exception as e:
+        print(f"Price error: {e}", flush=True)
+        return 0
 
-    body = {
-        "category": "spot",
-        "symbol": SYMBOL,
-        "side": side,  # Buy of Sell
-        "orderType": "Market",
-        "qty": qty_str,
-    }
-    data = bybit_post("/v5/order/create", body)
-    log(f"ORDER RESULTAAT: {data}")
-    if data.get("retCode") == 0:
-        return True
-    else:
-        log(f"ORDER FOUT: {data.get('retMsg')}")
-        return False
-
-# ---------- STRATEGIE ----------
-def ronde():
-    global aankoop_prijs
-
-    saldo_usdc, saldo_pepe = get_alle_saldi()
-    prijs = get_prijs()
-
-    if saldo_usdc is None or saldo_pepe is None or prijs is None:
-        log("WACHT: saldo of prijs fout, doe niks deze ronde")
+def do_buy(reason="UT Bot Buy"):
+    global last_trade_info
+    usdt, pepe = get_balances()
+    if usdt < 10:
+        send_telegram(f"❌ BUY genegeerd: te weinig USDT ({usdt:.2f})")
         return
-
-    log(f"STATUS | USDC: {saldo_usdc} | PEPE: {saldo_pepe} | Prijs: {prijs} | Aankoopprijs: {aankoop_prijs}")
-
-    # Waarde van je PEPE in USDC
-    pepe_waarde_usdc = saldo_pepe * prijs
-
-    # 1. GEEN PEPE, WEL USDC -> KOOP
-    if pepe_waarde_usdc < 1.0 and saldo_usdc >= MIN_SALDO_OM_TE_HANDELEN:
-        qty = TRADE_BEDRAG_USDC / prijs
-        log(f"ACTIE: Geen PEPE, koop voor {TRADE_BEDRAG_USDC} USDC = {qty:.0f} PEPE")
-        if plaats_order("Buy", qty):
-            aankoop_prijs = prijs
-            log(f"GEKOCHT op {prijs}, onthoud als aankoopprijs")
+    use = min(TRADE_USDT, usdt * 0.98)
+    price = get_price()
+    if price <= 0:
+        send_telegram("❌ BUY mislukt: geen prijs")
         return
-
-    # 2. WEL PEPE, MAAR GEEN AANKOOPPRIJS BEKEND (bijv. na herstart) -> onthoud huidige prijs
-    if pepe_waarde_usdc >= 1.0 and aankoop_prijs is None:
-        aankoop_prijs = prijs
-        log(f"Herstart: zet aankoopprijs op huidige prijs {prijs}, wachten op beweging")
+    qty = int(math.floor((use / price) / 1000) * 1000)
+    if qty <= 0:
+        send_telegram("❌ BUY genegeerd: qty te klein")
         return
-
-    # 3. WEL PEPE -> CHECK WINST / VERLIES
-    if pepe_waarde_usdc >= 1.0 and aankoop_prijs is not None:
-        verschil_procent = ((prijs - aankoop_prijs) / aankoop_prijs) * 100
-        log(f"POSITIE: {verschil_procent:.2f}% t.o.v. aankoop")
-
-        if verschil_procent >= WINST_PROCENT:
-            log(f"ACTIE: +{verschil_procent:.2f}% winst, VERKOOP alles")
-            if plaats_order("Sell", saldo_pepe):
-                aankoop_prijs = None
-                log("VERKOCHT met winst, klaar voor nieuwe ronde")
-            return
-
-        if verschil_procent <= -VERLIES_PROCENT:
-            log(f"ACTIE: {verschil_procent:.2f}% verlies, VERKOOP alles om erger te voorkomen")
-            if plaats_order("Sell", saldo_pepe):
-                aankoop_prijs = None
-                log("VERKOCHT met verlies, klaar voor nieuwe ronde")
-            return
-
-        log("ACTIE: Niks doen, wachten op +3% of -2%")
-        return
-
-    # 4. TE WEINIG USDC
-    if saldo_usdc < MIN_SALDO_OM_TE_HANDELEN and pepe_waarde_usdc < 1.0:
-        log(f"WACHT: Te weinig USDC ({saldo_usdc}) om te handelen, minimaal {MIN_SALDO_OM_TE_HANDELEN} nodig")
-
-# ---------- MAIN ----------
-def main():
-    log("=== Pepebot-3 gestart op Bybit EU - UNIFIED ===")
-    log(f"Key prefix: {API_KEY[:4]}**** als dit leeg is staat je key niet in Render")
-
-    if not API_KEY or not API_SECRET:
-        log("FOUT: BYBIT_API_KEY / BYBIT_API_SECRET ontbreken in Render Environment")
-        return
-
-    # Eerste test: werkt saldo?
-    test = get_saldo(QUOTE_COIN)
-    if test is None:
-        log("START FOUT: Saldo werkt nog steeds niet. Bot start wel, maar handelt niet.")
-        log("Dit is geen code-fout meer, dit is Bybit EU die je key blokkeert.")
-    else:
-        log(f"START OK: Saldo USDC = {test}")
-
-    while True:
-        try:
-            ronde()
-        except Exception as e:
-            log(f"Loop fout: {e}")
-        log(f"Wacht {WACHT_SECONDEN} sec...")
-        time.sleep(WACHT_SECONDEN)
-
-if __name__ == "__main__":
-    main()
+    try:
+        session.place_order(category="spot", symbol=SYMBOL, side="Buy", orderType="Market", qty=str(qty))
+        last
