@@ -1,11 +1,17 @@
-import os, time, hmac, hashlib, threading, requests
+import os
+import time
+import hmac
+import hashlib
+import json
+import threading
+import requests
 from flask import Flask, jsonify
 
 app = Flask(__name__)
 
 BASE_URL = "https://api.bybit.eu"
-API_KEY = os.getenv("【entity-BYBIT_API_KEY¦canonical_name=Bybit】", "")
-API_SECRET = os.getenv("【entity-BYBIT_API_SECRET¦canonical_name=Bybit】", "")
+API_KEY = os.getenv("BYBIT_API_KEY", "")
+API_SECRET = os.getenv("BYBIT_API_SECRET", "")
 TG_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TG_CHAT = os.getenv("TELEGRAM_CHAT_ID", "")
 SYMBOL = "PEPEUSDT"
@@ -18,29 +24,31 @@ def send_tg(msg):
     if not TG_TOKEN or not TG_CHAT:
         return
     try:
-        requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
-            json={"chat_id": TG_CHAT, "text": msg}, timeout=10)
+        requests.post(
+            f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
+            json={"chat_id": TG_CHAT, "text": msg},
+            timeout=10
+        )
     except Exception as e:
         log(f"Telegram fout: {e}")
 
-def headers_and_sign(query_string=""):
+def signed_headers(query_or_body):
     ts = str(int(time.time() * 1000))
     recv = "5000"
-    to_sign = ts + API_KEY + recv + query_string
+    to_sign = ts + API_KEY + recv + query_or_body
     sign = hmac.new(API_SECRET.encode(), to_sign.encode(), hashlib.sha256).hexdigest()
-    headers = {
+    return {
         "X-BAPI-API-KEY": API_KEY,
         "X-BAPI-TIMESTAMP": ts,
         "X-BAPI-RECV-WINDOW": recv,
         "X-BAPI-SIGN": sign,
         "Content-Type": "application/json"
     }
-    return headers
 
 def get_balance():
     try:
         qs = "accountType=SPOT"
-        headers = headers_and_sign(qs)
+        headers = signed_headers(qs)
         r = requests.get(f"{BASE_URL}/v5/account/wallet-balance?{qs}", headers=headers, timeout=10)
         d = r.json()
         if d.get("retCode") != 0:
@@ -61,7 +69,11 @@ def get_balance():
 
 def get_price():
     try:
-        r = requests.get(f"{BASE_URL}/v5/market/tickers", params={"category": "spot", "symbol": SYMBOL}, timeout=10)
+        r = requests.get(
+            f"{BASE_URL}/v5/market/tickers",
+            params={"category": "spot", "symbol": SYMBOL},
+            timeout=10
+        )
         d = r.json()
         lst = d["result"]["list"]
         return float(lst[0]["lastPrice"])
@@ -71,20 +83,15 @@ def get_price():
 
 def place_order(side, qty):
     try:
-        body = {"category": "spot", "symbol": SYMBOL, "side": side, "orderType": "Market", "qty": str(qty)}
-        import json as _json
-        body_str = _json.dumps(body)
-        ts = str(int(time.time() * 1000))
-        recv = "5000"
-        to_sign = ts + API_KEY + recv + body_str
-        sign = hmac.new(API_SECRET.encode(), to_sign.encode(), hashlib.sha256).hexdigest()
-        headers = {
-            "X-BAPI-API-KEY": API_KEY,
-            "X-BAPI-TIMESTAMP": ts,
-            "X-BAPI-RECV-WINDOW": recv,
-            "X-BAPI-SIGN": sign,
-            "Content-Type": "application/json"
+        body = {
+            "category": "spot",
+            "symbol": SYMBOL,
+            "side": side,
+            "orderType": "Market",
+            "qty": str(qty)
         }
+        body_str = json.dumps(body)
+        headers = signed_headers(body_str)
         r = requests.post(f"{BASE_URL}/v5/order/create", headers=headers, data=body_str, timeout=10)
         log(f"ORDER {side} {qty}: {r.text[:300]}")
         return r.json()
@@ -104,8 +111,6 @@ def bot_loop():
             money, pepe = get_balance()
             price = get_price()
             log(f"Check: Geld {money:.2f} PEPE {pepe:.0f} prijs {price}")
-
-            # KOOP: geld + geen PEPE = koop nu, niet wachten op supertrend
             if money > 1 and pepe == 0 and price > 0:
                 buy_usd = min(money, 10)
                 qty = int(buy_usd / price)
@@ -113,9 +118,6 @@ def bot_loop():
                     log(f"KOOP NU: {qty} PEPE voor {buy_usd:.2f}")
                     place_order("Buy", qty)
                     send_tg(f"PEPE GEKOCHT: {qty} voor ~{buy_usd:.2f} prijs {price}")
-            # VERKOOP: hij heeft PEPE, verkoop als hij 5% winst heeft of gewoon na 1 check om te testen
-            # Voor nu: alleen verkopen als je het zelf zegt, dus geen auto-sell - eerst bewijzen dat kopen werkt
-
         except Exception as e:
             log(f"Loop fout, gaat door: {e}")
         time.sleep(60)
@@ -129,7 +131,14 @@ def test_key():
     try:
         money, pepe = get_balance()
         price = get_price()
-        return jsonify({"ok": True, "geld": money, "PEPE": pepe, "prijs": price, "key_set": bool(API_KEY)})
+        return jsonify({
+            "ok": True,
+            "geld": money,
+            "PEPE": pepe,
+            "prijs": price,
+            "key_set": bool(API_KEY),
+            "key_len": len(API_KEY)
+        })
     except Exception as e:
         return jsonify({"ok": False, "fout": str(e)}), 200
 
