@@ -1,98 +1,140 @@
-import os, time, hmac, hashlib, requests, threading
-from flask import Flask, jsonify
+"""
+PEPEBOT-3 - Werkende 【entity-Bybit¦canonical_name=Bybit】 v5 Bot
+"""
+import os
+import time
+import hmac
+import hashlib
+import json
+import requests
+import threading
+from flask import Flask
+
+API_KEY = os.getenv("BYBIT_API_KEY", "")
+API_SECRET = os.getenv("BYBIT_API_SECRET", "")
+TESTNET = os.getenv("BYBIT_TESTNET", "false").lower() == "true"
+SYMBOL = os.getenv("SYMBOL", "PEPEUSDT")
+TRADE_USDT = float(os.getenv("TRADE_USDT", "10"))
+BASE_URL = "https://api-testnet.bybit.com" if TESTNET else "https://api.bybit.com"
 
 app = Flask(__name__)
 
-API_KEY = os.getenv("BYBIT_API_KEY", "").strip()
-API_SECRET = os.getenv("BYBIT_API_SECRET", "").strip()
-BASE_URL = "https://api.bybit.eu"
-SYMBOL = "PEPEUSDT"
-CATEGORY = "spot"
+@app.route("/")
+def home():
+    return "PEPEBOT-3 RUNNING", 200
 
-print(f"START - api_key_set: {bool(API_KEY)} - key begint met: {API_KEY[:4] if API_KEY else 'LEEG'} - base: {BASE_URL}")
+def sign(params_str, timestamp):
+    payload = f"{timestamp}{API_KEY}5000{params_str}"
+    return hmac.new(API_SECRET.encode(), payload.encode(), hashlib.sha256).hexdigest()
 
-def sign(params):
+def bybit_get(path, params):
     timestamp = str(int(time.time() * 1000))
-    recv = "5000"
-    query = "&".join([f"{k}={params[k]}" for k in sorted(params)])
-    to_sign = timestamp + API_KEY + recv + query
-    signature = hmac.new(API_SECRET.encode(), to_sign.encode(), hashlib.sha256).hexdigest()
-    return {
+    query = "&".join([f"{k}={v}" for k, v in params.items()])
+    signature = sign(query, timestamp)
+    headers = {
         "X-BAPI-API-KEY": API_KEY,
         "X-BAPI-TIMESTAMP": timestamp,
-        "X-BAPI-RECV-WINDOW": recv,
+        "X-BAPI-RECV-WINDOW": "5000",
+        "X-BAPI-SIGN": signature,
+    }
+    r = requests.get(BASE_URL + path, params=params, headers=headers, timeout=10)
+    return r.json()
+
+def bybit_post(path, body):
+    timestamp = str(int(time.time() * 1000))
+    body_str = json.dumps(body)
+    signature = sign(body_str, timestamp)
+    headers = {
+        "X-BAPI-API-KEY": API_KEY,
+        "X-BAPI-TIMESTAMP": timestamp,
+        "X-BAPI-RECV-WINDOW": "5000",
         "X-BAPI-SIGN": signature,
         "Content-Type": "application/json"
     }
+    r = requests.post(BASE_URL + path, data=body_str, headers=headers, timeout=10)
+    return r.json()
+
+def get_prijs():
+    try:
+        r = requests.get(f"{BASE_URL}/v5/market/tickers", params={"category": "linear", "symbol": SYMBOL}, timeout=10)
+        data = r.json()
+        lst = data.get("result", {}).get("list", [])
+        if not lst:
+            print(f"Prijs fout: lege list, response={data}", flush=True)
+            return 0.0
+        prijs = float(lst[0].get("lastPrice", 0))
+        return prijs
+    except Exception as e:
+        print(f"Prijs fout: {e}", flush=True)
+        return 0.0
 
 def get_balance():
     try:
-        params = {"accountType": "SPOT", "coin": "USDT"}
-        headers = sign(params)
-        r = requests.get(f"{BASE_URL}/v5/account/wallet-balance", params=params, headers=headers, timeout=10)
-        data = r.json()
-        print(f"Balance raw: {data}")
-        if data.get("retCode") == 0:
-            lst = data["result"]["list"]
-            # Bybit kan hier list of dict geven - allebei afvangen
-            if isinstance(lst, dict):
-                lst = [lst]
-            coins = lst[0].get("coin", [])
-            for c in coins:
-                if c.get("coin") == "USDT":
-                    return float(c.get("walletBalance", 0))
-            return 0.0
+        if not API_KEY or not API_SECRET:
+            print("Balance fail: GEEN API KEY / SECRET in Render Environment!", flush=True)
+            return 0.0, 0.0
+        data = bybit_get("/v5/account/wallet-balance", {"accountType": "UNIFIED"})
+        if data.get("retCode") != 0:
+            print(f"Balance fail: {data}", flush=True)
+            if data.get("retCode") == 10003:
+                print(">>> 10003 = KEY HEEFT GEEN PERMISSIE. In Bybit: API > Edit > Unified Trading Read + Trade AAN, IP whitelist UIT.", flush=True)
+            return 0.0, 0.0
+        coins = data["result"]["list"][0]["coin"]
+        usdt = 0.0
+        pepe = 0.0
+        for c in coins:
+            if c["coin"] == "USDT":
+                usdt = float(c.get("walletBalance", 0) or 0)
+            if c["coin"] == "PEPE":
+                pepe = float(c.get("walletBalance", 0) or 0)
+        return usdt, pepe
+    except Exception as e:
+        print(f"Balance fail exception: {e}", flush=True)
+        return 0.0, 0.0
+
+def plaats_order(side, qty):
+    body = {
+        "category": "linear",
+        "symbol": SYMBOL,
+        "side": side,
+        "orderType": "Market",
+        "qty": str(int(qty)),
+        "timeInForce": "GTC",
+        "positionIdx": 0
+    }
+    res = bybit_post("/v5/order/create", body)
+    print(f"Order {side} {qty} -> {res}", flush=True)
+    return res
+
+def check_en_trade():
+    prijs = get_prijs()
+    geld, pepe = get_balance()
+    print(f"Check: Geld {geld:.2f} PEPE {pepe} prijs {prijs}", flush=True)
+    if prijs == 0 or geld == 0:
+        print("Niet traden: prijs 0 of geld 0 - check keys / balance", flush=True)
+        return
+    if pepe == 0 and geld >= TRADE_USDT:
+        qty = TRADE_USDT / prijs
+        qty = int(qty // 1000 * 1000)
+        if qty >= 1000:
+            print(f"KOOP signaal: {qty} PEPE voor {TRADE_USDT} USDT", flush=True)
+            plaats_order("Buy", qty)
         else:
-            print(f"Balance fail: {data}")
-            return 0.0
-    except Exception as e:
-        print(f"Balance fout: {e}")
-        return 0.0
+            print(f"Qty te klein: {qty}", flush=True)
+    else:
+        print("Geen actie: al PEPE in bezit of te weinig geld", flush=True)
 
-def get_price():
-    try:
-        # Prijs hoeft GEEN key - publieke endpoint
-        r = requests.get(f"{BASE_URL}/v5/market/tickers", params={"category": "spot", "symbol": SYMBOL}, timeout=10)
-        data = r.json()
-        # FIX voor 'list' fout: result['list'] is een LIST
-        lst = data["result"]["list"]
-        if isinstance(lst, list) and len(lst) > 0:
-            return float(lst[0].get("lastPrice", 0))
-        return 0.0
-    except Exception as e:
-        print(f"Prijs fout: {e}")
-        return 0.0
-
-def bot_loop():
-    print("Bot loop gestart - GAAT NU TRADEN")
+def loop():
+    time.sleep(5)
     while True:
         try:
-            geld = get_balance()
-            prijs = get_price()
-            print(f"Check: Geld {geld:.2f} prijs {prijs}")
-            # hier komt je koop-logica
+            check_en_trade()
         except Exception as e:
-            print(f"Loop fout: {e}")
+            print(f"Loop fout: {e}", flush=True)
         time.sleep(60)
 
-@app.route("/")
-def home():
-    return "Pepebot-3 live"
-
-@app.route("/test-key")
-def test_key():
-    geld = get_balance()
-    prijs = get_price()
-    return jsonify({
-        "api_key_set": bool(API_KEY),
-        "key_start": API_KEY[:4] if API_KEY else "LEEG",
-        "base_url": BASE_URL,
-        "USDT": geld,
-        "prijs": prijs,
-        "status": "OK" if geld > 0 and prijs > 0 else "CHECK"
-    })
-
-threading.Thread(target=bot_loop, daemon=True).start()
+threading.Thread(target=loop, daemon=True).start()
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=10000)
+    port = int(os.getenv("PORT", 10000))
+    app.run(host="0.0.0.0", port=port)
