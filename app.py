@@ -1,125 +1,78 @@
-import os
-import time
-import hmac
-import hashlib
-import json
-import threading
-import requests
+import os, time, hmac, hashlib, requests, threading
 from flask import Flask, jsonify
 
 app = Flask(__name__)
 
+API_KEY = os.getenv("BYBIT_API_KEY", "").strip()
+API_SECRET = os.getenv("BYBIT_API_SECRET", "").strip()
 BASE_URL = "https://api.bybit.eu"
-API_KEY = os.getenv("BYBIT_API_KEY", "")
-API_SECRET = os.getenv("BYBIT_API_SECRET", "")
-TG_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-TG_CHAT = os.getenv("TELEGRAM_CHAT_ID", "")
 SYMBOL = "PEPEUSDT"
-running = False
+CATEGORY = "spot"
 
-def log(msg):
-    print(msg, flush=True)
+print(f"START - api_key_set: {bool(API_KEY)} - key begint met: {API_KEY[:4] if API_KEY else 'LEEG'} - base: {BASE_URL}")
 
-def send_tg(msg):
-    if not TG_TOKEN or not TG_CHAT:
-        return
-    try:
-        requests.post(
-            f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
-            json={"chat_id": TG_CHAT, "text": msg},
-            timeout=10
-        )
-    except Exception as e:
-        log(f"Telegram fout: {e}")
-
-def signed_headers(query_or_body):
-    ts = str(int(time.time() * 1000))
+def sign(params):
+    timestamp = str(int(time.time() * 1000))
     recv = "5000"
-    to_sign = ts + API_KEY + recv + query_or_body
-    sign = hmac.new(API_SECRET.encode(), to_sign.encode(), hashlib.sha256).hexdigest()
+    query = "&".join([f"{k}={params[k]}" for k in sorted(params)])
+    to_sign = timestamp + API_KEY + recv + query
+    signature = hmac.new(API_SECRET.encode(), to_sign.encode(), hashlib.sha256).hexdigest()
     return {
         "X-BAPI-API-KEY": API_KEY,
-        "X-BAPI-TIMESTAMP": ts,
+        "X-BAPI-TIMESTAMP": timestamp,
         "X-BAPI-RECV-WINDOW": recv,
-        "X-BAPI-SIGN": sign,
+        "X-BAPI-SIGN": signature,
         "Content-Type": "application/json"
     }
 
 def get_balance():
     try:
-        qs = "accountType=SPOT"
-        headers = signed_headers(qs)
-        r = requests.get(f"{BASE_URL}/v5/account/wallet-balance?{qs}", headers=headers, timeout=10)
-        d = r.json()
-        if d.get("retCode") != 0:
-            log(f"Balance fail: {d}")
-            return 0.0, 0.0
-        coins = d["result"]["list"][0]["coin"]
-        money = 0.0
-        pepe = 0.0
-        for c in coins:
-            if c["coin"] in ("USDT", "USDC"):
-                money += float(c.get("walletBalance") or 0)
-            if c["coin"] == "PEPE":
-                pepe = float(c.get("walletBalance") or 0)
-        return money, pepe
+        params = {"accountType": "SPOT", "coin": "USDT"}
+        headers = sign(params)
+        r = requests.get(f"{BASE_URL}/v5/account/wallet-balance", params=params, headers=headers, timeout=10)
+        data = r.json()
+        print(f"Balance raw: {data}")
+        if data.get("retCode") == 0:
+            lst = data["result"]["list"]
+            # Bybit kan hier list of dict geven - allebei afvangen
+            if isinstance(lst, dict):
+                lst = [lst]
+            coins = lst[0].get("coin", [])
+            for c in coins:
+                if c.get("coin") == "USDT":
+                    return float(c.get("walletBalance", 0))
+            return 0.0
+        else:
+            print(f"Balance fail: {data}")
+            return 0.0
     except Exception as e:
-        log(f"Balance fout: {e}")
-        return 0.0, 0.0
+        print(f"Balance fout: {e}")
+        return 0.0
 
 def get_price():
     try:
-        r = requests.get(
-            f"{BASE_URL}/v5/market/tickers",
-            params={"category": "spot", "symbol": SYMBOL},
-            timeout=10
-        )
-        d = r.json()
-        lst = d["result"]["list"]
-        return float(lst[0]["lastPrice"])
+        # Prijs hoeft GEEN key - publieke endpoint
+        r = requests.get(f"{BASE_URL}/v5/market/tickers", params={"category": "spot", "symbol": SYMBOL}, timeout=10)
+        data = r.json()
+        # FIX voor 'list' fout: result['list'] is een LIST
+        lst = data["result"]["list"]
+        if isinstance(lst, list) and len(lst) > 0:
+            return float(lst[0].get("lastPrice", 0))
+        return 0.0
     except Exception as e:
-        log(f"Prijs fout: {e}")
+        print(f"Prijs fout: {e}")
         return 0.0
 
-def place_order(side, qty):
-    try:
-        body = {
-            "category": "spot",
-            "symbol": SYMBOL,
-            "side": side,
-            "orderType": "Market",
-            "qty": str(qty)
-        }
-        body_str = json.dumps(body)
-        headers = signed_headers(body_str)
-        r = requests.post(f"{BASE_URL}/v5/order/create", headers=headers, data=body_str, timeout=10)
-        log(f"ORDER {side} {qty}: {r.text[:300]}")
-        return r.json()
-    except Exception as e:
-        log(f"Order fout: {e}")
-        return None
-
 def bot_loop():
-    global running
-    if running:
-        return
-    running = True
-    log("Bot loop gestart - GAAT NU TRADEN")
-    time.sleep(5)
+    print("Bot loop gestart - GAAT NU TRADEN")
     while True:
         try:
-            money, pepe = get_balance()
-            price = get_price()
-            log(f"Check: Geld {money:.2f} PEPE {pepe:.0f} prijs {price}")
-            if money > 1 and pepe == 0 and price > 0:
-                buy_usd = min(money, 10)
-                qty = int(buy_usd / price)
-                if qty > 0:
-                    log(f"KOOP NU: {qty} PEPE voor {buy_usd:.2f}")
-                    place_order("Buy", qty)
-                    send_tg(f"PEPE GEKOCHT: {qty} voor ~{buy_usd:.2f} prijs {price}")
+            geld = get_balance()
+            prijs = get_price()
+            print(f"Check: Geld {geld:.2f} prijs {prijs}")
+            # hier komt je koop-logica
         except Exception as e:
-            log(f"Loop fout, gaat door: {e}")
+            print(f"Loop fout: {e}")
         time.sleep(60)
 
 @app.route("/")
@@ -128,19 +81,16 @@ def home():
 
 @app.route("/test-key")
 def test_key():
-    try:
-        money, pepe = get_balance()
-        price = get_price()
-        return jsonify({
-            "ok": True,
-            "geld": money,
-            "PEPE": pepe,
-            "prijs": price,
-            "key_set": bool(API_KEY),
-            "key_len": len(API_KEY)
-        })
-    except Exception as e:
-        return jsonify({"ok": False, "fout": str(e)}), 200
+    geld = get_balance()
+    prijs = get_price()
+    return jsonify({
+        "api_key_set": bool(API_KEY),
+        "key_start": API_KEY[:4] if API_KEY else "LEEG",
+        "base_url": BASE_URL,
+        "USDT": geld,
+        "prijs": prijs,
+        "status": "OK" if geld > 0 and prijs > 0 else "CHECK"
+    })
 
 threading.Thread(target=bot_loop, daemon=True).start()
 
