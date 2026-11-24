@@ -1,99 +1,104 @@
-import os, time, hmac, hashlib, threading, requests
+import os, time, hmac, hashlib, threading, requests, json, traceback
 from flask import Flask, jsonify
 
 app = Flask(__name__)
 
-BASE_URL = os.getenv("BASE_URL", "https://api.bybit.eu")
-API_KEY = os.getenv("BYBIT_API_KEY", "")
-API_SECRET = os.getenv("BYBIT_API_SECRET", "")
-SYMBOL = "PEPEUSDC"
-COIN = "PEPE"
-CASH = "USDC"
+BASE_URL = "https://api.bybit.eu"
+API_KEY = os.environ.get("BYBIT_API_KEY", "").strip()
+API_SECRET = os.environ.get("BYBIT_API_SECRET", "").strip()
 
-prices = []
-last_status = {"status": "starting"}
+SYMBOL = "PEPEUSDT"
+BASE_COIN = "PEPE"
+QUOTE_COIN = "USDT"
 
-def sign(params):
-    qs = "&".join(f"{k}={params[k]}" for k in sorted(params))
-    sig = hmac.new(API_SECRET.encode(), qs.encode(), hashlib.sha256).hexdigest()
-    return qs + f"&sign={sig}"
+TRADE_USDT = 20.0
+MIN_USDT = 10.0
+TAKE_PROFIT_PCT = 5.0
+STOP_LOSS_PCT = -3.0
+CHECK_EVERY_SEC = 60
 
-def get_price():
-    try:
-        r = requests.get(f"{BASE_URL}/v5/market/tickers", params={"category": "spot", "symbol": SYMBOL}, timeout=10)
-        data = r.json()
-        lst = data.get("result", {}).get("list", [])
-        if not lst:
-            return 0.0, data
-        return float(lst[0].get("lastPrice", 0)), data
-    except Exception as e:
-        return 0.0, {"error": str(e)}
+RECV_WINDOW = "5000"
 
-def get_balance(coin):
-    try:
-        ts = str(int(time.time() * 1000))
-        params = {"api_key": API_KEY, "timestamp": ts, "accountType": "SPOT", "coin": coin}
-        url = f"{BASE_URL}/v5/account/wallet-balance?{sign(params)}"
-        r = requests.get(url, headers={"X-BAPI-API-KEY": API_KEY}, timeout=10)
-        data = r.json()
-        lst = data.get("result", {}).get("list", [])
-        if not lst:
-            return 0.0, data
-        coins = lst[0].get("coin", [])
-        for c in coins:
-            if c.get("coin") == coin:
-                return float(c.get("walletBalance", 0) or 0), data
-        return 0.0, data
-    except Exception as e:
-        return 0.0, {"error": str(e)}
+STATUS = {
+    "started_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+    "last_check": "nog niet",
+    "usdt": 0,
+    "usdc": 0,
+    "pepe": 0,
+    "pepe_price": 0,
+    "in_position": False,
+    "entry_price": 0,
+    "pnl_pct": 0,
+    "last_action": "opstarten...",
+    "last_error": None,
+    "total_trades": 0,
+    "total_buys": 0,
+    "total_sells": 0,
+}
 
-def get_ut_signal():
-    # simpel UT-signaal op basis van laatste prijzen
-    if len(prices) < 3:
-        return "hold"
-    if prices[-1] > prices[-2] > prices[-3]:
-        return "buy"
-    if prices[-1] < prices[-2] < prices[-3]:
-        return "sell"
-    return "hold"
+_bot_started = False
+_bot_lock = threading.Lock()
 
-def bot_loop():
-    global last_status
-    while True:
+def log(msg):
+    print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
+
+def sign(timestamp, api_key, recv_window, payload_str):
+    param_str = str(timestamp) + api_key + str(recv_window) + payload_str
+    return hmac.new(API_SECRET.encode("utf-8"), param_str.encode("utf-8"), hashlib.sha256).hexdigest()
+
+def bybit_get(path, params):
+    timestamp = int(time.time() * 1000)
+    query = "&".join([f"{k}={v}" for k, v in sorted(params.items())])
+    signature = sign(timestamp, API_KEY, RECV_WINDOW, query)
+    headers = {
+        "X-BAPI-API-KEY": API_KEY,
+        "X-BAPI-SIGN": signature,
+        "X-BAPI-TIMESTAMP": str(timestamp),
+        "X-BAPI-RECV-WINDOW": str(RECV_WINDOW),
+        "Content-Type": "application/json"
+    }
+    r = requests.get(f"{BASE_URL}{path}", params=params, headers=headers, timeout=15)
+    log(f"GET {path} {params} -> {r.status_code} {r.text[:600]}")
+    return r.json()
+
+def bybit_post(path, body_dict):
+    timestamp = int(time.time() * 1000)
+    body_str = json.dumps(body_dict, separators=(',', ':'))
+    signature = sign(timestamp, API_KEY, RECV_WINDOW, body_str)
+    headers = {
+        "X-BAPI-API-KEY": API_KEY,
+        "X-BAPI-SIGN": signature,
+        "X-BAPI-TIMESTAMP": str(timestamp),
+        "X-BAPI-RECV-WINDOW": str(RECV_WINDOW),
+        "Content-Type": "application/json"
+    }
+    r = requests.post(f"{BASE_URL}{path}", data=body_str, headers=headers, timeout=15)
+    log(f"POST {path} {body_str} -> {r.status_code} {r.text[:600]}")
+    return r.json()
+
+def get_balances():
+    usdt = 0.0
+    usdc = 0.0
+    pepe = 0.0
+    for coin_name in ["USDT", "USDC", "PEPE"]:
         try:
-            price, _ = get_price()
-            cash, _ = get_balance(CASH)
-            pepe, _ = get_balance(COIN)
-            if price > 0:
-                prices.append(price)
-                prices[:] = prices[-100:]
-            sig = get_ut_signal()
-            last_status = {"price": price, "cash": cash, "pepe": pepe, "signal": sig, "symbol": SYMBOL}
-            print(f"Check: Geld {cash} PEPE {pepe} prijs {price} UT:{sig}", flush=True)
+            data = bybit_get("/v5/account/wallet-balance", {"accountType": "SPOT", "coin": coin_name})
+            if data.get("retCode") != 0:
+                log(f"SALDO FOUT {coin_name}: {data}")
+                if coin_name == "USDT":
+                    return 0, 0, 0, data
+                continue
+            coins = data["result"]["list"][0]["coin"]
+            for c in coins:
+                val = float(c.get("walletBalance", 0) or 0)
+                if c["coin"] == "USDT":
+                    usdt = val
+                elif c["coin"] == "USDC":
+                    usdc = val
+                elif c["coin"] == "PEPE":
+                    pepe = val
         except Exception as e:
-            print(f"BOT ERROR: {e}", flush=True)
-        time.sleep(60)
-
-@app.route("/")
-def home():
-    return jsonify(last_status)
-
-@app.route("/test-key")
-def test_key():
-    price, price_raw = get_price()
-    cash, cash_raw = get_balance(CASH)
-    pepe, pepe_raw = get_balance(COIN)
-    return jsonify({
-        "symbol": SYMBOL,
-        "price": price,
-        "USDC": cash,
-        "PEPE": pepe,
-        "price_raw": price_raw,
-        "cash_raw": cash_raw,
-        "pepe_raw": pepe_raw
-    })
-
-threading.Thread(target=bot_loop, daemon=True).start()
-
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=10000)
+            log(f"SALDO EXCEPTION {coin_name}: {e}")
+            if coin_name == "USDT":
+                return 0, 0, 0, {"error": str(e)}
+   
