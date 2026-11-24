@@ -1,130 +1,94 @@
-import os, time, hmac, hashlib, threading, requests, math, json
-from flask import Flask, jsonify
-from datetime import datetime
+import os, time, hmac, hashlib, threading, requests
+from flask import Flask
+
+# === JOUW INSTELLINGEN - PAS DIT AAN ===
+BUY_PRICE = 0.00000800   # koop als PEPE onder dit komt
+SELL_PRICE = 0.00001000  # verkoop als PEPE boven dit komt
+TRADE_USDT = 10.0        # hoeveel USDT per trade
+# ========================================
+
+API_KEY = os.getenv("BYBIT_API_KEY", "")
+API_SECRET = os.getenv("BYBIT_API_SECRET", "")
+BASE = "https://api.bybit.com"
+SYMBOL = "PEPEUSDT"
 
 app = Flask(__name__)
+@app.route("/")
+def home():
+    return "Pepebot draait"
 
-BASE_URL = "https://api.bybit.eu"
-API_KEY = os.getenv("BYBIT_API_KEY", "").strip()
-API_SECRET = os.getenv("BYBIT_API_SECRET", "").strip()
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
-
-SYMBOL = "PEPEUSDC"
-CATEGORY = "spot"
-INTERVAL = "15"
-BUY_AMOUNT_USDC = 15.0
-CHECK_EVERY = 60
-
-ATR_PERIOD = 10
-ATR_MULT = 3.0
-UT_KEY = 1.0
-UT_ATR_PERIOD = 10
-
-state = {
-    "prijs": 0.0, "usdc": 0.0, "pepe": 0.0,
-    "signaal": "NONE", "positie": "GEEN",
-    "entry_prijs": 0.0, "winst_pct": 0.0,
-    "supertrend": "NONE", "utbot": "NONE",
-    "last_trade": "nog geen", "last_error": "",
-    "laatste_check": "", "bot_status": "gestart"
-}
-
-def telegram(msg):
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        return
-    try:
-        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-        requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": msg}, timeout=10)
-    except Exception as e:
-        print("TELEGRAM FAIL:", e)
-
-def sign_headers(payload_str):
-    ts = str(int(time.time() * 1000))
-    recv = "5000"
-    to_sign = ts + API_KEY + recv + payload_str
-    sig = hmac.new(API_SECRET.encode(), to_sign.encode(), hashlib.sha256).hexdigest()
-    return {
-        "X-BAPI-API-KEY": API_KEY, "X-BAPI-TIMESTAMP": ts,
-        "X-BAPI-RECV-WINDOW": recv, "X-BAPI-SIGN": sig,
-        "Content-Type": "application/json"
-    }
-
-def build_query(params):
-    return "&".join([f"{k}={params[k]}" for k in sorted(params)])
+def sign_request(params_str, ts, recv):
+    msg = ts + API_KEY + recv + params_str
+    return hmac.new(API_SECRET.encode(), msg.encode(), hashlib.sha256).hexdigest()
 
 def get_prijs():
     try:
-        r = requests.get(f"{BASE_URL}/v5/market/tickers", params={"category": CATEGORY, "symbol": SYMBOL}, timeout=10)
+        r = requests.get(f"{BASE}/v5/market/tickers", params={"category": "spot", "symbol": SYMBOL}, timeout=10)
         data = r.json()
-        if data.get("retCode") != 0:
-            print("PRIJS FAIL:", data)
-            return 0.0
-        lst = data.get("result", {}).get("list", [])
-        if not lst:
-            return 0.0
-        return float(lst[0].get("lastPrice", 0))
+        return float(data["result"]["list"][0]["lastPrice"])
     except Exception as e:
-        print("PRIJS FAIL:", e)
+        print(f"PRIJS FAIL: {e}", flush=True)
         return 0.0
 
-def get_spot_balance(coin):
+def get_saldo(coin):
     try:
-        query = build_query({"accountType": "SPOT", "coin": coin})
-        headers = sign_headers(query)
-        r = requests.get(f"{BASE_URL}/v5/account/wallet-balance?{query}", headers=headers, timeout=10)
+        ts = str(int(time.time() * 1000))
+        recv = "5000"
+        params = f"accountType=UNIFIED&coin={coin}"
+        headers = {
+            "X-BAPI-API-KEY": API_KEY,
+            "X-BAPI-TIMESTAMP": ts,
+            "X-BAPI-RECV-WINDOW": recv,
+            "X-BAPI-SIGN": sign_request(params, ts, recv)
+        }
+        r = requests.get(f"{BASE}/v5/account/wallet-balance?{params}", headers=headers, timeout=10)
         data = r.json()
         if data.get("retCode") != 0:
-            print(f"Saldo fout {coin} SPOT:", data)
-            state["last_error"] = f"{coin}: {data.get('retCode')} {data.get('retMsg')}"
-            return None
-        lst = data.get("result", {}).get("list", [])
-        if not lst:
+            print(f"Saldo fout {coin}: {data}", flush=True)
             return 0.0
-        for c in lst[0].get("coin", []):
-            if c.get("coin") == coin:
-                return float(c.get("walletBalance", 0))
+        for c in data["result"]["list"][0]["coin"]:
+            if c["coin"] == coin:
+                return float(c["walletBalance"])
         return 0.0
     except Exception as e:
-        print(f"Saldo fout {coin}:", e)
+        print(f"Saldo fout {coin}: {e}", flush=True)
+        return 0.0
+
+def place_order(side, qty):
+    try:
+        ts = str(int(time.time() * 1000))
+        recv = "5000"
+        body = f'{{"category":"spot","symbol":"{SYMBOL}","side":"{side}","orderType":"Market","qty":"{qty}"}}'
+        headers = {
+            "X-BAPI-API-KEY": API_KEY,
+            "X-BAPI-TIMESTAMP": ts,
+            "X-BAPI-RECV-WINDOW": recv,
+            "X-BAPI-SIGN": sign_request(body, ts, recv),
+            "Content-Type": "application/json"
+        }
+        r = requests.post(f"{BASE}/v5/order/create", headers=headers, data=body, timeout=10)
+        print(f"ORDER {side} {qty}: {r.json()}", flush=True)
+        return r.json()
+    except Exception as e:
+        print(f"ORDER FAIL: {e}", flush=True)
         return None
 
-def get_klines(limit=200):
-    try:
-        r = requests.get(f"{BASE_URL}/v5/market/kline", params={"category": CATEGORY, "symbol": SYMBOL, "interval": INTERVAL, "limit": limit}, timeout=10)
-        data = r.json()
-        if data.get("retCode") != 0:
-            print("KLINES FAIL:", data)
-            return [], [], []
-        klines = list(reversed(data.get("result", {}).get("list", [])))
-        closes = [float(k[4]) for k in klines]
-        highs = [float(k[2]) for k in klines]
-        lows = [float(k[3]) for k in klines]
-        return closes, highs, lows
-    except Exception as e:
-        print("KLINES FAIL:", e)
-        return [], [], []
+def bot_loop():
+    while True:
+        try:
+            prijs = get_prijs()
+            usdt = get_saldo("USDT")
+            pepe = get_saldo("PEPE")
+            print(f"Prijs {prijs} - USDT {usdt} - PEPE {pepe}", flush=True)
 
-def calc_atr(highs, lows, closes, period):
-    if len(closes) < period + 2:
-        return [0.0]*len(closes)
-    trs = []
-    for i in range(1, len(closes)):
-        tr = max(highs[i]-lows[i], abs(highs[i]-closes[i-1]), abs(lows[i]-closes[i-1]))
-        trs.append(tr)
-    atr = [sum(trs[:period])/period]
-    for i in range(period, len(trs)):
-        atr.append((atr[-1]*(period-1) + trs[i]) / period)
-    return [0.0]*(len(closes)-len(atr)) + atr
+            if prijs == 0:
+                time.sleep(30)
+                continue
 
-def calc_supertrend(highs, lows, closes, atr_period=10, mult=3.0):
-    atr = calc_atr(highs, lows, closes, atr_period)
-    n = len(closes)
-    upper = [0.0]*n
-    lower = [0.0]*n
-    trend = [1]*n
-    for i in range(1, n):
-        hl2 = (highs[i]+lows[i])/2
-        upper[i] = hl2 + mult*atr[i]
-        lower[i] = hl2 - mult*atr[i]
-        if closes[i] > upper
+            # KOOP LOGICA
+            if prijs <= BUY_PRICE and usdt >= TRADE_USDT:
+                qty = int(TRADE_USDT / prijs)
+                print(f"KOOP! Prijs {prijs} <= {BUY_PRICE}", flush=True)
+                place_order("Buy", str(qty))
+
+            # VERKO
