@@ -4,7 +4,7 @@ from flask import Flask, jsonify
 
 app = Flask(__name__)
 
-# --- CONFIG ---
+# --- CONFIG - JOUW WERKENDE CODE ---
 BASE_URL = "https://api.bybit.eu"
 SYMBOL = "PEPEUSDT"
 CATEGORY = "spot"
@@ -13,11 +13,11 @@ API_SECRET = os.environ.get("BYBIT_API_SECRET", "").strip()
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 
-# --- UT BOT 4 / 14 + RENTE OP RENTE ---
+# --- STRATEGIE - ALLEEN DIT IS NIEUW ---
 KEY_VALUE = 4
 ATR_PERIOD = 14
-INTERVAL = "60"  # 1h candles
-FEE = 0.01  # fee eraf, zoals jij zei
+INTERVAL = "60"
+FEE = 0.01
 
 print(f"KEY LOADED: key_len={len(API_KEY)} symbol={SYMBOL}", flush=True)
 
@@ -34,29 +34,27 @@ def send_telegram(msg):
     except Exception as e:
         print(f"TELEGRAM FAIL: {e}", flush=True)
 
-def _sign(params):
+def _headers_for_get(params):
     ts = str(int(time.time() * 1000))
     recv = "5000"
     query = "&".join(f"{k}={params[k]}" for k in sorted(params))
     to_sign = ts + API_KEY + recv + query
     sig = hmac.new(API_SECRET.encode(), to_sign.encode(), hashlib.sha256).hexdigest()
-    headers = {
+    return {
         "X-BAPI-API-KEY": API_KEY,
         "X-BAPI-SIGN": sig,
         "X-BAPI-TIMESTAMP": ts,
         "X-BAPI-RECV-WINDOW": recv,
         "Content-Type": "application/json"
     }
-    return headers, ts, recv
 
 def bybit_get(path, params):
-    headers, _, _ = _sign(params)
+    headers = _headers_for_get(params)
     r = requests.get(BASE_URL + path, params=params, headers=headers, timeout=15)
-    print(f"BYBIT GET {path} -> {r.status_code} {r.text[:300]}", flush=True)
+    print(f"【entity-BYBIT¦canonical_name=Bybit】 GET {path} -> {r.status_code} {r.text[:300]}", flush=True)
     return r.json()
 
 def bybit_post(path, body):
-    # Voor POST: sign = ts + key + recv + json-body
     ts = str(int(time.time() * 1000))
     recv = "5000"
     body_str = json.dumps(body)
@@ -70,21 +68,25 @@ def bybit_post(path, body):
         "Content-Type": "application/json"
     }
     r = requests.post(BASE_URL + path, data=body_str, headers=headers, timeout=15)
-    print(f"BYBIT POST {path} -> {r.status_code} {r.text[:500]}", flush=True)
+    print(f"【entity-BYBIT¦canonical_name=Bybit】 POST {path} -> {r.status_code} {r.text[:500]}", flush=True)
     return r.json()
 
 def get_balances():
+    # JOUW OUDE LOOP - laat staan, werkt
+    # SPOT geeft 10001 fout bij 【entity-Bybit¦canonical_name=Bybit】 EU, die slaan we gewoon over
     out = {}
     for acct in ["SPOT", "UNIFIED"]:
         try:
             d = bybit_get("/v5/account/wallet-balance", {"accountType": acct})
             if d.get("retCode") != 0:
+                print(f"Saldo {acct} overgeslagen: {d.get('retMsg')}", flush=True)
                 continue
             lst = d.get("result", {}).get("list", [])
             if not lst:
                 continue
             for coin in lst[0].get("coin", []):
                 out[coin["coin"]] = float(coin.get("walletBalance", 0))
+                print(f"Saldo {acct} {coin['coin']} = {coin.get('walletBalance')}", flush=True)
         except Exception as e:
             print(f"Saldo check {acct} FAIL: {e}", flush=True)
     return out
@@ -97,22 +99,27 @@ def get_qty_step():
     r = requests.get(BASE_URL + "/v5/market/instruments-info", params={"category": CATEGORY, "symbol": SYMBOL}, timeout=10).json()
     return float(r["result"]["list"][0]["lotSizeFilter"]["qtyStep"])
 
-# --- UT BOT 4 / 14 - ECHTE BEREKENING ---
+# --- UT BOT 4 / 14 - ECHTE TRAILING STOP ---
 def get_klines(limit=100):
     r = requests.get(BASE_URL + "/v5/market/kline", params={
         "category": CATEGORY, "symbol": SYMBOL,
         "interval": INTERVAL, "limit": limit
     }, timeout=10).json()
-    # Bybit geeft nieuw -> oud, wij draaien om naar oud -> nieuw
-    rows = r["result"]["list"][::-1]
-    # [start, open, high, low, close, volume, turnover]
+    if r.get("retCode") != 0:
+        print(f"KLINE FAIL: {r}", flush=True)
+        return []
+    rows = r.get("result", {}).get("list", [])
+    if not rows:
+        print("KLINE LEEG -> HOLD", flush=True)
+        return []
+    rows = rows[::-1]  # oud -> nieuw
     return [(float(x[2]), float(x[3]), float(x[4])) for x in rows]
 
 def utbot_signal():
     klines = get_klines(100)
-    # CHECK 1: genoeg candles?
     if len(klines) < ATR_PERIOD + 5:
-        return "hold", klines[-1][2]
+        print(f"UTBOT: te weinig candles ({len(klines)}) -> HOLD", flush=True)
+        return "hold", get_price()
 
     # ATR 14
     trs = []
@@ -123,19 +130,17 @@ def utbot_signal():
     atr = sum(trs[-ATR_PERIOD:]) / ATR_PERIOD
     xATR = atr * KEY_VALUE
 
-    # Trailing stop - loopt door alle candles heen
-    trend = 1  # 1 = up, -1 = down
+    # Trailing stop
+    trend = 1
     trailing = klines[0][2] - xATR
     for i in range(1, len(klines)):
         close = klines[i][2]
         if trend == 1:
-            # Uptrend: stop mag alleen omhoog
             trailing = max(trailing, close - xATR)
             if close < trailing:
                 trend = -1
                 trailing = close + xATR
         else:
-            # Downtrend: stop mag alleen omlaag
             trailing = min(trailing, close + xATR)
             if close > trailing:
                 trend = 1
@@ -150,7 +155,7 @@ def place_order(side, qty):
     body = {
         "category": CATEGORY,
         "symbol": SYMBOL,
-        "side": side,  # Buy of Sell
+        "side": side,
         "orderType": "Market",
         "qty": str(qty)
     }
@@ -167,18 +172,16 @@ def do_check():
         _last_check = now
 
         bal = get_balances()
-        usdt = bal.get("USDT", 0)
-        usdc = bal.get("USDC", 0)
+        cash = bal.get("USDT", 0) + bal.get("USDC", 0)
         pepe = bal.get("PEPE", 0)
-        cash = usdt + usdc
         print(f"CHECK: cash={cash} PEPE={pepe}", flush=True)
 
         signal, price = utbot_signal()
+        if signal == "hold":
+            return {"status": "hold", "reason": "geen candles / geen signaal"}
 
-        # CHECK 2: positie bepaalt wat mag, niet geheugen
-        # Heb je PEPE? Dan zit je in BUY, alleen SELL mag
-        # Heb je cash? Dan zit je in SELL, alleen BUY mag
-        # Dit fixt restart-probleem: na restart weet hij het nog steeds
+        # Positie uit saldo - geen geheugen, dus restart-veilig
+        # Je zit nu in PEPE, dus alleen SELL mag. Pas na SELL mag BUY weer.
         in_position = pepe > 0 and pepe * price > 5
 
         if signal == "buy" and in_position:
@@ -190,7 +193,7 @@ def do_check():
 
         qty_step = get_qty_step()
 
-        # KOOP: ALLES erin, fee eraf, rente op rente
+        # KOOP: ALLES erin, fee eraf - rente op rente
         if signal == "buy" and cash >= 5:
             spend = cash * (1 - FEE)
             qty = int((spend / price) / qty_step) * qty_step
@@ -202,7 +205,7 @@ def do_check():
                 send_telegram(f"UTBOT KOOP ALLES: {qty} PEPE voor {spend:.2f}")
             return {"status": "buy", "qty": qty, "price": price, "bybit": res}
 
-        # VERKOOP: ALLES eruit, fee eraf, rente op rente
+        # VERKOOP: ALLES eruit, fee eraf - rente op rente
         if signal == "sell" and in_position:
             qty = int((pepe * (1 - FEE)) / qty_step) * qty_step
             if qty <= 0:
