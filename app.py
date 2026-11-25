@@ -1,221 +1,250 @@
-import os, time, requests, hmac, hashlib, json, threading
-from flask import Flask, request, jsonify
+import os
+import time
+import hmac
+import hashlib
+import json
+import threading
+import requests
+from flask import Flask, jsonify
+
 app = Flask(__name__)
 
-BYBIT_API_KEY = os.environ.get("BYBIT_API_KEY", "")
-BYBIT_API_SECRET = os.environ.get("BYBIT_API_SECRET", "")
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
-SYMBOL = "PEPEUSDT"
-CATEGORY = "spot"
-INTERVAL = "15"
-ATR_PERIOD = 14
-BASE_URL = "https://api.bybit.eu"
+BASE_URL = os.getenv("BASE_URL", "https://api.bybit.eu").strip()
+API_KEY = os.getenv("BYBIT_API_KEY", "").strip()
+API_SECRET = os.getenv("BYBIT_API_SECRET", "").strip()
+TG_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+TG_CHAT = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+
+BUY_AMOUNT = 10.0
+CHECK_SECONDS = 60
+running = False
 
 def log(msg):
     print(msg, flush=True)
 
-def send_telegram(msg):
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+def send_tg(msg):
+    if not TG_TOKEN or not TG_CHAT:
         return
     try:
-        url = "https://api.telegram.org/bot" + TELEGRAM_BOT_TOKEN + "/sendMessage"
-        requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": msg}, timeout=10)
+        requests.post(
+            f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
+            json={"chat_id": TG_CHAT, "text": msg},
+            timeout=10,
+        )
     except Exception as e:
-        log(f"Telegram error: {e}")
+        log(f"Telegram fout: {e}")
 
-def _sign(ts, recv, payload=""):
-    msg = ts + BYBIT_API_KEY + recv + payload
-    return hmac.new(BYBIT_API_SECRET.encode(), msg.encode(), hashlib.sha256).hexdigest()
+def make_sign(timestamp, recv_window, payload_str):
+    msg = timestamp + API_KEY + recv_window + payload_str
+    return hmac.new(API_SECRET.encode(), msg.encode(), hashlib.sha256).hexdigest()
 
-def _headers(ts, recv, sign):
-    return {"X-BAPI-API-KEY": BYBIT_API_KEY, "X-BAPI-TIMESTAMP": ts, "X-BAPI-RECV-WINDOW": recv, "X-BAPI-SIGN": sign, "Content-Type": "application/json"}
-
-def _extract_list(result):
-    if isinstance(result, dict):
-        return result.get("list", []) or []
-    if isinstance(result, list):
-        return result
-    return []
-
-def get_price():
+def safe_json(resp):
     try:
-        url = BASE_URL + "/v5/market/tickers"
-        params = {"category": CATEGORY, "symbol": SYMBOL}
-        r = requests.get(url, params=params, timeout=10).json()
-        if r.get("retCode") != 0:
-            log(f"Prijs error retCode: {r}")
-            return 0
-        lst = _extract_list(r.get("result", {}))
-        if not lst:
-            return 0
-        return float(lst[0].get("lastPrice") or 0)
-    except Exception as e:
-        log(f"Prijs error: {e}")
-        return 0
+        return resp.json()
+    except Exception:
+        log(f"Geen JSON terug, status {resp.status_code}, body: {resp.text[:300]}")
+        return {}
 
-def get_balance(coin):
-    for acct in ["UNIFIED", "SPOT", "FUND"]:
-        try:
-            if not BYBIT_API_KEY or not BYBIT_API_SECRET:
-                return 0.0
-            ts = str(int(time.time() * 1000))
-            recv = "5000"
-            query = "accountType=" + acct + "&coin=" + coin
-            sign = _sign(ts, recv, query)
-            url = BASE_URL + "/v5/account/wallet-balance?" + query
-            r = requests.get(url, headers=_headers(ts, recv, sign), timeout=10).json()
-            if r.get("retCode") != 0:
-                log(f"Saldo error {coin} {acct}: {r}")
-                continue
-            lst = _extract_list(r.get("result", {}))
-            if not lst:
-                continue
-            coins = lst[0].get("coin", []) or []
-            for c in coins:
-                if c.get("coin") == coin:
-                    return float(c.get("walletBalance") or 0)
-        except Exception as e:
-            log(f"Saldo error {coin} {acct}: {e}")
-            continue
+def get_balance_unified(coin):
+    ts = str(int(time.time() * 1000))
+    recv = "5000"
+    query = "accountType=UNIFIED&coin=" + coin
+    sign = make_sign(ts, recv, query)
+    headers = {
+        "X-BAPI-API-KEY": API_KEY,
+        "X-BAPI-TIMESTAMP": ts,
+        "X-BAPI-RECV-WINDOW": recv,
+        "X-BAPI-SIGN": sign,
+    }
+    r = safe_json(requests.get(BASE_URL + "/v5/account/wallet-balance?" + query, headers=headers, timeout=10))
+    if r.get("retCode") != 0:
+        log(f"Balance UNIFIED fail {coin}: {r}")
+        return 0.0
+    lst = r.get("result", {}).get("list", []) or []
+    if not lst:
+        return 0.0
+    coins = lst[0].get("coin", []) or []
+    for c in coins:
+        if c.get("coin") == coin:
+            return float(c.get("walletBalance") or 0)
     return 0.0
 
-def get_free_usdt():
-    return get_balance("USDT")
+def get_balance_funding(coin):
+    ts = str(int(time.time() * 1000))
+    recv = "5000"
+    query = "accountType=FUND&coin=" + coin
+    sign = make_sign(ts, recv, query)
+    headers = {
+        "X-BAPI-API-KEY": API_KEY,
+        "X-BAPI-TIMESTAMP": ts,
+        "X-BAPI-RECV-WINDOW": recv,
+        "X-BAPI-SIGN": sign,
+    }
+    r = safe_json(requests.get(BASE_URL + "/v5/asset/transfer/query-account-coins-balance?" + query, headers=headers, timeout=10))
+    if r.get("retCode") != 0:
+        return 0.0
+    res = r.get("result", {})
+    lst = []
+    if isinstance(res, dict):
+        lst = res.get("list", []) or []
+        if not lst and res.get("coin"):
+            lst = [res]
+    elif isinstance(res, list):
+        lst = res
+    for c in lst:
+        if isinstance(c, dict) and c.get("coin") == coin:
+            return float(c.get("balance") or c.get("walletBalance") or 0)
+    return 0.0
 
-def get_pepe_balance():
-    return get_balance("PEPE")
+def get_balance():
+    try:
+        if not API_KEY or not API_SECRET:
+            log("Balance fout: geen API key in Render")
+            return 0.0, 0.0, 0.0
+        usdc_u = get_balance_unified("USDC")
+        usdt_u = get_balance_unified("USDT")
+        pepe_u = get_balance_unified("PEPE")
+        usdc = usdc_u
+        usdt = usdt_u
+        pepe = pepe_u
+        if usdc == 0:
+            usdc = get_balance_funding("USDC")
+        if usdt == 0:
+            usdt = get_balance_funding("USDT")
+        if pepe == 0:
+            pepe = get_balance_funding("PEPE")
+        return usdt, usdc, pepe
+    except Exception as e:
+        log(f"Balance fout: {e}")
+        return 0.0, 0.0, 0.0
 
-def is_in_positie():
-    prijs = get_price()
-    if prijs <= 0:
-        return get_pepe_balance() > 0
-    return get_pepe_balance() * prijs > 1
+def get_closes(symbol):
+    try:
+        r = safe_json(requests.get(
+            BASE_URL + "/v5/market/kline",
+            params={"category": "spot", "symbol": symbol, "interval": "15", "limit": 200},
+            timeout=10,
+        ))
+        if r.get("retCode") != 0:
+            log(f"Klines fail {symbol}: {r}")
+            return None
+        lst = r.get("result", {}).get("list", []) or []
+        closes = [float(x[4]) for x in lst]
+        if len(closes) < 60:
+            return None
+        closes.reverse()
+        return closes[:-1]
+    except Exception as e:
+        log(f"Klines fout: {e}")
+        return None
 
-def place_order(side, qty):
+def trend_up(closes):
+    try:
+        if len(closes) < 50:
+            return False
+        sma50 = sum(closes[-50:]) / 50
+        return closes[-1] > sma50
+    except Exception:
+        return False
+
+def place_order(symbol, side, qty):
     try:
         ts = str(int(time.time() * 1000))
         recv = "5000"
-        body = {"category": CATEGORY, "symbol": SYMBOL, "side": side, "orderType": "Market", "qty": str(qty)}
-        payload = json.dumps(body)
-        sign = _sign(ts, recv, payload)
-        url = BASE_URL + "/v5/order/create"
-        r = requests.post(url, headers=_headers(ts, recv, sign), data=payload, timeout=10).json()
-        log(f"Order {side} {qty}: {r}")
+        body = {
+            "category": "spot",
+            "symbol": symbol,
+            "side": side,
+            "orderType": "Market",
+            "qty": str(int(qty)),
+        }
+        body_str = json.dumps(body)
+        sign = make_sign(ts, recv, body_str)
+        headers = {
+            "X-BAPI-API-KEY": API_KEY,
+            "X-BAPI-TIMESTAMP": ts,
+            "X-BAPI-RECV-WINDOW": recv,
+            "X-BAPI-SIGN": sign,
+            "Content-Type": "application/json",
+        }
+        r = safe_json(requests.post(
+            BASE_URL + "/v5/order/create",
+            headers=headers,
+            data=body_str,
+            timeout=10,
+        ))
+        log(f"ORDER {side} {symbol} {qty}: {r}")
         return r
     except Exception as e:
-        log(f"Order error: {e}")
+        log(f"Order fout: {e}")
         return {}
 
-def do_buy():
-    usdt = get_free_usdt()
-    prijs = get_price()
-    if usdt < 5 or prijs <= 0:
-        log(f"BUY: te weinig USDT ({usdt}) of geen prijs ({prijs})")
-        return
-    qty = int(usdt / prijs)
-    if qty <= 0:
-        return
-    log(f"BUY: {qty} PEPE voor {usdt} USDT @ {prijs}")
-    place_order("Buy", qty)
-    send_telegram(f"BUY: {qty} PEPE @ {prijs} - USDT: {usdt}")
-
-def do_sell():
-    pepe = get_pepe_balance()
-    prijs = get_price()
-    if pepe <= 0 or prijs <= 0:
-        log(f"SELL: geen PEPE ({pepe}) of geen prijs ({prijs})")
-        return
-    qty = int(pepe)
-    log(f"SELL: {qty} PEPE @ {prijs}")
-    place_order("Sell", qty)
-    send_telegram(f"SELL: {qty} PEPE @ {prijs}")
-
-def get_klines():
-    try:
-        url = BASE_URL + "/v5/market/kline"
-        params = {"category": CATEGORY, "symbol": SYMBOL, "interval": INTERVAL, "limit": 200}
-        r = requests.get(url, params=params, timeout=10).json()
-        lst = _extract_list(r.get("result", {}))
-        return lst
-    except Exception as e:
-        log(f"Klines error: {e}")
-        return []
-
-def utbot_signal():
-    klines = get_klines()
-    if len(klines) < ATR_PERIOD + 2:
-        return 0
-    klines = list(reversed(klines))
-    closes = [float(k[4]) for k in klines]
-    highs = [float(k[2]) for k in klines]
-    lows = [float(k[3]) for k in klines]
-    trs = []
-    for i in range(1, len(klines)):
-        trs.append(max(highs[i]-lows[i], abs(highs[i]-closes[i-1]), abs(lows[i]-closes[i-1])))
-    atr = sum(trs[-ATR_PERIOD:]) / ATR_PERIOD if trs else 0
-    last_close = closes[-1]
-    prev_close = closes[-2]
-    if last_close > prev_close + atr * 0.1:
-        return 1
-    if last_close < prev_close - atr * 0.1:
-        return -1
-    return 0
-
-last_handled_signal = 0
-
 def bot_loop():
-    global last_handled_signal
-    log("Bot loop gestart")
-    send_telegram("Bot gestart: SPOT via bybit.eu")
+    global running
+    if running:
+        return
+    running = True
+    log("Bot loop gestart - definitieve versie - PEPEUSDC / UNIFIED+FUNDING")
+    send_tg("Pepebot-3 gestart - definitieve versie AAN")
     while True:
         try:
-            prijs = get_price()
-            usdt = get_free_usdt()
-            log(f"Check - Prijs: {prijs} - USDT: {usdt}")
-            sig = utbot_signal()
-            if sig == 1 and last_handled_signal != 1:
-                if not is_in_positie():
-                    do_buy()
-                    last_handled_signal = 1
-            elif sig == -1 and last_handled_signal != -1:
-                if is_in_positie():
-                    do_sell()
-                    last_handled_signal = -1
-            time.sleep(60)
+            usdt, usdc, pepe = get_balance()
+            if usdc >= 1:
+                symbol, money = "PEPEUSDC", usdc
+            elif usdt >= 1:
+                symbol, money = "PEPEUSDT", usdt
+                log("WAARSCHUWING: geld staat in USDT, Bybit EU heeft geen USDT-paren. Zet om naar USDC.")
+            else:
+                symbol, money = "PEPEUSDC", 0.0
+            closes = get_closes(symbol)
+            if closes is None:
+                log("Geen klines, over 60 sec opnieuw")
+                time.sleep(CHECK_SECONDS)
+                continue
+            price = closes[-1]
+            up = trend_up(closes)
+            log(f"Check: USDT {usdt:.2f} USDC {usdc:.2f} PEPE {pepe:.0f} SYMBOL {symbol} UP={up} prijs {price}")
+            if up and money >= 1 and pepe == 0:
+                buy_usd = min(money, BUY_AMOUNT)
+                qty = int(buy_usd / price)
+                if qty > 0:
+                    res = place_order(symbol, "Buy", qty)
+                    if res and res.get("retCode") == 0:
+                        send_tg(f"PEPE GEKOCHT: {qty} voor ~{buy_usd:.2f} prijs {price}")
+                    else:
+                        log(f"BUY afgewezen: {res}")
+            elif not up and pepe > 0:
+                res = place_order(symbol, "Sell", int(pepe))
+                if res and res.get("retCode") == 0:
+                    send_tg(f"PEPE VERKOCHT: {pepe:.0f} prijs {price}")
+                else:
+                    log(f"SELL afgewezen: {res}")
         except Exception as e:
-            log(f"Loop error: {e}")
-            time.sleep(60)
+            log(f"Loop fout, gaat door: {e}")
+        time.sleep(CHECK_SECONDS)
 
 @app.route("/")
 def home():
-    return f"Bot live - Prijs: {get_price()} - USDT: {get_free_usdt()}"
+    return "Pepebot-3 live - definitieve versie"
 
 @app.route("/ping")
 def ping():
-    return "PONG"
+    return "pong"
 
-@app.route("/status")
-def status():
-    return jsonify({"prijs": get_price(), "usdt": get_free_usdt(), "pepe": get_pepe_balance(), "symbool": SYMBOL})
+@app.route("/test-key")
+def test_key():
+    usdt, usdc, pepe = get_balance()
+    return jsonify({
+        "ok": True,
+        "USDT": usdt,
+        "USDC": usdc,
+        "PEPE": pepe,
+        "base": BASE_URL,
+        "keys_set": bool(API_KEY and API_SECRET),
+    })
 
-@app.route("/webhook", methods=["POST"])
-def webhook():
-    return jsonify({"ok": True})
-
-@app.route("/telegram", methods=["POST"])
-def telegram():
-    return jsonify({"ok": True})
-
-_loop_started = False
-_lock = threading.Lock()
-def start_loop_once():
-    global _loop_started
-    with _lock:
-        if not _loop_started:
-            _loop_started = True
-            threading.Thread(target=bot_loop, daemon=True).start()
-start_loop_once()
+threading.Thread(target=bot_loop, daemon=True).start()
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
+    port = int(os.getenv("PORT", "10000"))
+    app.run(host="0.0.0.0", port=port)
