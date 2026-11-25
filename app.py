@@ -4,13 +4,16 @@ from flask import Flask, jsonify
 
 app = Flask(__name__)
 
-BASE_URL = "https://api." + "bybit" + ".eu"
+BASE_URL = "https://api.bybit.eu"
 SYMBOL = "PEPEUSDT"
 CATEGORY = "spot"
-API_KEY = os.environ.get("BYBIT_API_KEY", "").strip()
-API_SECRET = os.environ.get("BYBIT_API_SECRET", "").strip()
+API_KEY = os.environ.get("【entity-BYBIT_API_KEY¦canonical_name=Bybit】", "").strip()
+API_SECRET = os.environ.get("【entity-BYBIT_API_SECRET¦canonical_name=Bybit】", "").strip()
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
+
+UT_KEY = 4
+UT_ATR_PERIOD = 14
 
 print(f"KEY LOADED: key_len={len(API_KEY)} secret_len={len(API_SECRET)} base={BASE_URL} symbol={SYMBOL}", flush=True)
 
@@ -87,25 +90,76 @@ def get_qty_step():
     return float(r["result"]["list"][0]["lotSizeFilter"]["qtyStep"])
 
 def get_klines():
-    try:
-        r = requests.get(BASE_URL + "/v5/market/kline", params={
-            "category": "spot",
-            "symbol": SYMBOL,
-            "interval": "15",
-            "limit": 50
-        }, timeout=10).json()
-        print(f"KLINE RAW: {str(r)[:300]}", flush=True)
-        if r.get("retCode") != 0:
-            print(f"KLINE FAIL retCode={r.get('retCode')} {r.get('retMsg')}", flush=True)
-            return []
-        lst = r.get("result", {}).get("list", [])
-        if not lst:
-            print("KLINE LEEG - result list is leeg", flush=True)
-            return []
-        return lst
-    except Exception as e:
-        print(f"KLINE EXCEPT: {e}", flush=True)
-        return []
+    for interval in ["15", "60", "D"]:
+        try:
+            r = requests.get(BASE_URL + "/v5/market/kline", params={
+                "category": "spot",
+                "symbol": SYMBOL,
+                "interval": interval,
+                "limit": 100
+            }, timeout=10).json()
+            lst = r.get("result", {}).get("list", [])
+            if lst:
+                print(f"KLINE OK interval={interval} candles={len(lst)}", flush=True)
+                return list(reversed(lst))
+        except Exception as e:
+            print(f"KLINE EXCEPT {interval}: {e}", flush=True)
+    print("KLINE LEEG voor alle intervals", flush=True)
+    return []
+
+def utbot_signal(candles):
+    if len(candles) < UT_ATR_PERIOD + 5:
+        return "hold", 0, 0
+    closes = [float(c[4]) for c in candles]
+    highs = [float(c[2]) for c in candles]
+    lows = [float(c[3]) for c in candles]
+    tr_list = []
+    atr_list = []
+    for i in range(1, len(closes)):
+        tr = max(highs[i] - lows[i], abs(highs[i] - closes[i-1]), abs(lows[i] - closes[i-1]))
+        tr_list.append(tr)
+    for i in range(len(tr_list)):
+        if i < UT_ATR_PERIOD:
+            atr_list.append(sum(tr_list[:i+1]) / (i+1))
+        else:
+            atr_list.append((atr_list[-1] * (UT_ATR_PERIOD - 1) + tr_list[i]) / UT_ATR_PERIOD)
+    atr = [0] + atr_list
+    trailing = [0] * len(closes)
+    pos = [0] * len(closes)
+    for i in range(len(closes)):
+        nloss = UT_KEY * atr[i]
+        if i == 0:
+            trailing[i] = closes[i] + nloss
+            pos[i] = 0
+            continue
+        if closes[i] > trailing[i-1] and closes[i-1] > trailing[i-1]:
+            trailing[i] = max(trailing[i-1], closes[i] - nloss)
+        elif closes[i] < trailing[i-1] and closes[i-1] < trailing[i-1]:
+            trailing[i] = min(trailing[i-1], closes[i] + nloss)
+        elif closes[i] > trailing[i-1]:
+            trailing[i] = closes[i] - nloss
+        else:
+            trailing[i] = closes[i] + nloss
+        if closes[i] > trailing[i] and closes[i-1] <= trailing[i-1]:
+            pos[i] = 1
+        elif closes[i] < trailing[i] and closes[i-1] >= trailing[i-1]:
+            pos[i] = -1
+        else:
+            pos[i] = pos[i-1]
+    last_pos = pos[-1]
+    prev_pos = pos[-2]
+    last_close = closes[-1]
+    last_trail = trailing[-1]
+    print(f"UTBOT: close={last_close} trail={last_trail} pos={last_pos} prev={prev_pos}", flush=True)
+    if last_pos == 1 and prev_pos != 1:
+        return "buy", last_close, last_trail
+    if last_pos == -1 and prev_pos != -1:
+        return "sell", last_close, last_trail
+    if last_pos == 1:
+        return "hold_buy", last_close, last_trail
+    if last_pos == -1:
+        return "hold_sell", last_close, last_trail
+    return "hold", last_close, last_trail
 
 def do_check():
     global _last_check
@@ -116,46 +170,52 @@ def do_check():
         if now - _last_check < 30:
             return {"status": "too soon, wait 30s"}
         _last_check = now
-
         bal = get_balances()
         usdc = bal.get("USDC", 0)
         usdt = bal.get("USDT", 0)
         pepe = bal.get("PEPE", 0)
         cash = usdc + usdt
         print(f"CHECK: cash={cash} USDC={usdc} USDT={usdt} PEPE={pepe}", flush=True)
-
         candles = get_klines()
-        if len(candles) < 20:
+        if len(candles) < UT_ATR_PERIOD + 5:
             print(f"UTBOT: te weinig candles ({len(candles)}) -> HOLD", flush=True)
             return {"status": "hold", "reason": "te weinig candles", "cash": cash, "pepe": pepe}
-
-        if pepe > 100000:
-            print(f"HOLD: al PEPE in bezit ({pepe}), niet opnieuw kopen", flush=True)
-            return {"status": "hold", "reason": "al PEPE in bezit", "cash": cash, "pepe": pepe}
-
-        if cash < 5:
-            print(f"HOLD: te weinig cash ({cash})", flush=True)
-            return {"status": "hold", "reason": "te weinig cash", "cash": cash, "pepe": pepe}
-
-        price = get_price()
-        qty_step = get_qty_step()
-        buy_amount = min(cash * 0.9, 90)
-        qty = round((buy_amount / price) / qty_step) * qty_step
-        print(f"BUY qty={qty} price={price}", flush=True)
-
-        res = api_post("/v5/order/create", {
-            "category": "spot",
-            "symbol": SYMBOL,
-            "side": "Buy",
-            "orderType": "Market",
-            "qty": str(qty)
-        })
-        if res.get("retCode") == 0:
-            send_telegram(f"PEPE gekocht: {qty} @ {price}")
-            return {"status": "ok", "qty": qty, "price": price}
-        else:
-            return {"status": "fail", "error": res.get("retMsg"), "cash": cash, "pepe": pepe}
-
+        signal, price, trail = utbot_signal(candles)
+        print(f"SIGNAL: {signal} price={price} trail={trail}", flush=True)
+        if signal == "sell" and pepe > 100000:
+            qty_step = get_qty_step()
+            qty = round(pepe / qty_step) * qty_step
+            print(f"SELL qty={qty} price={price}", flush=True)
+            res = api_post("/v5/order/create", {
+                "category": "spot",
+                "symbol": SYMBOL,
+                "side": "Sell",
+                "orderType": "Market",
+                "qty": str(qty)
+            })
+            if res.get("retCode") == 0:
+                send_telegram(f"PEPE verkocht: {qty} @ {price} - UTBot SELL")
+                return {"status": "sold", "qty": qty, "price": price}
+            else:
+                return {"status": "fail", "error": res.get("retMsg")}
+        if signal == "buy" and pepe < 100000 and cash >= 5:
+            qty_step = get_qty_step()
+            buy_amount = min(cash * 0.9, 90)
+            qty = round((buy_amount / price) / qty_step) * qty_step
+            print(f"BUY qty={qty} price={price}", flush=True)
+            res = api_post("/v5/order/create", {
+                "category": "spot",
+                "symbol": SYMBOL,
+                "side": "Buy",
+                "orderType": "Market",
+                "qty": str(qty)
+            })
+            if res.get("retCode") == 0:
+                send_telegram(f"PEPE gekocht: {qty} @ {price} - UTBot BUY")
+                return {"status": "ok", "qty": qty, "price": price}
+            else:
+                return {"status": "fail", "error": res.get("retMsg")}
+        return {"status": "hold", "signal": signal, "cash": cash, "pepe": pepe, "price": price}
     except Exception as e:
         print(f"CHECK FAIL: {e}", flush=True)
         return {"status": "fail", "error": str(e)}
