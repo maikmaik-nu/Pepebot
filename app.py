@@ -1,190 +1,197 @@
-import os, time, hmac, hashlib, json, threading, requests, math
+import os, time, hmac, hashlib, json, threading
+import requests
 from flask import Flask, jsonify
+
 app = Flask(__name__)
 
 BASE_URL = "https://api.bybit.eu"
-API_KEY = os.getenv("BYBIT_API_KEY", "").strip()
-API_SECRET = os.getenv("BYBIT_API_SECRET", "").strip()
-TG_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-TG_CHAT = os.getenv("TELEGRAM_CHAT_ID", "").strip()
-
 SYMBOL = "PEPEUSDC"
-BUY_AMOUNT = 100.0
-USE_ALL_BALANCE = True
-CHECK_SECONDS = 60
-TAKE_PROFIT_PCT = 5.0
-STOP_LOSS_PCT = -3.0
+CATEGORY = "spot"
+API_KEY = os.environ.get("BYBIT_API_KEY", "").strip()
+API_SECRET = os.environ.get("BYBIT_API_SECRET", "").strip()
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "").strip()
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 
-running = False
-bought_price = 0.0
-bought_qty = 0
-last_signal = "NONE"
-trade_count = 0
+print(f"KEY LOADED: key_len={len(API_KEY)} secret_len={len(API_SECRET)} base={BASE_URL} symbol={SYMBOL}", flush=True)
 
-def log(msg):
-    print(msg, flush=True)
+_lock = threading.Lock()
+_last_check = 0
+_prev_signal = "NEUTRAAL"
+_bought_at = 0.0
+_bought_qty = 0.0
 
-def send_tg(msg):
-    if not TG_TOKEN or not TG_CHAT:
+def send_telegram(msg):
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        print(f"TELEGRAM SKIP: {msg}", flush=True)
         return
     try:
-        requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage", json={"chat_id": TG_CHAT, "text": msg}, timeout=10)
+        requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+            json={"chat_id": TELEGRAM_CHAT_ID, "text": msg}, timeout=10)
     except Exception as e:
-        log(f"Telegram fout: {e}")
+        print(f"TELEGRAM FAIL: {e}", flush=True)
 
-def make_sign(timestamp, recv_window, payload_str):
-    msg = timestamp + API_KEY + recv_window + payload_str
-    return hmac.new(API_SECRET.encode(), msg.encode(), hashlib.sha256).hexdigest()
-
-def headers_for(ts, recv, sign):
-    return {
+def _sign(params):
+    ts = str(int(time.time() * 1000))
+    recv = "5000"
+    query = "&".join(f"{k}={params[k]}" for k in sorted(params))
+    to_sign = ts + API_KEY + recv + query
+    sig = hmac.new(API_SECRET.encode(), to_sign.encode(), hashlib.sha256).hexdigest()
+    headers = {
         "X-BAPI-API-KEY": API_KEY,
+        "X-BAPI-SIGN": sig,
         "X-BAPI-TIMESTAMP": ts,
         "X-BAPI-RECV-WINDOW": recv,
-        "X-BAPI-SIGN": sign,
-        "X-BAPI-SIGN-TYPE": "2",
         "Content-Type": "application/json"
     }
+    return headers
 
-def safe_json(resp):
-    try:
-        return resp.json()
-    except Exception:
-        return {}
+def bybit_get(path, params):
+    r = requests.get(BASE_URL + path, params=params, headers=_sign(params), timeout=15)
+    print(f"【entity-BYBIT¦canonical_name=Bybit】 GET {path} -> {r.status_code} {r.text[:300]}", flush=True)
+    return r.json()
 
 def bybit_post(path, body):
-    if not API_KEY or not API_SECRET:
-        return {"retCode": -1, "retMsg": "no api key"}
-    try:
-        ts = str(int(time.time() * 1000)); recv = "20000"
-        payload = json.dumps(body, separators=(",", ":"))
-        sign = make_sign(ts, recv, payload)
-        r = safe_json(requests.post(BASE_URL + path, headers=headers_for(ts, recv, sign), data=payload, timeout=10))
-        print(f"【entity-BYBIT¦canonical_name=BYBIT】 POST {path} -> {r.get('retCode')} {str(r)[:300]}", flush=True)
-        return r
-    except Exception as e:
-        log(f"【entity-BYBIT¦canonical_name=BYBIT】 POST FAIL {path}: {e}")
-        return {"retCode": -1, "retMsg": str(e)}
+    # POST: sign over body, geen query-params
+    ts = str(int(time.time() * 1000))
+    recv = "5000"
+    to_sign = ts + API_KEY + recv + json.dumps(body)
+    sig = hmac.new(API_SECRET.encode(), to_sign.encode(), hashlib.sha256).hexdigest()
+    headers = {
+        "X-BAPI-API-KEY": API_KEY,
+        "X-BAPI-SIGN": sig,
+        "X-BAPI-TIMESTAMP": ts,
+        "X-BAPI-RECV-WINDOW": recv,
+        "Content-Type": "application/json"
+    }
+    r = requests.post(BASE_URL + path, json=body, headers=headers, timeout=15)
+    print(f"【entity-BYBIT¦canonical_name=Bybit】 POST {path} -> {r.status_code} {r.text[:500]}", flush=True)
+    return r.json()
 
-def get_balance_unified(coin):
-    try:
-        query = "accountType=UNIFIED&coin=" + coin
-        ts = str(int(time.time() * 1000)); recv = "20000"
-        sign = make_sign(ts, recv, query)
-        r = safe_json(requests.get(BASE_URL + "/v5/account/wallet-balance?" + query, headers=headers_for(ts, recv, sign), timeout=10))
-        if r.get("retCode") != 0:
-            log(f"Balance UNIFIED fail {coin}: {r.get('retCode')} {r.get('retMsg')}")
-            return 0.0
-        lst = r.get("result", {}).get("list", []) or []
-        if not lst:
-            return 0.0
-        for c in lst[0].get("coin", []) or []:
-            if c.get("coin") == coin:
-                try:
-                    return float(c.get("walletBalance") or 0)
-                except Exception:
-                    return 0.0
-        return 0.0
-    except Exception as e:
-        log(f"Balance UNIFIED exception {coin}: {e}")
-        return 0.0
-
-def get_balance():
-    if not API_KEY or not API_SECRET:
-        log("Balance fout: geen API key in Render")
-        return 0.0, 0.0, 0.0
-    usdc = get_balance_unified("USDC")
-    usdt = get_balance_unified("USDT")
-    pepe = get_balance_unified("PEPE")
-    return usdt, usdc, pepe
-
-def get_klines(symbol):
-    try:
-        r = safe_json(requests.get(BASE_URL + "/v5/market/kline", params={"category": "spot", "symbol": symbol, "interval": "15", "limit": 200}, timeout=10))
-        if r.get("retCode") != 0:
-            return []
-        lst = r.get("result", {}).get("list", []) or []
-        lst = list(reversed(lst))
-        out = []
-        for k in lst:
-            try:
-                out.append({"open": float(k[1]), "high": float(k[2]), "low": float(k[3]), "close": float(k[4]), "volume": float(k[5])})
-            except Exception:
+def get_balances():
+    out = {}
+    for acct in ["SPOT", "UNIFIED"]:
+        try:
+            d = bybit_get("/v5/account/wallet-balance", {"accountType": acct})
+            if d.get("retCode") != 0:
+                print(f"Saldo check {acct}: retCode={d.get('retCode')} retMsg={d.get('retMsg')}", flush=True)
                 continue
-        return out
+            lst = d.get("result", {}).get("list", [])
+            if not lst:
+                continue
+            for coin in lst[0].get("coin", []):
+                out[coin["coin"]] = float(coin.get("walletBalance", 0))
+        except Exception as e:
+            print(f"Saldo check {acct} FAIL: {e}", flush=True)
+    return out
+
+def get_price():
+    r = requests.get(BASE_URL + "/v5/market/tickers",
+        params={"category": CATEGORY, "symbol": SYMBOL}, timeout=10).json()
+    return float(r["result"]["list"][0]["lastPrice"])
+
+def get_signal(price):
+    # Simpel signaal: snelle vs langzame gemiddelde over klines
+    try:
+        r = requests.get(BASE_URL + "/v5/market/kline",
+            params={"category": CATEGORY, "symbol": SYMBOL, "interval": "15", "limit": 50}, timeout=10).json()
+        closes = [float(x[4]) for x in r["result"]["list"]]
+        closes.reverse()
+        fast = sum(closes[-5:]) / 5
+        slow = sum(closes[-20:]) / 20
+        return "UP" if fast > slow else "NEUTRAAL"
     except Exception as e:
-        log(f"Kline fout: {e}")
-        return []
+        print(f"SIGNAL FAIL: {e}", flush=True)
+        return "NEUTRAAL"
 
-def calc_atr(klines, period):
+def koop_pepe(usdc_bedrag):
+    # FIX 170381: Market Buy op Spot -> qty = USDC, NIET PEPE
+    qty_usdc = round(float(usdc_bedrag), 2)
+    print(f"ORDER Buy PEPEUSDC qty {qty_usdc} USDC (Market)", flush=True)
+    return bybit_post("/v5/order/create", {
+        "category": "spot",
+        "symbol": SYMBOL,
+        "side": "Buy",
+        "orderType": "Market",
+        "qty": str(qty_usdc)
+    })
+
+def verkoop_pepe(pepe_qty):
+    # Market Sell -> qty = PEPE (andersom als kopen)
+    qty_pepe = int(float(pepe_qty))
+    print(f"ORDER Sell PEPEUSDC qty {qty_pepe} PEPE (Market)", flush=True)
+    return bybit_post("/v5/order/create", {
+        "category": "spot",
+        "symbol": SYMBOL,
+        "side": "Sell",
+        "orderType": "Market",
+        "qty": str(qty_pepe)
+    })
+
+def do_check():
+    global _last_check, _prev_signal, _bought_at, _bought_qty
+    now = time.time()
+    if not _lock.acquire(blocking=False):
+        return {"status": "already running"}
     try:
-        trs = []
-        for i in range(1, len(klines)):
-            trs.append(max(klines[i]["high"] - klines[i]["low"], abs(klines[i]["high"] - klines[i-1]["close"]), abs(klines[i]["low"] - klines[i-1]["close"])))
-        if not trs:
-            return 0
-        return sum(trs[-period:]) / min(len(trs), period)
-    except Exception:
-        return 0
+        if now - _last_check < 30:
+            return {"status": "too soon, wait 30s"}
+        _last_check = now
 
-def calc_supertrend(klines):
-    try:
-        atr = calc_atr(klines, 10)
-        closes = [k["close"] for k in klines]
-        hl2 = [(k["high"] + k["low"]) / 2 for k in klines]
-        upper = [hl2[i] + 3 * atr for i in range(len(klines))]
-        lower = [hl2[i] - 3 * atr for i in range(len(klines))]
-        st_up = True
-        for i in range(1, len(klines)):
-            if closes[i] > upper[i-1]:
-                st_up = True
-            elif closes[i] < lower[i-1]:
-                st_up = False
-        return st_up
-    except Exception:
-        return False
+        bal = get_balances()
+        usdt = bal.get("USDT", 0)
+        usdc = bal.get("USDC", 0)
+        pepe = bal.get("PEPE", 0)
+        price = get_price()
+        signal = get_signal(price)
+        up = signal == "UP"
 
-def calc_utbot(klines):
-    try:
-        atr14 = calc_atr(klines, 14)
-        x_atr = 4 * atr14
-        closes = [k["close"] for k in klines]
-        hl2 = [(k["high"] + k["low"]) / 2 for k in klines]
-        return closes[-1] > closes[-2] and closes[-1] > (hl2[-1] - x_atr)
-    except Exception:
-        return False
+        if signal != _prev_signal:
+            print(f"Signaal {_prev_signal} -> {signal}", flush=True)
+            _prev_signal = signal
 
-def calc_signals(klines):
-    if len(klines) < 50:
-        return False, False, 0.0
-    price = klines[-1]["close"]
-    st_up = calc_supertrend(klines)
-    ut_up = calc_utbot(klines)
-    log(f"Signals: ST={st_up} UT={ut_up} prijs {price}")
-    return st_up, ut_up, price
+        print(f"Check: USDT {usdt:.2f} USDC {usdc:.2f} PEPE {pepe:.0f} SYMBOL {SYMBOL} UP={up} prijs {price:.3e} bought@{_bought_at:.3e} qty {_bought_qty:.0f}", flush=True)
 
-# ===== BUY MET OPKNIP-FIX VOOR 170381 =====
-def place_buy(symbol, usdc_amount, price):
-    global bought_price, bought_qty
-    if price <= 0:
-        return {}
-    qty_total = math.floor((usdc_amount / price) / 1000) * 1000
-    if qty_total <= 0:
-        log(f"Buy afgebroken: qty 0, bedrag {usdc_amount} prijs {price}")
-        return {}
-    MAX_PER_ORDER = 2500000
-    done_qty = 0
-    last_res = {}
-    while done_qty < qty_total:
-        qty = min(MAX_PER_ORDER, qty_total - done_qty)
-        qty = math.floor(qty / 1000) * 1000
-        if qty <= 0:
-            break
-        body = {"category": "spot", "symbol": symbol, "side": "Buy", "orderType": "Market", "qty": str(int(qty))}
-        log(f"ORDER Buy {symbol} qty {qty} chunk {done_qty + qty}/{qty_total}")
-        last_res = bybit_post("/v5/order/create", body)
-        log(f"ORDER Buy resultaat: {last_res}")
-        if last_res.get("retCode") != 0:
-            break
-        done_qty += qty
-        if
+        # KOPEN: signaal UP, nog geen positie, genoeg USDC
+        if up and pepe < 1000 and usdc >= 5:
+            inzet = round(usdc * 0.99, 2)  # 99% van je saldo
+            print(f"Rente-op-rente: koop voor {inzet:.2f} van {usdc:.2f} USDC", flush=True)
+            res = koop_pepe(inzet)
+            if res.get("retCode") == 0:
+                _bought_at = price
+                _bought_qty = inzet / price
+                send_telegram(f"Gekocht: {inzet:.2f} USDC PEPE @ {price}")
+                return {"status": "bought", "usdc": usdc, "price": price}
+            else:
+                print(f"KOOP GEFAALD: {res}", flush=True)
+                return {"status": "buy failed", "error": res, "usdc": usdc, "price": price}
+
+        # VERKOPEN: signaal weer NEUTRAAL en we hebben PEPE
+        if not up and pepe >= 1000:
+            res = verkoop_pepe(pepe)
+            if res.get("retCode") == 0:
+                send_telegram(f"Verkocht: {pepe:.0f} PEPE @ {price}")
+                _bought_at = 0.0
+                _bought_qty = 0.0
+                return {"status": "sold", "pepe": pepe, "price": price}
+            else:
+                print(f"VERKOOP GEFAALD: {res}", flush=True)
+                return {"status": "sell failed", "error": res, "pepe": pepe, "price": price}
+
+        return {"status": "ok", "signal": signal, "usdt": usdt, "usdc": usdc, "pepe": pepe, "price": price}
+    except Exception as e:
+        print(f"CHECK FAIL: {e}", flush=True)
+        return {"status": "fail", "error": str(e)}
+    finally:
+        _lock.release()
+
+def bot_loop():
+    time.sleep(10)
+    while True:
+        try:
+            print("AUTO CHECK gestart", flush=True)
+            res = do_check()
+            print(f"AUTO CHECK klaar: {res}", flush=True)
+        except Exception as e:
+            print(f"AUTO CHECK FAIL: {e}", flush=True)
+        time
