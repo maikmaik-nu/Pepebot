@@ -4,6 +4,7 @@ from flask import Flask, jsonify
 
 app = Flask(__name__)
 
+# --- CONFIG ---
 BASE_URL = "https://api.bybit.eu"
 SYMBOL = "PEPEUSDT"
 CATEGORY = "spot"
@@ -12,7 +13,13 @@ API_SECRET = os.environ.get("BYBIT_API_SECRET", "").strip()
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 
-print(f"KEY LOADED: key_len={len(API_KEY)} secret_len={len(API_SECRET)} base={BASE_URL} symbol={SYMBOL} category={CATEGORY}", flush=True)
+# --- UT BOT 4 / 14 + RENTE OP RENTE ---
+KEY_VALUE = 4
+ATR_PERIOD = 14
+INTERVAL = "60"  # 1h candles
+FEE = 0.01  # fee eraf, zoals jij zei
+
+print(f"KEY LOADED: key_len={len(API_KEY)} symbol={SYMBOL}", flush=True)
 
 _lock = threading.Lock()
 _last_check = 0
@@ -27,7 +34,7 @@ def send_telegram(msg):
     except Exception as e:
         print(f"TELEGRAM FAIL: {e}", flush=True)
 
-def bybit_get(path, params):
+def _sign(params):
     ts = str(int(time.time() * 1000))
     recv = "5000"
     query = "&".join(f"{k}={params[k]}" for k in sorted(params))
@@ -40,37 +47,46 @@ def bybit_get(path, params):
         "X-BAPI-RECV-WINDOW": recv,
         "Content-Type": "application/json"
     }
+    return headers, ts, recv
+
+def bybit_get(path, params):
+    headers, _, _ = _sign(params)
     r = requests.get(BASE_URL + path, params=params, headers=headers, timeout=15)
-    print(f"BYBIT GET {path} -> {r.status_code} {r.text[:500]}", flush=True)
+    print(f"BYBIT GET {path} -> {r.status_code} {r.text[:300]}", flush=True)
+    return r.json()
+
+def bybit_post(path, body):
+    # Voor POST: sign = ts + key + recv + json-body
+    ts = str(int(time.time() * 1000))
+    recv = "5000"
+    body_str = json.dumps(body)
+    to_sign = ts + API_KEY + recv + body_str
+    sig = hmac.new(API_SECRET.encode(), to_sign.encode(), hashlib.sha256).hexdigest()
+    headers = {
+        "X-BAPI-API-KEY": API_KEY,
+        "X-BAPI-SIGN": sig,
+        "X-BAPI-TIMESTAMP": ts,
+        "X-BAPI-RECV-WINDOW": recv,
+        "Content-Type": "application/json"
+    }
+    r = requests.post(BASE_URL + path, data=body_str, headers=headers, timeout=15)
+    print(f"BYBIT POST {path} -> {r.status_code} {r.text[:500]}", flush=True)
     return r.json()
 
 def get_balances():
     out = {}
-    try:
-        d = bybit_get("/v5/account/wallet-balance", {"accountType": "UNIFIED"})
-        print(f"BYBIT BALANCE RAW: {d}", flush=True)
-
-        if d.get("retCode") != 0:
-            print(f"Saldo check UNIFIED: retCode={d.get('retCode')} retMsg={d.get('retMsg')}", flush=True)
-            return out
-
-        result = d.get("result", {})
-        # Bybit geeft soms result = {"list": [...]}, soms result = [...]
-        if isinstance(result, list):
-            lst = result
-        else:
-            lst = result.get("list", [])
-
-        if not lst:
-            print("Saldo check UNIFIED: lege list", flush=True)
-            return out
-
-        for coin in lst[0].get("coin", []):
-            out[coin["coin"]] = float(coin.get("walletBalance", 0))
-            print(f"Saldo UNIFIED {coin['coin']} = {coin.get('walletBalance')}", flush=True)
-
-    except Exception as e:
-        print(f"Saldo check UNIFIED FAIL: {e}", flush=True)
+    for acct in ["SPOT", "UNIFIED"]:
+        try:
+            d = bybit_get("/v5/account/wallet-balance", {"accountType": acct})
+            if d.get("retCode") != 0:
+                continue
+            lst = d.get("result", {}).get("list", [])
+            if not lst:
+                continue
+            for coin in lst[0].get("coin", []):
+                out[coin["coin"]] = float(coin.get("walletBalance", 0))
+        except Exception as e:
+            print(f"Saldo check {acct} FAIL: {e}", flush=True)
     return out
 
 def get_price():
@@ -81,6 +97,65 @@ def get_qty_step():
     r = requests.get(BASE_URL + "/v5/market/instruments-info", params={"category": CATEGORY, "symbol": SYMBOL}, timeout=10).json()
     return float(r["result"]["list"][0]["lotSizeFilter"]["qtyStep"])
 
+# --- UT BOT 4 / 14 - ECHTE BEREKENING ---
+def get_klines(limit=100):
+    r = requests.get(BASE_URL + "/v5/market/kline", params={
+        "category": CATEGORY, "symbol": SYMBOL,
+        "interval": INTERVAL, "limit": limit
+    }, timeout=10).json()
+    # Bybit geeft nieuw -> oud, wij draaien om naar oud -> nieuw
+    rows = r["result"]["list"][::-1]
+    # [start, open, high, low, close, volume, turnover]
+    return [(float(x[2]), float(x[3]), float(x[4])) for x in rows]
+
+def utbot_signal():
+    klines = get_klines(100)
+    # CHECK 1: genoeg candles?
+    if len(klines) < ATR_PERIOD + 5:
+        return "hold", klines[-1][2]
+
+    # ATR 14
+    trs = []
+    for i in range(1, len(klines)):
+        high, low, close = klines[i]
+        prev_close = klines[i-1][2]
+        trs.append(max(high - low, abs(high - prev_close), abs(low - prev_close)))
+    atr = sum(trs[-ATR_PERIOD:]) / ATR_PERIOD
+    xATR = atr * KEY_VALUE
+
+    # Trailing stop - loopt door alle candles heen
+    trend = 1  # 1 = up, -1 = down
+    trailing = klines[0][2] - xATR
+    for i in range(1, len(klines)):
+        close = klines[i][2]
+        if trend == 1:
+            # Uptrend: stop mag alleen omhoog
+            trailing = max(trailing, close - xATR)
+            if close < trailing:
+                trend = -1
+                trailing = close + xATR
+        else:
+            # Downtrend: stop mag alleen omlaag
+            trailing = min(trailing, close + xATR)
+            if close > trailing:
+                trend = 1
+                trailing = close - xATR
+
+    signal = "buy" if trend == 1 else "sell"
+    price = klines[-1][2]
+    print(f"UTBOT: trend={signal} price={price} atr={atr} trailing={trailing}", flush=True)
+    return signal, price
+
+def place_order(side, qty):
+    body = {
+        "category": CATEGORY,
+        "symbol": SYMBOL,
+        "side": side,  # Buy of Sell
+        "orderType": "Market",
+        "qty": str(qty)
+    }
+    return bybit_post("/v5/order/create", body)
+
 def do_check():
     global _last_check
     now = time.time()
@@ -90,18 +165,58 @@ def do_check():
         if now - _last_check < 30:
             return {"status": "too soon, wait 30s"}
         _last_check = now
+
         bal = get_balances()
         usdt = bal.get("USDT", 0)
+        usdc = bal.get("USDC", 0)
         pepe = bal.get("PEPE", 0)
-        print(f"CHECK: USDT={usdt} PEPE={pepe}", flush=True)
-        if usdt < 5:
-            send_telegram(f"Bot stopt: te weinig USDT ({usdt})")
-            return {"status": "te weinig USDT", "usdt": usdt, "pepe": pepe}
-        price = get_price()
+        cash = usdt + usdc
+        print(f"CHECK: cash={cash} PEPE={pepe}", flush=True)
+
+        signal, price = utbot_signal()
+
+        # CHECK 2: positie bepaalt wat mag, niet geheugen
+        # Heb je PEPE? Dan zit je in BUY, alleen SELL mag
+        # Heb je cash? Dan zit je in SELL, alleen BUY mag
+        # Dit fixt restart-probleem: na restart weet hij het nog steeds
+        in_position = pepe > 0 and pepe * price > 5
+
+        if signal == "buy" and in_position:
+            print("UTBOT buy, maar al in positie -> HOLD", flush=True)
+            return {"status": "hold", "signal": "buy", "reason": "al in positie"}
+        if signal == "sell" and not in_position:
+            print("UTBOT sell, maar geen positie -> HOLD", flush=True)
+            return {"status": "hold", "signal": "sell", "reason": "geen positie"}
+
         qty_step = get_qty_step()
-        qty = round((10 / price) / qty_step) * qty_step
-        print(f"CHECK OK: price={price} qtyStep={qty_step} would_buy_qty={qty}", flush=True)
-        return {"status": "ok", "usdt": usdt, "pepe": pepe, "price": price, "would_buy_qty": qty}
+
+        # KOOP: ALLES erin, fee eraf, rente op rente
+        if signal == "buy" and cash >= 5:
+            spend = cash * (1 - FEE)
+            qty = int((spend / price) / qty_step) * qty_step
+            if qty <= 0:
+                return {"status": "hold", "reason": "qty te klein"}
+            print(f"KOOP ALLES: spend={spend} qty={qty} price={price}", flush=True)
+            res = place_order("Buy", qty)
+            if res.get("retCode") == 0:
+                send_telegram(f"UTBOT KOOP ALLES: {qty} PEPE voor {spend:.2f}")
+            return {"status": "buy", "qty": qty, "price": price, "bybit": res}
+
+        # VERKOOP: ALLES eruit, fee eraf, rente op rente
+        if signal == "sell" and in_position:
+            qty = int((pepe * (1 - FEE)) / qty_step) * qty_step
+            if qty <= 0:
+                return {"status": "hold", "reason": "qty te klein"}
+            print(f"VERKOOP ALLES: qty={qty} price={price}", flush=True)
+            res = place_order("Sell", qty)
+            if res.get("retCode") == 0:
+                send_telegram(f"UTBOT VERKOOP ALLES: {qty} PEPE")
+            return {"status": "sell", "qty": qty, "price": price, "bybit": res}
+
+        return {"status": "hold", "signal": signal, "cash": cash, "pepe": pepe}
+    except Exception as e:
+        print(f"CHECK FAIL: {e}", flush=True)
+        return {"status": "fail", "error": str(e)}
     finally:
         _lock.release()
 
@@ -129,7 +244,7 @@ def test_key():
         price = get_price()
     except Exception as e:
         price = f"FAIL {e}"
-    return jsonify({"key_len": len(API_KEY), "secret_len": len(API_SECRET), "base": BASE_URL, "balances": bal, "PEPEUSDT_price": price})
+    return jsonify({"balances": bal, "PEPEUSDT_price": price})
 
 @app.route("/check")
 def check():
