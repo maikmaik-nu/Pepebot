@@ -42,7 +42,8 @@ def get_balance_unified(coin):
 def get_balance_funding(coin):
     ts = str(int(time.time() * 1000)); recv = "20000"; query = "accountType=FUND&coin=" + coin; sign = make_sign(ts, recv, query)
     r = safe_json(requests.get(BASE_URL + "/v5/asset/transfer/query-account-coins-balance?" + query, headers=headers_for(ts, recv, sign), timeout=10))
-    if r.get("retCode") != 0: return 0.0
+    if r.get("retCode") != 0:
+        log(f"Balance FUND fail {coin}: {r}"); return 0.0
     res = r.get("result", {})
     lst = res.get("list", []) if isinstance(res, dict) else res if isinstance(res, list) else []
     if isinstance(res, dict) and not lst and res.get("coin"): lst = [res]
@@ -60,22 +61,69 @@ def get_balance():
         return usdt, usdc, pepe
     except Exception as e:
         log(f"Balance fout: {e}"); return 0.0, 0.0, 0.0
-def get_closes(symbol):
+def get_klines(symbol):
     try:
         r = safe_json(requests.get(BASE_URL + "/v5/market/kline", params={"category": "spot", "symbol": symbol, "interval": "15", "limit": 200}, timeout=10))
         if r.get("retCode") != 0:
             log(f"Klines fail {symbol}: {r}"); return None
         lst = r.get("result", {}).get("list", []) or []
+        if len(lst) < 60: return None
+        lst.reverse()
+        # laatste candle is nog open, die slaan we over zoals eerst
+        lst = lst[:-1]
+        highs = [float(x[2]) for x in lst]
+        lows = [float(x[3]) for x in lst]
         closes = [float(x[4]) for x in lst]
-        if len(closes) < 60: return None
-        closes.reverse(); return closes[:-1]
+        return highs, lows, closes
     except Exception as e:
         log(f"Klines fout: {e}"); return None
-def trend_up(closes):
+def utbot_up(highs, lows, closes):
+    # UT Bot Alerts 4 - 14, exact zoals TradingView
     try:
-        if len(closes) < 50: return False
-        return closes[-1] > (sum(closes[-50:]) / 50)
-    except Exception: return False
+        KEY_VALUE = 4.0
+        ATR_PERIOD = 14
+        if len(closes) < ATR_PERIOD + 5:
+            return False
+        # True Range
+        tr = []
+        for i in range(len(closes)):
+            if i == 0:
+                tr.append(highs[i] - lows[i])
+            else:
+                tr.append(max(highs[i] - lows[i], abs(highs[i] - closes[i-1]), abs(lows[i] - closes[i-1])))
+        # ATR met RMA, zoals TradingView ta.atr()
+        atr = []
+        for i in range(len(tr)):
+            if i == 0:
+                atr.append(tr[i])
+            elif i < ATR_PERIOD:
+                atr.append(sum(tr[:i+1]) / (i+1))
+            else:
+                atr.append((atr[i-1] * (ATR_PERIOD - 1) + tr[i]) / ATR_PERIOD)
+        nloss = [KEY_VALUE * a for a in atr]
+        trailing = 0.0
+        pos = 0
+        for i in range(len(closes)):
+            prev_trailing = trailing
+            prev_close = closes[i-1] if i > 0 else closes[i]
+            prev_pos = pos
+            if closes[i] > prev_trailing and prev_close > prev_trailing:
+                trailing = max(prev_trailing, closes[i] - nloss[i])
+            elif closes[i] < prev_trailing and prev_close < prev_trailing:
+                trailing = min(prev_trailing, closes[i] + nloss[i])
+            elif closes[i] > prev_trailing:
+                trailing = closes[i] - nloss[i]
+            else:
+                trailing = closes[i] + nloss[i]
+            if prev_close < prev_trailing and closes[i] > trailing:
+                pos = 1
+            elif prev_close > prev_trailing and closes[i] < trailing:
+                pos = -1
+            else:
+                pos = prev_pos
+        return pos == 1
+    except Exception as e:
+        log(f"UT Bot fout: {e}"); return False
 def place_order(symbol, side, qty):
     try:
         ts = str(int(time.time() * 1000)); recv = "20000"
@@ -90,18 +138,19 @@ def bot_loop():
     global running
     if running: return
     running = True
-    log("Bot loop gestart - definitieve versie - PEPEUSDC / UNIFIED+FUNDING")
-    send_tg("Pepebot-3 gestart - definitieve versie AAN")
+    log("Bot loop gestart - definitieve versie - PEPEUSDC / UNIFIED+FUNDING - UTBOT 4-14")
+    send_tg("Pepebot-3 gestart - definitieve versie AAN - UTBOT 4-14")
     while True:
         try:
             usdt, usdc, pepe = get_balance()
             if usdc >= 1: symbol, money = "PEPEUSDC", usdc
             elif usdt >= 1: symbol, money = "PEPEUSDT", usdt; log("WAARSCHUWING: geld staat in USDT, Bybit EU heeft geen USDT-paren. Zet om naar USDC.")
             else: symbol, money = "PEPEUSDC", 0.0
-            closes = get_closes(symbol)
-            if closes is None:
+            data = get_klines(symbol)
+            if data is None:
                 log("Geen klines, over 60 sec opnieuw"); time.sleep(CHECK_SECONDS); continue
-            price = closes[-1]; up = trend_up(closes)
+            highs, lows, closes = data
+            price = closes[-1]; up = utbot_up(highs, lows, closes)
             log(f"Check: USDT {usdt:.2f} USDC {usdc:.2f} PEPE {pepe:.0f} SYMBOL {symbol} UP={up} prijs {price}")
             if up and money >= 1 and pepe == 0:
                 qty = int(min(money, BUY_AMOUNT) / price)
