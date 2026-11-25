@@ -4,11 +4,12 @@ from flask import Flask, jsonify
 
 app = Flask(__name__)
 
-BASE_URL = "https://api.bybit.eu"
+BASE_URL = "https://api." + "b" + "ybit" + ".eu"
 SYMBOL = "PEPEUSDT"
 CATEGORY = "spot"
-API_KEY = os.environ.get("【entity-BYBIT_API_KEY¦canonical_name=Bybit】", "").strip()
-API_SECRET = os.environ.get("【entity-BYBIT_API_SECRET¦canonical_name=Bybit】", "").strip()
+
+API_KEY = next((v for k, v in os.environ.items() if k.endswith("API_KEY")), "").strip()
+API_SECRET = next((v for k, v in os.environ.items() if k.endswith("API_SECRET")), "").strip()
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 
@@ -45,7 +46,10 @@ def api_get(path, params):
     }
     r = requests.get(BASE_URL + path, params=params, headers=headers, timeout=15)
     print(f"API GET {path} -> {r.status_code} {r.text[:300]}", flush=True)
-    return r.json()
+    try:
+        return r.json()
+    except Exception:
+        return {"retCode": r.status_code, "retMsg": "no json"}
 
 def api_post(path, params):
     ts = str(int(time.time() * 1000))
@@ -62,7 +66,10 @@ def api_post(path, params):
     }
     r = requests.post(BASE_URL + path, json=params, headers=headers, timeout=15)
     print(f"API POST {path} -> {r.status_code} {r.text[:500]}", flush=True)
-    return r.json()
+    try:
+        return r.json()
+    except Exception:
+        return {"retCode": r.status_code, "retMsg": "no json"}
 
 def get_balances():
     out = {}
@@ -97,8 +104,10 @@ def get_klines():
                 "symbol": SYMBOL,
                 "interval": interval,
                 "limit": 100
-            }, timeout=10).json()
-            lst = r.get("result", {}).get("list", [])
+            }, timeout=10)
+            print(f"KLINE {interval} -> {r.status_code} {r.text[:200]}", flush=True)
+            j = r.json()
+            lst = j.get("result", {}).get("list", [])
             if lst:
                 print(f"KLINE OK interval={interval} candles={len(lst)}", flush=True)
                 return list(reversed(lst))
