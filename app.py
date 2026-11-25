@@ -49,7 +49,7 @@ def bybit_post(path, params):
     sig = hmac.new(API_SECRET.encode(), to_sign.encode(), hashlib.sha256).hexdigest()
     headers = {"X-BAPI-API-KEY": API_KEY, "X-BAPI-SIGN": sig, "X-BAPI-TIMESTAMP": ts, "X-BAPI-RECV-WINDOW": recv, "Content-Type": "application/json"}
     r = requests.post(BASE_URL + path, data=body, headers=headers, timeout=15)
-    print(f" BYBIT POST {path} -> {r.status_code} {r.text[:500]}", flush=True)
+    print(f" 【entity-BYBIT¦canonical_name=BYBIT】 POST {path} -> {r.status_code} {r.text[:500]}", flush=True)
     return r.json()
 
 def get_balances():
@@ -135,4 +135,28 @@ def bot_loop():
             res = do_check()
             print(f"AUTO CHECK klaar: {res}", flush=True)
         except Exception as e:
-           
+            print(f"AUTO CHECK FAIL: {e}", flush=True)
+        time.sleep(300)
+
+threading.Thread(target=bot_loop, daemon=True).start()
+
+@app.route("/")
+def home():
+    return "Pepebot-3 live"
+
+@app.route("/check")
+def check():
+    return jsonify(do_check())
+
+@app.route("/status")
+def status():
+    bal = get_balances()
+    try:
+        price = get_price()
+    except Exception as e:
+        price = f"FAIL {e}"
+    return jsonify({"balances": bal, "price": price, "buy_price": BUY_PRICE})
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host="0.0.0.0", port=port)
