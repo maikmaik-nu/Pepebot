@@ -6,7 +6,7 @@ API_KEY = os.getenv("BYBIT_API_KEY", "").strip()
 API_SECRET = os.getenv("BYBIT_API_SECRET", "").strip()
 TG_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TG_CHAT = os.getenv("TELEGRAM_CHAT_ID", "").strip()
-BUY_AMOUNT = 10.0
+BUY_AMOUNT = 100.0
 CHECK_SECONDS = 60
 running = False
 def log(msg):
@@ -127,7 +127,10 @@ def utbot_up(highs, lows, closes):
 def place_order(symbol, side, qty):
     try:
         ts = str(int(time.time() * 1000)); recv = "20000"
-        body = {"category": "spot", "symbol": symbol, "side": side, "orderType": "Market", "qty": str(int(qty))}
+        if side == "Buy":
+            body = {"category": "spot", "symbol": symbol, "side": side, "orderType": "Market", "quoteQty": str(int(BUY_AMOUNT))}
+        else:
+            body = {"category": "spot", "symbol": symbol, "side": side, "orderType": "Market", "qty": str(int(qty))}
         body_str = json.dumps(body); sign = make_sign(ts, recv, body_str)
         h = headers_for(ts, recv, sign); h["Content-Type"] = "application/json"
         r = safe_json(requests.post(BASE_URL + "/v5/order/create", headers=h, data=body_str, timeout=10))
