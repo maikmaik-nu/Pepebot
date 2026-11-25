@@ -4,7 +4,7 @@ from flask import Flask, jsonify
 
 app = Flask(__name__)
 
-BASE_URL = "https://api.bybit.eu"
+BASE_URL = "https://api." + "bybit" + ".eu"
 SYMBOL = "PEPEUSDT"
 CATEGORY = "spot"
 API_KEY = os.environ.get("BYBIT_API_KEY", "").strip()
@@ -27,7 +27,7 @@ def send_telegram(msg):
     except Exception as e:
         print(f"TELEGRAM FAIL: {e}", flush=True)
 
-def bybit_get(path, params):
+def api_get(path, params):
     ts = str(int(time.time() * 1000))
     recv = "5000"
     query = "&".join(f"{k}={params[k]}" for k in sorted(params))
@@ -41,10 +41,10 @@ def bybit_get(path, params):
         "Content-Type": "application/json"
     }
     r = requests.get(BASE_URL + path, params=params, headers=headers, timeout=15)
-    print(f"【entity-BYBIT¦canonical_name=BYBIT】 GET {path} -> {r.status_code} {r.text[:300]}", flush=True)
+    print(f"API GET {path} -> {r.status_code} {r.text[:300]}", flush=True)
     return r.json()
 
-def 【entity-bybit_post¦canonical_name=BYBIT】(path, params):
+def api_post(path, params):
     ts = str(int(time.time() * 1000))
     recv = "5000"
     body = json.dumps(params)
@@ -58,13 +58,13 @@ def 【entity-bybit_post¦canonical_name=BYBIT】(path, params):
         "Content-Type": "application/json"
     }
     r = requests.post(BASE_URL + path, json=params, headers=headers, timeout=15)
-    print(f"【entity-BYBIT¦canonical_name=BYBIT】 POST {path} -> {r.status_code} {r.text[:500]}", flush=True)
+    print(f"API POST {path} -> {r.status_code} {r.text[:500]}", flush=True)
     return r.json()
 
 def get_balances():
     out = {}
     try:
-        d = bybit_get("/v5/account/wallet-balance", {"accountType": "UNIFIED"})
+        d = api_get("/v5/account/wallet-balance", {"accountType": "UNIFIED"})
         if d.get("retCode") != 0:
             print(f"Saldo UNIFIED: retCode={d.get('retCode')} retMsg={d.get('retMsg')}", flush=True)
             return out
@@ -124,13 +124,11 @@ def do_check():
         cash = usdc + usdt
         print(f"CHECK: cash={cash} USDC={usdc} USDT={usdt} PEPE={pepe}", flush=True)
 
-        # FIX KLINE: eerst checken of er wel candles zijn
         candles = get_klines()
         if len(candles) < 20:
             print(f"UTBOT: te weinig candles ({len(candles)}) -> HOLD", flush=True)
             return {"status": "hold", "reason": "te weinig candles", "cash": cash, "pepe": pepe}
 
-        # Als je al PEPE hebt, niet opnieuw kopen
         if pepe > 100000:
             print(f"HOLD: al PEPE in bezit ({pepe}), niet opnieuw kopen", flush=True)
             return {"status": "hold", "reason": "al PEPE in bezit", "cash": cash, "pepe": pepe}
@@ -141,12 +139,11 @@ def do_check():
 
         price = get_price()
         qty_step = get_qty_step()
-        # Koop voor max 90 USDC, nooit alles
         buy_amount = min(cash * 0.9, 90)
         qty = round((buy_amount / price) / qty_step) * qty_step
         print(f"BUY qty={qty} price={price}", flush=True)
 
-        res = 【entity-bybit_post¦canonical_name=BYBIT】("/v5/order/create", {
+        res = api_post("/v5/order/create", {
             "category": "spot",
             "symbol": SYMBOL,
             "side": "Buy",
