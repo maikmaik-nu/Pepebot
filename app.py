@@ -59,10 +59,10 @@ def _sign(params):
 def bybit_get(path, params):
     headers = _sign(params)
     r = requests.get(BASE_URL + path, params=params, headers=headers, timeout=15)
-    log(f"BYBIT GET {path} -> {r.status_code} {r.text[:300]}")
+    log(f"【entity-BYBIT¦canonical_name=BYBIT】 GET {path} -> {r.status_code} {r.text[:300]}")
     return r.json()
 
-def bybit_post(path, body):
+def 【entity-bybit_post¦canonical_name=BYBIT】(path, body):
     ts = str(int(time.time() * 1000))
     recv = "5000"
     body_str = json.dumps(body)
@@ -76,7 +76,7 @@ def bybit_post(path, body):
         "Content-Type": "application/json"
     }
     r = requests.post(BASE_URL + path, data=body_str, headers=headers, timeout=15)
-    log(f"BYBIT POST {path} -> {r.status_code} {r.text[:500]}")
+    log(f"【entity-BYBIT¦canonical_name=BYBIT】 POST {path} -> {r.status_code} {r.text[:500]}")
     return r.json()
 
 def get_balances():
@@ -175,7 +175,6 @@ def utbot_signal():
     log(f"UTBOT: trend={signal} price={price} atr={atr} trailing={trailing}")
     return signal, price
 
-# --- AANGEPAST: retry per chunk, stopt niet meer na 1 fout ---
 def place_order_chunked(side, qty_total):
     qty_total = math.floor(qty_total / 1000) * 1000
     if qty_total <= 0:
@@ -189,7 +188,6 @@ def place_order_chunked(side, qty_total):
         if qty <= 0:
             break
 
-        # 3 pogingen per chunk, in plaats van stoppen na 1 fout
         success = False
         for attempt in range(3):
             body = {
@@ -200,7 +198,7 @@ def place_order_chunked(side, qty_total):
                 "qty": str(int(qty))
             }
             log(f"ORDER {side} {SYMBOL} qty {qty} chunk {done_qty + qty}/{qty_total} poging {attempt + 1}/3")
-            last_res = bybit_post("/v5/order/create", body)
+            last_res = 【entity-bybit_post¦canonical_name=BYBIT】("/v5/order/create", body)
             log(f"ORDER {side} resultaat: {last_res}")
 
             if last_res.get("retCode") == 0:
@@ -239,13 +237,17 @@ def do_check():
         if signal == "hold" or price <= 0:
             return {"status": "hold", "signal": signal}
 
-        # --- AANGEPAST: van > 5 naar > 0.5, zodat stof van 3.75 USD ook mee verkocht wordt ---
-        in_position = pepe > 0 and pepe * price > 0.5
+        # --- FIX: 2 losse drempels ---
+        # Kopen: stof telt NIET mee, pas vanaf 5 USD is het een echte positie
+        # Verkopen: stof telt WEL mee, vanaf 0.5 USD verkopen we alles mee
+        pepe_value = pepe * price
+        in_position_buy = pepe > 0 and pepe_value > 5
+        in_position_sell = pepe > 0 and pepe_value > 0.5
 
-        if signal == "buy" and in_position:
+        if signal == "buy" and in_position_buy:
             log("UTBOT buy, maar al in positie -> HOLD")
             return {"status": "hold", "signal": "buy", "reason": "al in positie"}
-        if signal == "sell" and not in_position:
+        if signal == "sell" and not in_position_sell:
             log("UTBOT sell, maar geen positie -> HOLD")
             return {"status": "hold", "signal": "sell", "reason": "geen positie"}
 
@@ -259,59 +261,4 @@ def do_check():
             log(f"KOOP ALLES: spend={spend} qty={qty} price={price}")
             res = place_order_chunked("Buy", qty)
             if res.get("retCode") == 0:
-                send_telegram(f"UTBOT KOOP ALLES: {qty} PEPE voor {spend:.2f}")
-            return {"status": "buy", "qty": qty, "price": price, "bybit": res}
-
-        if signal == "sell" and in_position:
-            # --- AANGEPAST: verkoop volle PEPE, fee gaat van je USDC af, niet van je PEPE ---
-            qty = int(pepe / qty_step) * qty_step
-            if qty <= 0:
-                return {"status": "hold", "reason": "qty te klein"}
-            log(f"VERKOOP ALLES: qty={qty} price={price}")
-            res = place_order_chunked("Sell", qty)
-            if res.get("retCode") == 0:
-                send_telegram(f"UTBOT VERKOOP ALLES: {qty} PEPE")
-            return {"status": "sell", "qty": qty, "price": price, "bybit": res}
-
-        return {"status": "hold", "signal": signal, "cash": cash, "pepe": pepe}
-    except Exception as e:
-        log(f"CHECK FAIL: {e}")
-        traceback.print_exc()
-        return {"status": "fail", "error": str(e)}
-    finally:
-        _lock.release()
-
-def bot_loop():
-    time.sleep(10)
-    while True:
-        try:
-            log("AUTO CHECK gestart")
-            res = do_check()
-            log(f"AUTO CHECK klaar: {res}")
-        except Exception as e:
-            log(f"AUTO CHECK FAIL: {e}")
-            traceback.print_exc()
-        time.sleep(300)
-
-threading.Thread(target=bot_loop, daemon=True).start()
-
-@app.route("/")
-def home():
-    return "Pepebot-3 live"
-
-@app.route("/test-key")
-def test_key():
-    bal = get_balances()
-    try:
-        price = get_price()
-    except Exception as e:
-        price = f"FAIL {e}"
-    return jsonify({"balances": bal, "PEPEUSDC_price": price})
-
-@app.route("/check")
-def check():
-    return jsonify(do_check())
-
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host="0.0.0.0", port=port)
+                send_telegram(f"UTBOT KOOP ALLES: {qty} PEPE voor
