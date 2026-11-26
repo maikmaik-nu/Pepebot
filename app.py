@@ -6,7 +6,7 @@ app = Flask(__name__)
 
 # --- CONFIG ---
 BASE_URL = "https://api.bybit.eu"
-SYMBOL = "PEPEUSDC"  # je cash staat in USDC
+SYMBOL = "PEPEUSDC"
 CATEGORY = "spot"
 API_KEY = os.environ.get("BYBIT_API_KEY", "").strip()
 API_SECRET = os.environ.get("BYBIT_API_SECRET", "").strip()
@@ -16,9 +16,9 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 # --- UT BOT 4 / 14 - ALLEEN DIT, GEEN SUPERTREND ---
 KEY_VALUE = 4
 ATR_PERIOD = 14
-INTERVAL = "60"  # 1h candles
+INTERVAL = "15"  # 15m, zoals je chart
 FEE = 0.001  # 0,1% Bybit Spot Taker
-MAX_PER_ORDER = 2500000  # Bybit max per market-order, 10 -> 100 fix
+MAX_PER_ORDER = 2500000
 
 print(f"KEY LOADED: key_len={len(API_KEY)} symbol={SYMBOL} fee={FEE}", flush=True)
 
@@ -81,7 +81,6 @@ def bybit_post(path, body):
 
 def get_balances():
     out = {}
-    # Alleen UNIFIED, je account is UNIFIED-only, SPOT geeft 10001
     try:
         d = bybit_get("/v5/account/wallet-balance", {"accountType": "UNIFIED"})
         if d.get("retCode") != 0:
@@ -120,9 +119,7 @@ def get_klines(limit=100):
         if not lst:
             log("KLINE LEEG - result list is leeg")
             return []
-        # Bybit geeft nieuw -> oud, wij draaien om naar oud -> nieuw
         rows = lst[::-1]
-        # [start, open, high, low, close, volume, turnover]
         return [(float(x[2]), float(x[3]), float(x[4])) for x in rows]
     except Exception as e:
         log(f"KLINE EXCEPT: {e}")
@@ -135,7 +132,6 @@ def utbot_signal():
         log(f"UTBOT: te weinig candles ({len(klines)}) -> HOLD")
         return "hold", klines[-1][2] if klines else 0
 
-    # ATR 14
     trs = []
     for i in range(1, len(klines)):
         high, low, close = klines[i]
@@ -144,8 +140,7 @@ def utbot_signal():
     atr = sum(trs[-ATR_PERIOD:]) / ATR_PERIOD
     xATR = atr * KEY_VALUE
 
-    # Trailing stop - loopt door alle candles heen
-    trend = 1  # 1 = up, -1 = down
+    trend = 1
     trailing = klines[0][2] - xATR
     for i in range(1, len(klines)):
         close = klines[i][2]
@@ -166,7 +161,6 @@ def utbot_signal():
     return signal, price
 
 def place_order_chunked(side, qty_total):
-    # Opknippen in max 2.500.000, afgerond op 1000 - 10 -> 100 fix
     qty_total = math.floor(qty_total / 1000) * 1000
     if qty_total <= 0:
         return {"retCode": -1, "retMsg": "qty te klein"}
@@ -213,7 +207,6 @@ def do_check():
         usdc = bal.get("USDC", 0)
         usdt = bal.get("USDT", 0)
         pepe = bal.get("PEPE", 0)
-        # Voor PEPEUSDC is USDC je cash. USDT tellen we mee als je die ooit hebt.
         cash = usdc + usdt
         log(f"CHECK: cash={cash} USDC={usdc} USDT={usdt} PEPE={pepe}")
 
@@ -221,7 +214,6 @@ def do_check():
         if signal == "hold" or price <= 0:
             return {"status": "hold", "signal": signal}
 
-        # Positie bepaalt wat mag, niet geheugen - restart-veilig
         in_position = pepe > 0 and pepe * price > 5
 
         if signal == "buy" and in_position:
@@ -233,7 +225,6 @@ def do_check():
 
         qty_step = get_qty_step()
 
-        # KOOP: ALLES erin, fee eraf, rente op rente
         if signal == "buy" and cash >= 5:
             spend = cash * (1 - FEE)
             qty = int((spend / price) / qty_step) * qty_step
@@ -245,7 +236,6 @@ def do_check():
                 send_telegram(f"UTBOT KOOP ALLES: {qty} PEPE voor {spend:.2f}")
             return {"status": "buy", "qty": qty, "price": price, "bybit": res}
 
-        # VERKOOP: ALLES eruit, fee eraf, rente op rente
         if signal == "sell" and in_position:
             qty = int((pepe * (1 - FEE)) / qty_step) * qty_step
             if qty <= 0:
