@@ -102,8 +102,24 @@ def get_price():
     return float(r["result"]["list"][0]["lastPrice"])
 
 def get_qty_step():
-    r = requests.get(BASE_URL + "/v5/market/instruments-info", params={"category": CATEGORY, "symbol": SYMBOL}, timeout=10).json()
-    return float(r["result"]["list"][0]["lotSizeFilter"]["qtyStep"])
+    try:
+        r = requests.get(BASE_URL + "/v5/market/instruments-info", params={"category": CATEGORY, "symbol": SYMBOL}, timeout=10).json()
+        if r.get("retCode") != 0:
+            log(f"QTYSTEP FAIL retCode={r.get('retCode')} {r.get('retMsg')}")
+            return 1000.0
+        lst = r.get("result", {}).get("list", [])
+        if not lst:
+            return 1000.0
+        f = lst[0].get("lotSizeFilter", {})
+        # Futures: qtyStep | Spot: basePrecision | Fallback: 1000 voor PEPE
+        if "qtyStep" in f:
+            return float(f["qtyStep"])
+        if "basePrecision" in f:
+            return 10 ** (-int(f["basePrecision"]))
+        return 1000.0
+    except Exception as e:
+        log(f"QTYSTEP EXCEPT: {e} -> fallback 1000")
+        return 1000.0
 
 # --- UT BOT 4 / 14 - ECHTE BEREKENING ---
 def get_klines(limit=100):
