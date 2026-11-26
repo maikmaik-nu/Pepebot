@@ -1,8 +1,5 @@
 import os, time, math, hmac, hashlib, threading, requests
 from flask import Flask, jsonify
-import pandas as pd
-import numpy as np
-
 app = Flask(__name__)
 API_KEY = os.getenv("BYBIT_API_KEY", "")
 API_SECRET = os.getenv("BYBIT_API_SECRET", "")
@@ -10,7 +7,7 @@ BASE_URL = "https://api.bybit.eu"
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 SYMBOL = "PEPEUSDC"
-TRADE_USDC = 10.0
+TRADE_USDC = 100.0
 bought_price = 0
 bought_qty = 0
 
@@ -44,28 +41,32 @@ def balance():
 def candles():
     d = get("/v5/market/kline", {"category": "spot", "symbol": SYMBOL, "interval": "15", "limit": 200})
     lst = sorted(d.get("result", {}).get("list", []), key=lambda x: int(x[0]))
-    df = pd.DataFrame(lst, columns=["time","open","high","low","close","vol","turnover"])
-    for c in ["open","high","low","close"]: df[c] = df[c].astype(float)
-    return df
+    return [float(x[4]) for x in lst], [float(x[2]) for x in lst], [float(x[3]) for x in lst]
 
-def signal(df):
-    df["tr"] = np.maximum(df["high"]-df["low"], np.maximum(abs(df["high"]-df["close"].shift(1)), abs(df["low"]-df["close"].shift(1))))
-    df["atr"] = df["tr"].rolling(14).mean()
-    df["stop"] = 0.0
-    for i in range(1, len(df)):
-        p = df.iloc[i-1]; c = df.iloc[i]["close"]; a = df.iloc[i]["atr"] or 0
-        if c > p["stop"] and p["close"] > p["stop"]: df.loc[df.index[i],"stop"] = max(p["stop"], c-a)
-        elif c < p["stop"] and p["close"] < p["stop"]: df.loc[df.index[i],"stop"] = min(p["stop"], c+a)
-        elif c > p["stop"]: df.loc[df.index[i],"stop"] = c-a
-        else: df.loc[df.index[i],"stop"] = c+a
-    l = df.iloc[-1]; p = df.iloc[-2]
-    ut = l["close"] > l["stop"] and p["close"] <= p["stop"]
-    st = l["close"] > (l["close"] - 3*l["atr"])
-    return ut, st, float(l["close"])
+def signal():
+    closes, highs, lows = candles()
+    trs = []
+    for i in range(1, len(closes)):
+        trs.append(max(highs[i]-lows[i], abs(highs[i]-closes[i-1]), abs(lows[i]-closes[i-1])))
+    atr = sum(trs[-14:]) / 14 if len(trs) >= 14 else 0
+    stop = 0
+    prev_stop = 0
+    prev_close = closes[0]
+    for i in range(1, len(closes)):
+        c = closes[i]
+        # UT BOT 4 / 14
+        if c > prev_stop and prev_close > prev_stop: stop = max(prev_stop, c-4*atr)
+        elif c < prev_stop and prev_close < prev_stop: stop = min(prev_stop, c+4*atr)
+        elif c > prev_stop: stop = c-4*atr
+        else: stop = c+4*atr
+        prev_stop = stop; prev_close = c
+    ut = closes[-1] > stop and closes[-2] <= prev_stop
+    st = closes[-1] > (closes[-1] - 3*atr)
+    return ut, st, closes[-1]
 
-def place_buy(price):
+def place_buy(price, amount):
     global bought_price, bought_qty
-    total = math.floor((TRADE_USDC/price)/1000)*1000
+    total = math.floor((amount/price)/1000)*1000
     if total <= 0: return {}
     done = 0; res = {}
     while done < total:
@@ -83,11 +84,12 @@ def place_buy(price):
 def check():
     try:
         b = balance(); usdc = b.get("USDC",0); pepe = b.get("PEPE",0)
-        df = candles(); ut, st, prijs = signal(df)
+        ut, st, prijs = signal()
         log(f"CHECK: USDC={usdc} PEPE={pepe} PRICE={prijs} UTBOT={'buy' if ut else 'sell'}")
-        if ut and st and usdc >= TRADE_USDC and pepe == 0:
-            r = place_buy(prijs)
-            tg(f"PEPE GEKOCHT: {bought_qty} voor {TRADE_USDC} USDC @ {prijs}" if r.get("retCode")==0 else f"BUY AFGEWEZEN: {r}")
+        # RENTE-OP-RENTE: tradet met hele USDC-saldo, niet met vast bedrag
+        if ut and st and usdc >= 1 and pepe == 0:
+            r = place_buy(prijs, usdc)
+            tg(f"PEPE GEKOCHT: {bought_qty} voor {usdc} USDC @ {prijs}" if r.get("retCode")==0 else f"BUY AFGEWEZEN: {r}")
             return {"status":"bought","result":r}
         return {"status":"no-trade"}
     except Exception as e:
