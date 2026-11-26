@@ -100,6 +100,8 @@ def loop():
 
 @app.route("/")
 def home(): return "Pepebot-3 live"
+@app.route("/health")
+def health(): return "OK", 200
 @app.route("/check")
 def c(): return jsonify(check())
 @app.route("/test-key")
