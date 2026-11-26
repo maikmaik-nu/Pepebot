@@ -13,7 +13,6 @@ API_SECRET = os.environ.get("BYBIT_API_SECRET", "").strip()
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 
-# Setup (kan via dashboard aangepast worden)
 SETTINGS = {
     "trade_amount": 10.0,
     "ut_a": 1.0,
@@ -77,7 +76,8 @@ load();setInterval(load,10000);
 
 def send_telegram(msg):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        print(f"TELEGRAM SKIP: {msg}", flush=True); return
+        print(f"TELEGRAM SKIP: {msg}", flush=True)
+        return
     try:
         requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
             json={"chat_id": TELEGRAM_CHAT_ID, "text": msg}, timeout=10)
@@ -85,11 +85,18 @@ def send_telegram(msg):
         print(f"TELEGRAM FAIL: {e}", flush=True)
 
 def bybit_get(path, params):
-    ts = str(int(time.time()*1000)); recv = "5000"
+    ts = str(int(time.time() * 1000))
+    recv = "5000"
     query = "&".join(f"{k}={params[k]}" for k in sorted(params))
     to_sign = ts + API_KEY + recv + query
     sig = hmac.new(API_SECRET.encode(), to_sign.encode(), hashlib.sha256).hexdigest()
-    headers = {"X-BAPI-API-KEY": API_KEY, "X-BAPI-SIGN": sig, "X-BAPI-TIMESTAMP": ts, "X-BAPI-RECV-WINDOW": recv, "Content-Type": "application/json"}
+    headers = {
+        "X-BAPI-API-KEY": API_KEY,
+        "X-BAPI-SIGN": sig,
+        "X-BAPI-TIMESTAMP": ts,
+        "X-BAPI-RECV-WINDOW": recv,
+        "Content-Type": "application/json"
+    }
     r = requests.get(BASE_URL + path, params=params, headers=headers, timeout=15)
     print(f"BYBIT GET {path} -> {r.status_code} {r.text[:300]}", flush=True)
     if not r.text.strip():
@@ -98,31 +105,49 @@ def bybit_get(path, params):
 
 def get_balances():
     out = {}
-    for acct in ["UNIFIED", "SPOT"]:
-        try:
-            d = bybit_get("/v5/account/wallet-balance", {"accountType": acct})
-            if d.get("retCode") != 0:
-                print(f"Saldo {acct} overgeslagen: {d.get('retMsg')}", flush=True); continue
-            lst = d.get("result", {}).get("list", [])
-            if not lst: continue
-            for coin in lst[0].get("coin", []):
-                out[coin["coin"]] = float(coin.get("walletBalance", 0))
-        except Exception as e:
-            print(f"Saldo check {acct} FAIL: {e}", flush=True)
-            STATE["last_error"] = f"Saldo fout: {e}"
+    try:
+        d = bybit_get("/v5/account/wallet-balance", {"accountType": "UNIFIED"})
+        if d.get("retCode") != 0:
+            print(f"Saldo UNIFIED fail: {d.get('retMsg')}", flush=True)
+            return out
+        result = d.get("result", {})
+        lst = result.get("list", []) if isinstance(result, dict) else []
+        if not lst:
+            return out
+        coins = lst[0].get("coin", []) if isinstance(lst[0], dict) else []
+        for c in coins:
+            if isinstance(c, dict) and "coin" in c:
+                out[c["coin"]] = float(c.get("walletBalance", 0))
+    except Exception as e:
+        print(f"Saldo fout: {e}", flush=True)
+        STATE["last_error"] = f"Saldo fout: {e}"
     return out
 
 def get_price():
     r = requests.get(BASE_URL + "/v5/market/tickers", params={"category": CATEGORY, "symbol": SYMBOL}, timeout=10).json()
-    return float(r["result"]["list"][0]["lastPrice"])
+    result = r.get("result", {})
+    lst = result.get("list", []) if isinstance(result, dict) else []
+    if not lst:
+        raise Exception("geen prijs terug van 【entity-Bybit¦canonical_name=Bybit】")
+    return float(lst[0]["lastPrice"])
 
 def get_klines():
     try:
-        r = requests.get(BASE_URL + "/v5/market/kline", params={"category": CATEGORY, "symbol": SYMBOL, "interval": "15", "limit": 50}, timeout=10).json()
-        if r.get("retCode") != 0: return []
-        return r.get("result", {}).get("list", [])
+        r = requests.get(BASE_URL + "/v5/market/kline", params={
+            "category": CATEGORY,
+            "symbol": SYMBOL,
+            "interval": "15",
+            "limit": 50
+        }, timeout=10).json()
+        if r.get("retCode") != 0:
+            print(f"KLINE FAIL: {r.get('retMsg')}", flush=True)
+            return []
+        result = r.get("result", {})
+        lst = result.get("list", []) if isinstance(result, dict) else []
+        return lst
     except Exception as e:
-        print(f"KLINE EXCEPT: {e}", flush=True); return []
+        print(f"KLINE EXCEPT: {e}", flush=True)
+        return []
 
 def do_check():
     global _last_check
@@ -134,15 +159,23 @@ def do_check():
             return {"status": "too soon, wait 30s"}
         _last_check = now
         bal = get_balances()
-        usdc = bal.get("USDC", 0); usdt = bal.get("USDT", 0); pepe = bal.get("PEPE", 0)
+        usdc = bal.get("USDC", 0)
+        usdt = bal.get("USDT", 0)
+        pepe = bal.get("PEPE", 0)
         cash = usdc if usdc > 0 else usdt
         price = get_price()
         candles = get_klines()
-        STATE.update({"price": price, "usdc": usdc, "pepe": pepe, "candles": len(candles),
-                      "last_check": time.strftime("%H:%M:%S"), "last_error": ""})
+        STATE.update({
+            "price": price,
+            "usdc": usdc,
+            "pepe": pepe,
+            "candles": len(candles),
+            "last_check": time.strftime("%H:%M:%S"),
+            "last_error": ""
+        })
         print(f"CHECK: cash={cash} PEPE={pepe} price={price} candles={len(candles)}", flush=True)
         if len(candles) < 20:
-            STATE["last_signal"] = "HOLD - te weinig candles"
+            STATE["last_signal"] = f"HOLD - te weinig candles ({len(candles)})"
             return {"status": "hold", "reason": "te weinig candles"}
         if cash < SETTINGS["trade_amount"]:
             STATE["last_signal"] = f"HOLD: te weinig USDC {cash} < {SETTINGS['trade_amount']}"
@@ -180,7 +213,9 @@ def status():
 @app.route("/settings", methods=["POST"])
 def settings():
     d = request.get_json(force=True)
-    SETTINGS.update({k: d[k] for k in d if k in SETTINGS})
+    for k in d:
+        if k in SETTINGS:
+            SETTINGS[k] = d[k]
     return jsonify({"ok": True, "settings": SETTINGS})
 
 @app.route("/check")
@@ -190,8 +225,10 @@ def check():
 @app.route("/test-key")
 def test_key():
     bal = get_balances()
-    try: price = get_price()
-    except Exception as e: price = f"FAIL {e}"
+    try:
+        price = get_price()
+    except Exception as e:
+        price = f"FAIL {e}"
     return jsonify({"key_len": len(API_KEY), "secret_len": len(API_SECRET), "base": BASE_URL, "balances": bal, "PEPEUSDT_price": price})
 
 @app.route("/ping")
@@ -200,4 +237,4 @@ def ping():
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port
