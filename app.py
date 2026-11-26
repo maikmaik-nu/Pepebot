@@ -17,7 +17,7 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 KEY_VALUE = 4
 ATR_PERIOD = 14
 INTERVAL = "15"  # 15m, zoals je chart
-FEE = 0.001  # 0,1% Bybit Spot Taker
+FEE = 0.001  # 0,1% 【entity-Bybit¦canonical_name=BYBIT】 Spot Taker
 MAX_PER_ORDER = 2500000
 
 print(f"KEY LOADED: key_len={len(API_KEY)} symbol={SYMBOL} fee={FEE}", flush=True)
@@ -111,7 +111,6 @@ def get_qty_step():
         if not lst:
             return 1000.0
         f = lst[0].get("lotSizeFilter", {})
-        # Futures: qtyStep | Spot: basePrecision | Fallback: 1000 voor PEPE
         if "qtyStep" in f:
             return float(f["qtyStep"])
         if "basePrecision" in f:
@@ -176,6 +175,7 @@ def utbot_signal():
     log(f"UTBOT: trend={signal} price={price} atr={atr} trailing={trailing}")
     return signal, price
 
+# --- AANGEPAST: retry per chunk, stopt niet meer na 1 fout ---
 def place_order_chunked(side, qty_total):
     qty_total = math.floor(qty_total / 1000) * 1000
     if qty_total <= 0:
@@ -189,19 +189,28 @@ def place_order_chunked(side, qty_total):
         if qty <= 0:
             break
 
-        body = {
-            "category": CATEGORY,
-            "symbol": SYMBOL,
-            "side": side,
-            "orderType": "Market",
-            "qty": str(int(qty))
-        }
-        log(f"ORDER {side} {SYMBOL} qty {qty} chunk {done_qty + qty}/{qty_total}")
-        last_res = bybit_post("/v5/order/create", body)
-        log(f"ORDER {side} resultaat: {last_res}")
+        # 3 pogingen per chunk, in plaats van stoppen na 1 fout
+        success = False
+        for attempt in range(3):
+            body = {
+                "category": CATEGORY,
+                "symbol": SYMBOL,
+                "side": side,
+                "orderType": "Market",
+                "qty": str(int(qty))
+            }
+            log(f"ORDER {side} {SYMBOL} qty {qty} chunk {done_qty + qty}/{qty_total} poging {attempt + 1}/3")
+            last_res = bybit_post("/v5/order/create", body)
+            log(f"ORDER {side} resultaat: {last_res}")
 
-        if last_res.get("retCode") != 0:
-            log(f"ORDER STOP: chunk mislukt na {done_qty} van {qty_total}")
+            if last_res.get("retCode") == 0:
+                success = True
+                break
+            log(f"ORDER RETRY: chunk mislukt, probeer opnieuw na 2s")
+            time.sleep(2)
+
+        if not success:
+            log(f"ORDER STOP: chunk {qty} na 3 pogingen nog mislukt, done {done_qty} van {qty_total}")
             break
 
         done_qty += qty
@@ -230,7 +239,8 @@ def do_check():
         if signal == "hold" or price <= 0:
             return {"status": "hold", "signal": signal}
 
-        in_position = pepe > 0 and pepe * price > 5
+        # --- AANGEPAST: van > 5 naar > 0.5, zodat stof van 3.75 USD ook mee verkocht wordt ---
+        in_position = pepe > 0 and pepe * price > 0.5
 
         if signal == "buy" and in_position:
             log("UTBOT buy, maar al in positie -> HOLD")
@@ -253,7 +263,8 @@ def do_check():
             return {"status": "buy", "qty": qty, "price": price, "bybit": res}
 
         if signal == "sell" and in_position:
-            qty = int((pepe * (1 - FEE)) / qty_step) * qty_step
+            # --- AANGEPAST: verkoop volle PEPE, fee gaat van je USDC af, niet van je PEPE ---
+            qty = int(pepe / qty_step) * qty_step
             if qty <= 0:
                 return {"status": "hold", "reason": "qty te klein"}
             log(f"VERKOOP ALLES: qty={qty} price={price}")
